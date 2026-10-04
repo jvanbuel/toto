@@ -1,4 +1,4 @@
-//! `togra`: the local runner for Tokens of Gratitude.
+//! `toto`: the local runner for Tokens of Gratitude.
 //!
 //! Module layout follows docs/design.md ("Runner architecture"). Components that need
 //! external systems (queue server, Docker, Omnigent) sit behind traits so the full task

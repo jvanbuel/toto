@@ -12,9 +12,9 @@ Contributors want to donate unused Claude subscription capacity, not only API cr
 
 `ClaudeCliHarness` runs the official `claude` CLI as a subprocess, one process per task:
 
-- **Auth.** `togra login` runs `claude setup-token` (a long-lived subscription token for headless use) and stores the pasted token with mode 0600; the harness refuses a token file others can read. The token is passed to the CLI process only, in `CLAUDE_CODE_OAUTH_TOKEN`. `--bare` is never used: it ignores subscription login.
+- **Auth.** `toto login` runs `claude setup-token` (a long-lived subscription token for headless use) and stores the pasted token with mode 0600; the harness refuses a token file others can read. The token is passed to the CLI process only, in `CLAUDE_CODE_OAUTH_TOKEN`. `--bare` is never used: it ignores subscription login.
 - **Isolation of the contributor's own profile.** The CLI starts with a cleared environment (so a stray `ANTHROPIC_API_KEY` cannot change who is billed), a dedicated `HOME` and `CLAUDE_CONFIG_DIR`, `--setting-sources project`, and `--strict-mcp-config`. It runs in a scratch directory containing only the task's skills.
-- **Tools only in the container (ADR 10).** `--tools ""` turns off every built-in tool. The only MCP server is the runner-generated `sandbox` bridge, started as `docker exec -i <container> /togra/mcp-exec`. The prompt goes over stdin. Project MCP URLs may be added next to it (ADR 9) but cannot replace it.
+- **Tools only in the container (ADR 10).** `--tools ""` turns off every built-in tool. The only MCP server is the runner-generated `sandbox` bridge, started as `docker exec -i <container> /toto/mcp-exec`. The prompt goes over stdin. Project MCP URLs may be added next to it (ADR 9) but cannot replace it.
 - **Runtime checks.** The `system/init` event must list no built-in tool and show the bridge connected, or the run is killed.
 - **Metering.** Usage is read from `assistant` events (deduplicated per message id) and the final `result`, charged to the usage meter during the run; an overrun kills the process. `system/api_retry` errors that point at the account (`rate_limit`, `account_on_hold`, `billing_error`, authentication) are named in the failure.
 

@@ -9,7 +9,7 @@ Contributors donate capacity from their own AI subscriptions or API keys. The co
 
 ## Decision
 
-All model usage happens on the contributor's machine, through the contributor's own tools and login, orchestrated by `togra`. The platform only ever sees tasks and results.
+All model usage happens on the contributor's machine, through the contributor's own tools and login, orchestrated by `toto`. The platform only ever sees tasks and results.
 
 ## Alternatives considered
 

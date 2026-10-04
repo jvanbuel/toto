@@ -127,7 +127,7 @@ impl Drop for AuthProxy {
 }
 
 fn respond_error(mut conn: &UnixStream, status: u16, msg: &str) -> std::io::Result<()> {
-    let body = format!(r#"{{"type":"error","error":{{"type":"togra_proxy_error","message":"{msg}"}}}}"#);
+    let body = format!(r#"{{"type":"error","error":{{"type":"toto_proxy_error","message":"{msg}"}}}}"#);
     write!(conn, "HTTP/1.1 {status} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", reason(status), body.len())
 }
 

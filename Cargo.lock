@@ -799,33 +799,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "togra"
-version = "0.1.0"
-dependencies = [
- "base64",
- "chrono",
- "clap",
- "ed25519-dalek",
- "hex",
- "rand",
- "rpassword",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "thiserror",
- "tokio",
- "ureq",
-]
-
-[[package]]
-name = "togra-mcp-exec"
-version = "0.1.0"
-dependencies = [
- "serde_json",
-]
-
-[[package]]
 name = "tokio"
 version = "1.53.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -848,6 +821,33 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "toto-mcp-exec"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "toto-runner"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chrono",
+ "clap",
+ "ed25519-dalek",
+ "hex",
+ "rand",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "thiserror",
+ "tokio",
+ "ureq",
 ]
 
 [[package]]

@@ -8,10 +8,10 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 /// Where the MCP exec bridge appears inside a container sandbox.
-pub const BRIDGE_PATH: &str = "/togra/mcp-exec";
+pub const BRIDGE_PATH: &str = "/toto/mcp-exec";
 /// Where the credential proxy's unix socket and the agent binary appear inside the container.
-pub const PROXY_SOCKET_PATH: &str = "/togra/proxy.sock";
-pub const AGENT_PATH: &str = "/togra/claude";
+pub const PROXY_SOCKET_PATH: &str = "/toto/proxy.sock";
+pub const AGENT_PATH: &str = "/toto/claude";
 /// Loopback address the in-container relay serves; the agent's API base URL points here.
 pub const PROXY_ADDR: &str = "127.0.0.1:8080";
 
@@ -31,7 +31,7 @@ pub trait Sandbox: Send {
         host_put_inputs(ws, bundle, max_bytes)
     }
 
-    /// Archive (togra format) of files changed, added or deleted since `put_inputs`, at most
+    /// Archive (toto format) of files changed, added or deleted since `put_inputs`, at most
     /// `max_bytes` of content.
     fn collect_outputs(&self, ws: &Workspace, max_bytes: u64) -> Result<Vec<u8>> {
         host_collect_outputs(ws, max_bytes)
@@ -143,7 +143,7 @@ pub struct DockerSandbox {
     pub image: String,
     pub runtime: Option<String>,
     pub workspace_mb: u32,
-    /// Static `togra-mcp-exec` binary to mount read-only at `BRIDGE_PATH`: the only host path a
+    /// Static `toto-mcp-exec` binary to mount read-only at `BRIDGE_PATH`: the only host path a
     /// task container can see.
     pub bridge: Option<PathBuf>,
     /// Credential proxy socket (host side), bind-mounted at `PROXY_SOCKET_PATH`. When set, a
@@ -162,7 +162,7 @@ impl DockerSandbox {
 
     pub fn container_name(task_id: &str) -> String {
         let safe: String = task_id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
-        format!("togra-{safe}")
+        format!("toto-{safe}")
     }
 
     /// The `run` argument list; pure so the hardening flags are unit-tested without a daemon.

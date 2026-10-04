@@ -4,7 +4,7 @@ Status: draft · 2026-10-04 · Jan Vanbuel
 
 ## Summary
 
-Tokens of Gratitude lets people donate unused capacity from their own AI subscriptions or API keys to vetted public-good projects. Credentials never leave the contributor's machine: a local runner, `togra`, pulls tasks from a shared queue, executes them in a sandbox with the contributor's own tools, and returns results.
+Tokens of Gratitude lets people donate unused capacity from their own AI subscriptions or API keys to vetted public-good projects. Credentials never leave the contributor's machine: a local runner, `toto`, pulls tasks from a shared queue, executes them in a sandbox with the contributor's own tools, and returns results.
 
 **Goals**
 
@@ -35,7 +35,7 @@ flowchart LR
     end
 
     subgraph Contributor machine
-        R[togra runner<br/>policy, caps, audit log,<br/>signs results]
+        R[toto runner<br/>policy, caps, audit log,<br/>signs results]
         S[Sandbox<br/>runs AI tool on task,<br/>no host files or keys]
         R --> S
     end
@@ -87,9 +87,9 @@ A task is a self-contained, signed manifest plus an input bundle; runners need n
 - Fair scheduling across projects by budget, so one project cannot drain the pool.
 - Results are content-addressed and attached to the task with runner identity and run metadata.
 
-## Runner architecture (`togra`)
+## Runner architecture (`toto`)
 
-`togra` is a single Rust binary: a background daemon plus a TUI (ratatui) for contributor controls. It is the only component that ever touches the contributor's AI tools, and it never reads or transmits their credentials.
+`toto` is a single Rust binary: a background daemon plus a TUI (ratatui) for contributor controls. It is the only component that ever touches the contributor's AI tools, and it never reads or transmits their credentials.
 
 **Modules**
 
@@ -140,7 +140,7 @@ Treat every task as hostile: an agent executing a stranger's instructions on a c
 | Tampered results or fake runners | Signed results, redundancy, reputation, later zkTLS proofs |
 | Sandbox escape | Prefer microVMs (Firecracker, gVisor) over plain containers; auto-update the runner |
 
-`togra` should ship with the strictest profile on by default; contributors can only loosen it per project.
+`toto` should ship with the strictest profile on by default; contributors can only loosen it per project.
 
 ## Verification and reputation
 
@@ -161,7 +161,7 @@ The platform only works long-term with providers' blessing; plan for it from day
 - **API keys** are designed for programmatic use, so API-key runners are the lowest-risk option. V1 supports both API keys and subscription CLIs; subscription adapters stay behind the per-provider switch below.
 - **Outreach**: approach Anthropic, OpenAI, Google and Mistral early with a proposal for a sanctioned donate-your-quota programme. Their public-benefit and research credit programmes are a natural fit.
 - **Data protection (EU)**: task inputs may contain personal data. Projects declare it in the application; such tasks are excluded by default and require a DPA path.
-- **Per-provider switch**: `togra` enables a provider adapter only once that provider's stance is confirmed.
+- **Per-provider switch**: `toto` enables a provider adapter only once that provider's stance is confirmed.
 
 ## Governance and transparency
 

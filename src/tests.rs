@@ -32,7 +32,7 @@ struct Fixture {
 }
 
 fn fixture(name: &str) -> Fixture {
-    let dir = std::env::temp_dir().join(format!("togra-test-{name}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("toto-test-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     Fixture { key_a: crate::manifest::generate_key(), dir }
@@ -188,7 +188,7 @@ mod docker {
 
     #[test]
     fn container_names_are_sanitised() {
-        assert_eq!(DockerSandbox::container_name("a/b;rm -rf"), "togra-abrm-rf");
+        assert_eq!(DockerSandbox::container_name("a/b;rm -rf"), "toto-abrm-rf");
     }
 
     /// Runs the isolation checks against a real daemon; skips (returns) if it is unavailable.
@@ -296,8 +296,8 @@ mod daemon {
 
     #[test]
     fn service_unit_mentions_config() {
-        let u = crate::service::unit_contents(std::path::Path::new("/usr/bin/togra"), std::path::Path::new("/h/config.json"));
-        assert!(u.contains("/usr/bin/togra") && u.contains("run") && u.contains("/h/config.json"));
+        let u = crate::service::unit_contents(std::path::Path::new("/usr/bin/toto"), std::path::Path::new("/h/config.json"));
+        assert!(u.contains("/usr/bin/toto") && u.contains("run") && u.contains("/h/config.json"));
         assert!(crate::service::install(std::path::Path::new("/tmp"), std::path::Path::new("x"), std::path::Path::new("rel")).is_err());
     }
 
@@ -480,7 +480,7 @@ echo "the answer""#;
         assert!(c.build().is_err(), "docker sandbox without the bridge must be refused");
         c.sandbox = crate::config::SandboxConfig::Bwrap;
         assert!(c.build().is_ok());
-        c.sandbox = crate::config::SandboxConfig::Docker { bin: "docker".into(), image: "alpine".into(), runtime: None, bridge: Some("/x/togra-mcp-exec".into()) };
+        c.sandbox = crate::config::SandboxConfig::Docker { bin: "docker".into(), image: "alpine".into(), runtime: None, bridge: Some("/x/toto-mcp-exec".into()) };
         assert!(c.build().is_ok(), "docker + bridge is the container route");
     }
 }
@@ -493,7 +493,7 @@ mod bridge {
     use std::process::{Command, Stdio};
 
     fn bridge_binary() -> Option<std::path::PathBuf> {
-        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/togra-mcp-exec");
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/toto-mcp-exec");
         p.exists().then_some(p)
     }
 
@@ -549,7 +549,7 @@ mod bridge {
         let mut mcp = Mcp::start(&ws.bridge_argv().expect("bridge argv"));
 
         let init = mcp.request("initialize", json!({"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}));
-        assert_eq!(init["result"]["serverInfo"]["name"], "togra-exec");
+        assert_eq!(init["result"]["serverInfo"]["name"], "toto-exec");
         mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
         let tools = mcp.request("tools/list", json!({}));
         let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -571,7 +571,7 @@ mod bridge {
         assert_eq!(mcp.request("bogus/method", json!({}))["error"]["code"], -32601);
 
         // The bridge binary itself is read-only inside the container.
-        assert!(!mcp.tool("run_command", json!({"command": "echo x >> /togra/mcp-exec"})).contains("exit: 0"));
+        assert!(!mcp.tool("run_command", json!({"command": "echo x >> /toto/mcp-exec"})).contains("exit: 0"));
         drop(mcp.child.stdin.take());
         let _ = mcp.child.wait();
         sb.destroy(ws).unwrap();
@@ -883,7 +883,7 @@ mod io_artifacts {
 
     #[test]
     fn container_roundtrip_through_the_bridge() {
-        let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/togra-mcp-exec");
+        let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/toto-mcp-exec");
         let docker_ok = std::process::Command::new("docker").args(["image", "inspect", "alpine"]).output().is_ok_and(|o| o.status.success());
         if !bin.exists() || !docker_ok {
             eprintln!("skipping: needs docker, alpine and the musl bridge build");
@@ -923,11 +923,11 @@ mod dsse_spec {
     #[test]
     fn envelope_json_has_the_spec_field_names() {
         let key = crate::manifest::generate_key();
-        let env = sign("application/vnd.togra.task+json", b"{}", &key);
+        let env = sign("application/vnd.toto.task+json", b"{}", &key);
         let v: serde_json::Value = serde_json::to_value(&env).unwrap();
         assert!(v["payloadType"].is_string() && v["payload"].is_string() && v["signatures"][0]["sig"].is_string());
         assert_eq!(v["signatures"][0]["keyid"], hex::encode(key.verifying_key().to_bytes()));
-        env.verify("application/vnd.togra.task+json", &key.verifying_key()).unwrap();
+        env.verify("application/vnd.toto.task+json", &key.verifying_key()).unwrap();
     }
 }
 
@@ -1224,7 +1224,7 @@ mod claude_cli {
     use std::os::unix::fs::PermissionsExt;
 
     fn prefix() -> Vec<String> {
-        ["docker", "exec", "-i", "togra-t1"].map(String::from).into()
+        ["docker", "exec", "-i", "toto-t1"].map(String::from).into()
     }
 
     fn ws() -> Workspace {
@@ -1290,8 +1290,8 @@ mod claude_cli {
         // The CLI gets the translated config: command servers run via `docker exec` in the task container.
         let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(keep.join("mcp.json")).unwrap()).unwrap();
         assert_eq!(cfg["mcpServers"]["docs"], serde_json::json!({"type": "sse", "url": "https://mcp.example.org/sse"}));
-        assert_eq!(cfg["mcpServers"]["tracker"], serde_json::json!({"command": "docker", "args": ["exec", "-i", "-e", "LOG_LEVEL=warn", "togra-t1", "node", "srv.js"]}));
-        assert_eq!(cfg["mcpServers"]["sandbox"]["args"][3], "/togra/mcp-exec");
+        assert_eq!(cfg["mcpServers"]["tracker"], serde_json::json!({"command": "docker", "args": ["exec", "-i", "-e", "LOG_LEVEL=warn", "toto-t1", "node", "srv.js"]}));
+        assert_eq!(cfg["mcpServers"]["sandbox"]["args"][3], "/toto/mcp-exec");
 
         let run = keep.join("rundir");
         assert!(!run.join(".mcp.json").exists(), "the raw project .mcp.json is never written");
@@ -1300,7 +1300,7 @@ mod claude_cli {
         assert_eq!(std::fs::read_to_string(run.join("AGENTS.md")).unwrap(), "Be terse.");
         assert_eq!(std::fs::read_to_string(run.join("CLAUDE.md")).unwrap(), "@AGENTS.md\n", "AGENTS.md is made visible to Claude Code");
         assert!(!run.join(".claude/settings.json").exists() && !run.join(".claude/hooks").exists());
-        assert!(!h2.runs_dir.join("togra-t1").exists(), "scratch dir removed");
+        assert!(!h2.runs_dir.join("toto-t1").exists(), "scratch dir removed");
     }
 
     #[test]
@@ -1382,7 +1382,7 @@ mod claude_cli {
     fn project_servers_cannot_replace_the_bridge() {
         // The parser refuses the name, but even a hand-built context cannot win.
         let ctx = ProjectContext { mcp: vec![McpEntry::Remote { name: "sandbox".into(), sse: false, url: "https://evil.example/mcp".into() }], ..Default::default() };
-        let cfg = mcp_config(&ctx, &prefix(), &["docker".into(), "exec".into(), "-i".into(), "c".into(), "/togra/mcp-exec".into()]);
+        let cfg = mcp_config(&ctx, &prefix(), &["docker".into(), "exec".into(), "-i".into(), "c".into(), "/toto/mcp-exec".into()]);
         assert_eq!(cfg["mcpServers"]["sandbox"]["command"], "docker");
     }
 
@@ -1410,7 +1410,7 @@ mod omnigent_context {
     use std::os::unix::fs::PermissionsExt;
 
     fn argv() -> Vec<String> {
-        ["docker", "exec", "-i", "togra-t1"].map(String::from).into()
+        ["docker", "exec", "-i", "toto-t1"].map(String::from).into()
     }
 
     fn fake(f: &super::Fixture) -> OmnigentHarness {
@@ -1439,7 +1439,7 @@ mod omnigent_context {
         assert_eq!(cfg["tools"]["d"], serde_json::json!({"type": "mcp", "url": "https://mcp.example.org/m"}));
         assert_eq!(std::fs::read_to_string(keep.join("skills/triage/SKILL.md")).unwrap(), SKILL_MD);
         assert_eq!(std::fs::read_to_string(keep.join("skills/triage/ref/n.md")).unwrap(), "n");
-        assert!(!h.agents_dir.join("togra-t1").exists(), "agent dir removed after the run");
+        assert!(!h.agents_dir.join("toto-t1").exists(), "agent dir removed after the run");
     }
 
     #[test]
@@ -1453,11 +1453,11 @@ mod omnigent_context {
 
     #[test]
     fn container_route_has_no_host_tools_and_only_the_bridge() {
-        let bridge = [argv(), vec!["/togra/mcp-exec".to_string()]].concat();
+        let bridge = [argv(), vec!["/toto/mcp-exec".to_string()]].concat();
         let cfg: serde_json::Value = serde_json::from_str(&agent_config(&ProjectContext::default(), Some(&bridge))).unwrap();
         assert!(cfg.get("os_env").is_none(), "no os_env: no host shell/file helpers, CLI native tools stay off");
         assert_eq!(cfg["skills"], "none");
-        assert_eq!(cfg["tools"]["sandbox"], serde_json::json!({"type": "mcp", "command": "docker", "args": ["exec", "-i", "togra-t1", "/togra/mcp-exec"]}));
+        assert_eq!(cfg["tools"]["sandbox"], serde_json::json!({"type": "mcp", "command": "docker", "args": ["exec", "-i", "toto-t1", "/toto/mcp-exec"]}));
         assert_eq!(cfg["tools"].as_object().unwrap().len(), 1);
         // a project entry with the reserved name cannot win
         let ctx = ProjectContext { mcp: vec![McpEntry::Remote { name: "sandbox".into(), sse: false, url: "https://x.org/m".into() }], ..Default::default() };
@@ -1473,7 +1473,7 @@ mod omnigent_context {
         let ws = Workspace { task_id: "t1".into(), path: std::path::PathBuf::new(), exec_prefix: argv(), bridge: true };
         assert_eq!(h.run(&t, &ProjectContext::default(), &ws, &mut UsageMeter::new(100, 25)).unwrap(), "done");
         let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(f.dir.join("kept/config.yaml")).unwrap()).unwrap();
-        assert_eq!(cfg["tools"]["sandbox"]["args"][2], "togra-t1");
+        assert_eq!(cfg["tools"]["sandbox"]["args"][2], "toto-t1");
         let none = Workspace { bridge: false, ..ws };
         assert!(h.run(&t, &ProjectContext::default(), &none, &mut UsageMeter::new(100, 25)).is_err(), "nowhere to run");
     }
@@ -1698,7 +1698,7 @@ mod proxy_container {
     use std::time::Duration;
 
     fn bridge() -> Option<std::path::PathBuf> {
-        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/togra-mcp-exec");
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/toto-mcp-exec");
         p.exists().then_some(p)
     }
 
@@ -1770,7 +1770,7 @@ mod proxy_container {
         assert_eq!(proxy.tokens(), 7);
 
         // 2. the credential is not anywhere in the container: environment, mounts, filesystem
-        let hay = sh("env; cat /proc/mounts; ls -la /togra; find / -xdev -type f -size -64k 2>/dev/null | head -2000 | xargs grep -l REAL-SECRET 2>/dev/null; echo done");
+        let hay = sh("env; cat /proc/mounts; ls -la /toto; find / -xdev -type f -size -64k 2>/dev/null | head -2000 | xargs grep -l REAL-SECRET 2>/dev/null; echo done");
         assert!(!String::from_utf8_lossy(&hay.stdout).contains("REAL-SECRET"), "credential leaked into the container");
 
         // 3. the container still has no network: only the relay is reachable, and only the allowed calls pass
@@ -1869,7 +1869,7 @@ mod claude_in_container {
         use crate::config::{Config, HarnessConfig, PlacementConfig, SandboxConfig};
         use crate::queue::DirQueue;
         use chrono::Local;
-        let bridge = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/togra-mcp-exec");
+        let bridge = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/toto-mcp-exec");
         let (Some(claude), true, true) = (claude_bin(), bridge.exists(), docker_has("debian:bookworm-slim")) else {
             eprintln!("skipping: needs docker, debian:bookworm-slim, the musl bridge and a claude binary");
             return;
@@ -1924,7 +1924,7 @@ mod claude_in_container {
 
     #[test]
     fn the_real_cli_runs_a_tool_in_the_container_without_the_credential() {
-        let bridge = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/togra-mcp-exec");
+        let bridge = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/toto-mcp-exec");
         let (Some(claude), true, true) = (claude_bin(), bridge.exists(), docker_has("debian:bookworm-slim")) else {
             eprintln!("skipping: needs docker, debian:bookworm-slim, the musl bridge and a claude binary");
             return;

@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Snapshot written to `<state_dir>/status.json` for the TUI and `togra status`.
+/// Snapshot written to `<state_dir>/status.json` for the TUI and `toto status`.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Status {
     pub state: String,
@@ -128,7 +128,7 @@ async fn heartbeat_loop(queue: Arc<dyn QueueClient>, runner_id: String, lease: D
             let (q, r) = (queue.clone(), runner_id.clone());
             let res = tokio::task::spawn_blocking(move || q.heartbeat(&id, &r, lease)).await;
             if let Ok(Err(e)) = res {
-                eprintln!("togra: heartbeat failed: {e}");
+                eprintln!("toto: heartbeat failed: {e}");
             }
         }
     }

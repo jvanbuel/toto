@@ -28,7 +28,7 @@ pub enum SandboxConfig {
         image: String,
         #[serde(default)]
         runtime: Option<String>,
-        /// Path to the static `togra-mcp-exec` binary, mounted read-only into the container.
+        /// Path to the static `toto-mcp-exec` binary, mounted read-only into the container.
         #[serde(default)]
         bridge: Option<PathBuf>,
     },
@@ -50,7 +50,7 @@ pub enum HarnessConfig {
     Claude {
         #[serde(default = "claude_bin")]
         bin: String,
-        /// Token from `claude setup-token`, stored by `togra login` (default: <state_dir>/claude.token).
+        /// Token from `claude setup-token`, stored by `toto login` (default: <state_dir>/claude.token).
         #[serde(default)]
         token_file: Option<PathBuf>,
         #[serde(default)]
@@ -235,7 +235,7 @@ impl Config {
             HarnessConfig::Echo { tokens_per_run } => Box::new(EchoHarness { tokens_per_run: *tokens_per_run }),
             HarnessConfig::Claude { bin, token_file, model, placement, upstream, agent_binary, api_key_file } => {
                 if !matches!(self.sandbox, SandboxConfig::Docker { bridge: Some(_), .. }) {
-                    return Err(Error::Policy("the claude harness needs a Docker/Podman sandbox with `bridge` set to the static togra-mcp-exec binary".into()));
+                    return Err(Error::Policy("the claude harness needs a Docker/Podman sandbox with `bridge` set to the static toto-mcp-exec binary".into()));
                 }
                 let token_file = token_file.clone().unwrap_or_else(|| self.token_path());
                 let mut h = ClaudeCliHarness::new(&self.state_dir, token_file.clone())?;
@@ -259,7 +259,7 @@ impl Config {
             }
             HarnessConfig::Omnigent { bin, server_url, harness } => {
                 if matches!(self.sandbox, SandboxConfig::Docker { bridge: None, .. }) {
-                    return Err(Error::Policy("the omnigent harness with a container sandbox needs the exec bridge: set `bridge` to the static togra-mcp-exec binary (or use sandbox `dir` or `bwrap`)".into()));
+                    return Err(Error::Policy("the omnigent harness with a container sandbox needs the exec bridge: set `bridge` to the static toto-mcp-exec binary (or use sandbox `dir` or `bwrap`)".into()));
                 }
                 let mut h = OmnigentHarness::new(&self.state_dir)?;
                 h.bin = bin.clone();

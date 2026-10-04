@@ -3,7 +3,7 @@
 //!
 //! The signature covers `PAE(payloadType, payload)` over the exact payload bytes, so nothing
 //! depends on how a struct happens to serialise. Envelopes are compatible with in-toto and
-//! Sigstore tooling (key id = hex Ed25519 public key; payload types are `application/vnd.togra.*`).
+//! Sigstore tooling (key id = hex Ed25519 public key; payload types are `application/vnd.toto.*`).
 
 use crate::{Error, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};

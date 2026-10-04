@@ -62,7 +62,7 @@ pub struct TaskManifest {
 }
 
 /// DSSE payload type of a signed task manifest.
-pub const TASK_PAYLOAD_TYPE: &str = "application/vnd.togra.task+json";
+pub const TASK_PAYLOAD_TYPE: &str = "application/vnd.toto.task+json";
 
 impl TaskManifest {
     /// Signs the manifest as a DSSE envelope. The signed bytes are exactly the JSON payload.

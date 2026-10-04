@@ -1,13 +1,13 @@
 use chrono::Local;
 use clap::{Parser, Subcommand};
 use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, path::PathBuf};
-use togra::audit::AuditLog;
-use togra::harness::EchoHarness;
-use togra::manifest::{OutputSchema, SandboxProfile, TaskManifest, TrustedProjects};
-use togra::policy::Policy;
-use togra::queue::InMemoryQueue;
-use togra::runner::{Runner, Tick};
-use togra::sandbox::DirSandbox;
+use toto::audit::AuditLog;
+use toto::harness::EchoHarness;
+use toto::manifest::{OutputSchema, SandboxProfile, TaskManifest, TrustedProjects};
+use toto::policy::Policy;
+use toto::queue::InMemoryQueue;
+use toto::runner::{Runner, Tick};
+use toto::sandbox::DirSandbox;
 
 #[derive(Parser)]
 #[command(version, about = "Local runner for Tokens of Gratitude")]
@@ -83,7 +83,7 @@ fn home() -> PathBuf {
 }
 
 fn default_dir() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME").map_or_else(|| home().join(".config"), PathBuf::from).join("togra")
+    std::env::var_os("XDG_CONFIG_HOME").map_or_else(|| home().join(".config"), PathBuf::from).join("toto")
 }
 
 fn config_path(c: Option<PathBuf>) -> PathBuf {
@@ -109,17 +109,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if path.exists() {
                 return Err(format!("{} already exists", path.display()).into());
             }
-            let cfg = togra::config::Config::starter(&dir);
+            let cfg = toto::config::Config::starter(&dir);
             let id = hex::encode(cfg.load_or_create_key()?.verifying_key().to_bytes());
             fs::write(&path, serde_json::to_string_pretty(&cfg)?)?;
             println!("wrote {}\nrunner id: {id}\nNothing will run until you add a trusted project, allowed kinds and a share to the config.", path.display());
         }
         Cmd::Run { config, once: false } => {
-            let cfg = togra::config::Config::load(&config_path(config))?;
-            togra::daemon::run(cfg, shutdown_signal()).await?;
+            let cfg = toto::config::Config::load(&config_path(config))?;
+            toto::daemon::run(cfg, shutdown_signal()).await?;
         }
         Cmd::Run { config, once: true } => {
-            let cfg = togra::config::Config::load(&config_path(config))?;
+            let cfg = toto::config::Config::load(&config_path(config))?;
             let mut runner = cfg.build()?;
             runner.sandbox.probe()?;
             runner.harness.probe()?;
@@ -133,41 +133,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("queue empty; audit log: {}", cfg.state_dir.join("audit.jsonl").display());
         }
         Cmd::ProjectKey { out } => {
-            let key = togra::manifest::generate_key();
+            let key = toto::manifest::generate_key();
             fs::write(&out, hex::encode(key.to_bytes()))?;
             fs::set_permissions(&out, fs::Permissions::from_mode(0o600))?;
             println!("public key: {}", hex::encode(key.verifying_key().to_bytes()));
         }
         Cmd::ExtractResult { result, out } => {
-            let r: togra::result::SignedResult = serde_json::from_slice(&fs::read(&result)?)?;
+            let r: toto::result::SignedResult = serde_json::from_slice(&fs::read(&result)?)?;
             let body = r.open()?; // verifies the runner's signature, output hash and artifacts hash
             println!("result for {} by runner {}…: {} tokens", body.task_id, &body.runner_id[..12], body.tokens_used);
             let records = r.artifact_records(1 << 30)?;
             if records.is_empty() {
                 println!("no artifacts in this result (signature ok)");
             }
-            togra::archive::unpack_to(&out, &records)?;
+            toto::archive::unpack_to(&out, &records)?;
             for rec in &records {
                 match rec {
-                    togra::archive::Record::File { path, data, .. } => println!("file    {path} ({} bytes)", data.len()),
-                    togra::archive::Record::Deleted { path } => println!("deleted {path}"),
+                    toto::archive::Record::File { path, data, .. } => println!("file    {path} ({} bytes)", data.len()),
+                    toto::archive::Record::Deleted { path } => println!("deleted {path}"),
                 }
             }
         }
         Cmd::PostTask { key, config, bundle, context, task } => {
-            let cfg = togra::config::Config::load(&config_path(config))?;
+            let cfg = toto::config::Config::load(&config_path(config))?;
             let seed: [u8; 32] = hex::decode(fs::read_to_string(&key)?.trim()).ok().and_then(|b| b.try_into().ok()).ok_or("project key must be a 32-byte hex seed")?;
             let mut manifest: TaskManifest = serde_json::from_slice(&fs::read(&task)?)?;
-            let queue = togra::queue::DirQueue::new(&cfg.queue_dir)?;
+            let queue = toto::queue::DirQueue::new(&cfg.queue_dir)?;
             if let Some(dir) = bundle {
-                let records = togra::archive::pack_dir(&dir, togra::archive::Limits::new(cfg.policy.max_input_bytes))?;
-                manifest.inputs = queue.post_bundle(&togra::archive::to_bytes(&records)?)?;
+                let records = toto::archive::pack_dir(&dir, toto::archive::Limits::new(cfg.policy.max_input_bytes))?;
+                manifest.inputs = queue.post_bundle(&toto::archive::to_bytes(&records)?)?;
                 println!("bundled {} files from {} as {}", records.len(), dir.display(), manifest.inputs);
             }
             if let Some(dir) = context {
-                let limits = togra::archive::Limits::new(cfg.policy.max_context_bytes.max(1 << 20));
-                let bytes = togra::archive::to_bytes(&togra::archive::pack_dir(&dir, limits)?)?;
-                let ctx = togra::context::ProjectContext::parse(&bytes, limits)?; // same checks the runner applies
+                let limits = toto::archive::Limits::new(cfg.policy.max_context_bytes.max(1 << 20));
+                let bytes = toto::archive::to_bytes(&toto::archive::pack_dir(&dir, limits)?)?;
+                let ctx = toto::context::ProjectContext::parse(&bytes, limits)?; // same checks the runner applies
                 manifest.context = Some(queue.post_bundle(&bytes)?);
                 println!("context from {}: {}", dir.display(), ctx.summary());
             }
@@ -176,9 +176,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("posted {} to {}", manifest.id, cfg.queue_dir.display());
         }
         Cmd::Login { config } => {
-            let cfg = togra::config::Config::load(&config_path(config))?;
+            let cfg = toto::config::Config::load(&config_path(config))?;
             let token_file = match &cfg.harness {
-                togra::config::HarnessConfig::Claude { token_file, .. } => token_file.clone().unwrap_or_else(|| cfg.token_path()),
+                toto::config::HarnessConfig::Claude { token_file, .. } => token_file.clone().unwrap_or_else(|| cfg.token_path()),
                 _ => return Err("config.harness.kind is not `claude`".into()),
             };
             fs::create_dir_all(&cfg.state_dir)?;
@@ -188,12 +188,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if token.trim().is_empty() {
                 return Err("no token entered".into());
             }
-            togra::claude_cli::save_token(&token_file, &token)?;
+            toto::claude_cli::save_token(&token_file, &token)?;
             println!("saved to {} (mode 600). It never leaves this machine.", token_file.display());
         }
         Cmd::Status { config } => {
-            let cfg = togra::config::Config::load(&config_path(config))?;
-            match togra::daemon::Status::read(&cfg.state_dir) {
+            let cfg = toto::config::Config::load(&config_path(config))?;
+            match toto::daemon::Status::read(&cfg.state_dir) {
                 Some(s) => println!("{}", serde_json::to_string_pretty(&s)?),
                 None => println!("no status yet (daemon has not run)"),
             }
@@ -201,11 +201,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::InstallService { config } => {
             let cfg = config_path(config);
             let cfg = fs::canonicalize(&cfg).map_err(|e| format!("{}: {e}", cfg.display()))?;
-            let (path, enable) = togra::service::install(&home(), &std::env::current_exe()?, &cfg)?;
+            let (path, enable) = toto::service::install(&home(), &std::env::current_exe()?, &cfg)?;
             println!("wrote {}\nenable it with: {enable}", path.display());
         }
         Cmd::Keygen { out } => {
-            let key = togra::manifest::generate_key();
+            let key = toto::manifest::generate_key();
             fs::write(&out, hex::encode(key.to_bytes()))?;
             fs::set_permissions(&out, fs::Permissions::from_mode(0o600))?;
             println!("runner id: {}", hex::encode(key.verifying_key().to_bytes()));
@@ -221,9 +221,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn demo() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = std::env::temp_dir().join("togra-demo");
+    let dir = std::env::temp_dir().join("toto-demo");
     fs::create_dir_all(&dir)?;
-    let project_key = togra::manifest::generate_key();
+    let project_key = toto::manifest::generate_key();
     let mut trusted = TrustedProjects::default();
     trusted.insert("demo-project", project_key.verifying_key());
 
@@ -262,9 +262,9 @@ fn demo() -> Result<(), Box<dyn std::error::Error>> {
 
     let audit_path = dir.join("audit.jsonl");
     let mut runner = Runner::new(
-        policy, trusted, togra::manifest::generate_key(), queue,
+        policy, trusted, toto::manifest::generate_key(), queue,
         EchoHarness { tokens_per_run: 400 }, DirSandbox { root: dir.join("work") },
-        |_: &TaskManifest, _: &togra::result::SignedResult| true, AuditLog::new(&audit_path),
+        |_: &TaskManifest, _: &toto::result::SignedResult| true, AuditLog::new(&audit_path),
     );
     let outcome: Tick = runner.tick(Local::now())?;
     println!("{outcome:?}; audit log at {}", audit_path.display());

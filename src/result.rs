@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// DSSE payload type of a result.
-pub const RESULT_PAYLOAD_TYPE: &str = "application/vnd.togra.result+json";
+pub const RESULT_PAYLOAD_TYPE: &str = "application/vnd.toto.result+json";
 
 /// The signed part of a result. Artifacts travel next to it and are bound by `artifacts_hash`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

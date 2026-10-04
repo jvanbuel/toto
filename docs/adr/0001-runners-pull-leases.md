@@ -24,4 +24,4 @@ Runners pull work. A runner claims a task lease for a fixed window, renews it wi
 
 ## Simpler v1 option
 
-Use GitHub issues in approved repositories as the queue: an issue with a `togra` label is a task, assigning it (or a claim comment) is the lease. Removes the queue server; costs race handling on claims and GitHub rate limits.
+Use GitHub issues in approved repositories as the queue: an issue with a `toto` label is a task, assigning it (or a claim comment) is the lease. Removes the queue server; costs race handling on claims and GitHub rate limits.

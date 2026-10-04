@@ -1,7 +1,14 @@
 [package]
-name = "togra"
+name = "toto-runner"
 version = "0.1.0"
 edition = "2024"
+
+[lib]
+name = "toto"
+
+[[bin]]
+name = "toto"
+path = "src/main.rs"
 
 [workspace]
 members = ["bridge"]

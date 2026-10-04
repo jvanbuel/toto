@@ -3,13 +3,13 @@
 //!
 //! The agent loop and the login stay on the host. The CLI is started with every built-in tool
 //! turned off and exactly one MCP server, `sandbox`, whose command is
-//! `docker exec -i <container> /togra/mcp-exec`, so everything the agent does to files or
+//! `docker exec -i <container> /toto/mcp-exec`, so everything the agent does to files or
 //! processes happens inside the hardened container (ADR 10). The CLI runs from a scratch
 //! directory holding only the task's skills, with a dedicated config dir and a cleared
 //! environment, so the contributor's own settings, memory, hooks, MCP servers and skills never
 //! reach a task, and no API key in the environment can change who is billed.
 //!
-//! Subscription auth uses a long-lived token from `claude setup-token`, stored by `togra login`
+//! Subscription auth uses a long-lived token from `claude setup-token`, stored by `toto login`
 //! with mode 0600 and passed to the CLI process only. Never use `--bare`: it ignores
 //! subscription login.
 
@@ -73,13 +73,13 @@ impl ClaudeCliHarness {
 
 /// Reads a secret file (token or API key), refusing one that other users can read.
 pub fn read_secret(path: &Path) -> Result<String> {
-    let meta = std::fs::metadata(path).map_err(|e| Error::Harness(format!("no credential at {} ({e}); run `togra login`", path.display())))?;
+    let meta = std::fs::metadata(path).map_err(|e| Error::Harness(format!("no credential at {} ({e}); run `toto login`", path.display())))?;
     if meta.permissions().mode() & 0o077 != 0 {
         return Err(Error::Harness(format!("{} is readable by others; chmod 600 it", path.display())));
     }
     let t = std::fs::read_to_string(path)?.trim().to_string();
     if t.is_empty() {
-        return Err(Error::Harness(format!("{} is empty; run `togra login`", path.display())));
+        return Err(Error::Harness(format!("{} is empty; run `toto login`", path.display())));
     }
     Ok(t)
 }
@@ -218,7 +218,7 @@ impl Harness for ClaudeCliHarness {
             let token = self.read_token()?;
             write_context(&run_dir, ctx)?;
             // The raw project `.mcp.json` is never written: only the translated config is passed.
-            let mcp_path = run_dir.join("togra-mcp.json");
+            let mcp_path = run_dir.join("toto-mcp.json");
             std::fs::write(&mcp_path, serde_json::to_vec(&mcp_config(ctx, &ws.exec_prefix, &bridge))?)?;
             // Built-in tools stay off, except `Skill` (loads instructions, runs nothing) when the project ships skills.
             let allowed: Vec<String> = ctx.mcp.iter().map(|m| format!("mcp__{}", m.name())).chain([format!("mcp__{}", crate::manifest::BRIDGE_SERVER_NAME)]).chain(skill_tool.then(|| "Skill".to_string())).collect();

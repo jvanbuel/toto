@@ -1,10 +1,10 @@
-//! `togra-mcp-exec`: a minimal MCP server (stdio, newline-delimited JSON-RPC) that gives the
+//! `toto-mcp-exec`: a minimal MCP server (stdio, newline-delimited JSON-RPC) that gives the
 //! agent shell and file tools. It runs *inside* the task container, started by the runner as
-//! `docker exec -i <container> /togra/mcp-exec`, so every tool call executes in the sandbox
+//! `docker exec -i <container> /toto/mcp-exec`, so every tool call executes in the sandbox
 //! and the agent loop with its login stays outside (ADR 10).
 //!
 //! Build static for any Linux image: `cargo build --release --target x86_64-unknown-linux-musl
-//! --bin togra-mcp-exec`.
+//! --bin toto-mcp-exec`.
 
 use serde_json::{json, Value};
 use std::io::{BufRead, Read, Write};
@@ -117,7 +117,7 @@ fn handle(req: &Value) -> Option<Value> {
         "initialize" => Ok(json!({
             "protocolVersion": req["params"]["protocolVersion"].as_str().unwrap_or("2024-11-05"),
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "togra-exec", "version": env!("CARGO_PKG_VERSION")},
+            "serverInfo": {"name": "toto-exec", "version": env!("CARGO_PKG_VERSION")},
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools()})),
@@ -164,7 +164,7 @@ fn relay(listen: &str, sock: &str) -> Result<(), String> {
 
 fn exit_with(r: Result<(), String>) {
     if let Err(e) = r {
-        eprintln!("togra-mcp-exec: {e}");
+        eprintln!("toto-mcp-exec: {e}");
         std::process::exit(1);
     }
 }

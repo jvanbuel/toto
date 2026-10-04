@@ -19,15 +19,15 @@ Design it so the server is a convenience, not a trust anchor:
 
 - The queue API is an **open, versioned protocol**, documented independently of the implementation.
 - Runners verify project signatures on manifests themselves (ADR 3); a compromised or replaced coordinator cannot forge tasks or results.
-- `togra` can be configured with **multiple coordinator endpoints**, so moving to per-project queues later only changes where it polls.
+- `toto` can be configured with **multiple coordinator endpoints**, so moving to per-project queues later only changes where it polls.
 
 ### Resource shares
 
-Contributors allocate capacity per project as **resource shares** (e.g. 60% project A, 40% project B), on top of their overall caps. `togra`'s policy engine enforces the shares locally when choosing which lease to claim, so consent stays with the contributor whether there is one coordinator or many.
+Contributors allocate capacity per project as **resource shares** (e.g. 60% project A, 40% project B), on top of their overall caps. `toto`'s policy engine enforces the shares locally when choosing which lease to claim, so consent stays with the contributor whether there is one coordinator or many.
 
 ### Federation path
 
-The target for federation is BOINC's model: each project runs its own queue speaking the open protocol, and the registry acts as an *account manager* that curates projects and distributes their endpoints and keys (see ADR 7). `togra` already supports multiple endpoints and per-project shares, so this is a configuration change for runners.
+The target for federation is BOINC's model: each project runs its own queue speaking the open protocol, and the registry acts as an *account manager* that curates projects and distributes their endpoints and keys (see ADR 7). `toto` already supports multiple endpoints and per-project shares, so this is a configuration change for runners.
 
 ## Alternatives considered
 
