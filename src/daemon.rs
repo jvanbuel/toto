@@ -37,11 +37,10 @@ impl Status {
         self.task = task;
         self.updated = Local::now().to_rfc3339();
         let tmp = state_dir.join("status.json.tmp");
-        if let Ok(b) = serde_json::to_vec_pretty(self) {
-            if std::fs::write(&tmp, b).is_ok() {
+        if let Ok(b) = serde_json::to_vec_pretty(self)
+            && std::fs::write(&tmp, b).is_ok() {
                 let _ = std::fs::rename(tmp, state_dir.join("status.json"));
             }
-        }
     }
 }
 

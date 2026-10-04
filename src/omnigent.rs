@@ -254,13 +254,12 @@ impl Harness for OmnigentHarness {
         let deadline = Instant::now() + Duration::from_secs(task.sandbox_profile.timeout_secs);
         let (mut session, mut seen, mut next_poll) = (None::<String>, 0u64, Instant::now());
         let charge = |h: &Self, session: &Option<String>, seen: &mut u64, meter: &mut UsageMeter| -> Result<()> {
-            if let Some(total) = session.as_deref().and_then(|s| h.session_tokens(s)) {
-                if total > *seen {
+            if let Some(total) = session.as_deref().and_then(|s| h.session_tokens(s))
+                && total > *seen {
                     let delta = total - *seen;
                     *seen = total;
                     meter.record(delta)?;
                 }
-            }
             Ok(())
         };
         let status = loop {

@@ -345,8 +345,8 @@ impl UsageScanner {
     }
 
     pub fn total(&mut self) -> u64 {
-        if !self.json_body.is_empty() {
-            if let Ok(v) = serde_json::from_slice::<Value>(&self.json_body) {
+        if !self.json_body.is_empty()
+            && let Ok(v) = serde_json::from_slice::<Value>(&self.json_body) {
                 if self.provider == Provider::OpenAi {
                     self.take_openai(&v["usage"]);
                     return self.input + self.output;
@@ -357,7 +357,6 @@ impl UsageScanner {
                 self.cache_creation = n("cache_creation_input_tokens");
                 self.output = n("output_tokens");
             }
-        }
         self.input + self.cache_creation + self.output
     }
 }

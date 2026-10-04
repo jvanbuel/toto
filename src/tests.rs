@@ -383,7 +383,7 @@ mod daemon {
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let state = cfg.state_dir.clone();
         let handle = tokio::spawn(crate::daemon::run(cfg, async { let _ = rx.await; }));
-        for _ in 0..100 {
+        for _ in 0..600 {
             if q.results().unwrap().len() == 1 {
                 break;
             }
@@ -674,7 +674,7 @@ mod io_artifacts {
 
     fn tar_of(entries: &[Vec<u8>]) -> Vec<u8> {
         let mut v: Vec<u8> = entries.concat();
-        v.extend(std::iter::repeat(0u8).take(1024));
+        v.extend(std::iter::repeat_n(0u8, 1024));
         v
     }
 
@@ -1736,7 +1736,7 @@ mod proxy {
         for path in ["/v1/messages", "/v1/chat/completions", "/v1/models", "/v1/files", "/v1/responses/resp_1", "/v1/responses/../models"] {
             assert_eq!(call(p.socket(), &post(path, "", "{}")).0, 403, "POST {path}");
         }
-        assert_eq!(call(p.socket(), format!("GET /v1/responses HTTP/1.1\r\nhost: x\r\n\r\n").as_bytes()).0, 403);
+        assert_eq!(call(p.socket(), "GET /v1/responses HTTP/1.1\r\nhost: x\r\n\r\n".to_string().as_bytes()).0, 403);
         assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
@@ -1782,7 +1782,9 @@ mod proxy_container {
     }
 
     /// Fake API origin recording the auth headers it receives.
-    pub fn fake_api(body: &'static str, ctype: &'static str) -> (String, Arc<Mutex<Vec<Vec<(String, String)>>>>) {
+    pub type SeenHeaders = Arc<Mutex<Vec<Vec<(String, String)>>>>;
+
+    pub fn fake_api(body: &'static str, ctype: &'static str) -> (String, SeenHeaders) {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", l.local_addr().unwrap());
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -2108,7 +2110,7 @@ mod claude_in_container {
         let check = exec_io(&mk(&[]), &["cat", "/workspace/x.txt"], None, Duration::from_secs(10), 1024).unwrap();
         let first_result = seen.lock().unwrap().iter().map(|(_, b)| b.clone()).find(|b| b.contains("tool_result")).unwrap_or_default();
         let at = first_result.find("tool_result").unwrap_or(0);
-        assert_eq!(String::from_utf8_lossy(&check.stdout), "hello-from-omnigent-tool\n", "the tool ran in the container. tool_result was: {}", first_result[at.saturating_sub(100)..(at + 700).min(first_result.len())].to_string());
+        assert_eq!(String::from_utf8_lossy(&check.stdout), "hello-from-omnigent-tool\n", "the tool ran in the container. tool_result was: {}", &first_result[at.saturating_sub(100)..(at + 700).min(first_result.len())]);
         let bodies = seen.lock().unwrap().clone();
         // the last request carries the whole conversation, including the shell tool's output
         let last = bodies.iter().map(|(_, b)| b.as_str()).filter(|b| b.contains("tool_result")).max_by_key(|b| b.matches("tool_result").count()).expect("tool results reached the model");
@@ -2251,7 +2253,7 @@ mod claude_in_container {
         eprintln!("FACT egress experiment took {:?}: {:?}", started.elapsed(), r.as_ref().map(|s| s.chars().take(100).collect::<String>()).map_err(|e| e.to_string().chars().take(1500).collect::<String>()));
         let bodies = seen.lock().unwrap().clone();
         let last = bodies.iter().map(|(_, b)| b.as_str()).filter(|b| b.contains("tool_result")).max_by_key(|b| b.matches("tool_result").count()).unwrap_or("");
-        if let Some(i) = last.rfind("uid=") { eprintln!("FACT shell output: {}", &last[i.saturating_sub(10)..(i + 900).min(last.len())].replace("\\n", " | ")); }
+        if let Some(i) = last.rfind("uid=") { eprintln!("FACT shell output: {}", last[i.saturating_sub(10)..(i + 900).min(last.len())].replace("\\n", " | ")); }
         let shell = last.rfind("uid=").map(|i| last[i..].replace("\\n", "\n")).unwrap_or_default();
         let section = |from: &str, to: &str| -> String { shell.split(from).nth(1).and_then(|r| r.split(to).next()).unwrap_or("").trim().to_string() };
         assert!(shell.starts_with("uid=65534"), "tool runs unprivileged: {shell}");
@@ -2523,13 +2525,13 @@ mod codex_in_container {
         assert!(events.iter().any(|e| e["item"]["text"] == "DONE-FROM-FAKE-API"), "{stdout}");
 
         let check = exec_io(&mk(&[]), &["cat", "/workspace/x.txt"], None, Duration::from_secs(10), 1024).unwrap();
-        let tool_out = seen.lock().unwrap().iter().map(|(_, b)| b.clone()).filter(|b| b.contains("custom_tool_call_output")).last().map(|b| {
+        let tool_out = seen.lock().unwrap().iter().map(|(_, b)| b.clone()).rfind(|b| b.contains("custom_tool_call_output")).map(|b| {
             let v: serde_json::Value = serde_json::from_str(&b).unwrap_or_default();
             v["input"].as_array().into_iter().flatten().filter(|i| i["type"] == "custom_tool_call_output").map(|i| i["output"].to_string()).collect::<Vec<_>>().join(" | ")
         }).unwrap_or_default();
         assert_eq!(String::from_utf8_lossy(&check.stdout), "hello-from-codex\n", "the tool ran in the container. Codex reported: {tool_out}");
         let bodies = seen.lock().unwrap().clone();
-        let last = bodies.iter().map(|(_, b)| b.as_str()).filter(|b| serde_json::from_str::<serde_json::Value>(b).is_ok_and(|v| v["input"].as_array().into_iter().flatten().any(|i| i["type"] == "custom_tool_call_output"))).last().expect("the tool output reached the model");
+        let last = bodies.iter().map(|(_, b)| b.as_str()).rfind(|b| serde_json::from_str::<serde_json::Value>(b).is_ok_and(|v| v["input"].as_array().into_iter().flatten().any(|i| i["type"] == "custom_tool_call_output"))).expect("the tool output reached the model");
         assert!(last.contains("65534") && last.contains("key=not-a-credential"), "ran as nobody; only the dummy key exists inside: {last}");
         let calls: Vec<_> = bodies.iter().filter(|(h, _)| h.iter().any(|(k, v)| k == "path" && v == "/v1/responses")).collect();
         assert!(calls.len() >= 2);

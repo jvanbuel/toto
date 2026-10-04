@@ -83,18 +83,17 @@ impl QueueClient for InMemoryQueue {
         let done = |id: &str| s.results.keys().any(|(t, _)| t == id);
         Ok(s.tasks
             .iter()
-            .filter(|(id, _)| !done(id) && s.leases.get(id).map_or(true, |(_, exp)| *exp <= now))
+            .filter(|(id, _)| !done(id) && s.leases.get(id).is_none_or(|(_, exp)| *exp <= now))
             .map(|(_, e)| e.clone())
             .collect())
     }
 
     fn claim(&self, task_id: &str, runner_id: &str, lease: Duration) -> Result<()> {
         let mut s = self.state.lock().unwrap();
-        if let Some((holder, exp)) = s.leases.get(task_id) {
-            if *exp > Instant::now() && holder != runner_id {
+        if let Some((holder, exp)) = s.leases.get(task_id)
+            && *exp > Instant::now() && holder != runner_id {
                 return Err(Error::Queue("already leased".into()));
             }
-        }
         s.leases.insert(task_id.into(), (runner_id.into(), Instant::now() + lease));
         Ok(())
     }

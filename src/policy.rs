@@ -114,11 +114,10 @@ impl Policy {
             return Err(Error::Policy("MCP servers that run commands inside the sandbox are not allowed".into()));
         }
         for m in &c.mcp {
-            if let Some(host) = m.remote_host() {
-                if !self.allowed_mcp_hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+            if let Some(host) = m.remote_host()
+                && !self.allowed_mcp_hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
                     return Err(Error::Policy(format!("mcp host `{host}` not allowed")));
                 }
-            }
         }
         Ok(())
     }
