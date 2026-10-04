@@ -181,9 +181,38 @@ mod docker {
     }
 
     #[test]
-    fn network_allowlist_fails_closed() {
-        let p = SandboxProfile { network_allowlist: vec!["pypi.org".into()], ..Default::default() };
-        assert!(DockerSandbox::new("alpine").run_args("t1", &p).is_err());
+    fn egress_rules_need_the_contributors_network_switch() {
+        let p = SandboxProfile { network_allowlist: vec!["GET pypi.org/**".into()], ..Default::default() };
+        assert!(DockerSandbox::new("alpine").run_args("t1", &p).is_err(), "network off: refuse");
+        let mut sb = DockerSandbox::new("alpine");
+        sb.network = true;
+        let a = sb.run_args("t1", &p).unwrap().join(" ");
+        assert!(a.contains("--network bridge") && a.contains("--cap-drop ALL") && a.contains("--read-only"), "{a}");
+        let none = sb.run_args("t1", &SandboxProfile::default()).unwrap().join(" ");
+        assert!(none.contains("--network none"), "no rules, no network even when allowed: {none}");
+    }
+
+    #[test]
+    fn egress_rule_syntax_and_policy() {
+        use crate::manifest::valid_egress_rule as ok;
+        for good in ["GET api.github.com/repos/org/**", "GET,POST *.github.com/**", "* pypi.org/**", "HEAD 172.17.0.1/**"] {
+            assert!(ok(good), "{good}");
+        }
+        for bad in ["api.github.com", "get api.github.com/x", "GET evil.com@x.com/x", "GET host", "GET ho st/x", "GET %2e.com/x", " /x", "GET /x"] {
+            assert!(!ok(bad), "{bad}");
+        }
+        let mut m = super::task("n1", "a", 1, &ed25519_dalek::SigningKey::from_bytes(&[1; 32]));
+        m.sandbox_profile.network_allowlist = vec!["nonsense".into()];
+        let mut pol = super::policy();
+        let now = chrono::Local::now();
+        pol.max_profile.network_allowlist = vec!["nonsense".into()];
+        assert!(pol.admit(&m, 0, now).is_err(), "malformed rules are refused even if listed");
+        m.sandbox_profile.network_allowlist = vec!["GET a.org/**".into()];
+        assert!(pol.admit(&m, 0, now).is_err(), "rules outside the contributor's list are refused");
+        pol.max_profile.network_allowlist = vec!["GET a.org/**".into()];
+        assert!(pol.admit(&m, 0, now).is_ok());
+        assert!(crate::omnigent::egress_sandbox_spec(&[]).is_none());
+        assert_eq!(crate::omnigent::egress_sandbox_spec(&["GET a.org/**".into()]).unwrap()["egress_rules"][0], "GET a.org/**");
     }
 
     #[test]
@@ -480,7 +509,7 @@ echo "the answer""#;
         assert!(c.build().is_err(), "docker sandbox without the bridge must be refused");
         c.sandbox = crate::config::SandboxConfig::Bwrap;
         assert!(c.build().is_ok());
-        c.sandbox = crate::config::SandboxConfig::Docker { bin: "docker".into(), image: "alpine".into(), runtime: None, bridge: Some("/x/toto-mcp-exec".into()), nested_userns: false };
+        c.sandbox = crate::config::SandboxConfig::Docker { bin: "docker".into(), image: "alpine".into(), runtime: None, bridge: Some("/x/toto-mcp-exec".into()), nested_userns: false, network: false };
         assert!(c.build().is_ok(), "docker + bridge is the container route");
     }
 }
@@ -1394,7 +1423,7 @@ mod claude_cli {
         assert!(c.build().is_err(), "docker without bridge");
         c.sandbox = crate::config::SandboxConfig::Bwrap;
         assert!(c.build().is_err(), "bwrap has no bridge");
-        c.sandbox = crate::config::SandboxConfig::Docker { bin: "docker".into(), image: "alpine".into(), runtime: None, bridge: Some("/x".into()), nested_userns: false };
+        c.sandbox = crate::config::SandboxConfig::Docker { bin: "docker".into(), image: "alpine".into(), runtime: None, bridge: Some("/x".into()), nested_userns: false, network: false };
         assert!(c.build().is_ok());
     }
 }
@@ -1980,7 +2009,7 @@ mod claude_in_container {
         let (url, seen) = fake_anthropic("cat calc.txt; echo fixed > calc.txt; ls .claude/skills; cat AGENTS.md; id -u");
 
         let mut cfg = Config::starter(&f.dir);
-        cfg.sandbox = SandboxConfig::Docker { bin: "docker".into(), image: "debian:bookworm-slim".into(), runtime: None, bridge: Some(bridge), nested_userns: false };
+        cfg.sandbox = SandboxConfig::Docker { bin: "docker".into(), image: "debian:bookworm-slim".into(), runtime: None, bridge: Some(bridge), nested_userns: false, network: false };
         cfg.harness = HarnessConfig::Claude { bin: "claude".into(), token_file: None, model: None, placement: PlacementConfig::Container, upstream: url, agent_binary: Some(claude), agent_extra_files: vec![], api_key_file: None };
         cfg.policy = super::policy();
         cfg.policy.allow_context = true;
@@ -2114,7 +2143,7 @@ mod claude_in_container {
             ("mcp__omnigent__sys_os_shell", serde_json::json!({"command": "cat calc.txt; echo fixed > calc.txt; ls .claude/skills; cat AGENTS.md; id -u"})),
         ]);
         let mut cfg = Config::starter(&f.dir);
-        cfg.sandbox = SandboxConfig::Docker { bin: "docker".into(), image: "toto-omnigent-test".into(), runtime: None, bridge: Some(bridge), nested_userns: false };
+        cfg.sandbox = SandboxConfig::Docker { bin: "docker".into(), image: "toto-omnigent-test".into(), runtime: None, bridge: Some(bridge), nested_userns: false, network: false };
         cfg.harness = HarnessConfig::Omnigent { bin: "omnigent".into(), server_url: "http://unused".into(), harness: "claude-sdk".into(), placement: PlacementConfig::Container, provider: Default::default(), upstream: Some(url), token_file: None, api_key_file: None, agent_files: vec![], model: None };
         cfg.policy = super::policy();
         cfg.policy.allow_context = true;
@@ -2168,9 +2197,31 @@ mod claude_in_container {
             return;
         }
         let f = fixture("omni-egress");
+        // A local web server on the docker bridge gateway stands in for "the internet". The task's
+        // rules allow `GET /ok` only; the server records every path it is asked for.
+        let gw = "172.17.0.1";
+        let listener = std::net::TcpListener::bind((gw, 0)).or_else(|_| std::net::TcpListener::bind("0.0.0.0:0")).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        {
+            let hits = hits.clone();
+            std::thread::spawn(move || {
+                use std::io::{BufRead, BufReader, Write};
+                for s in listener.incoming().flatten() {
+                    let mut line = String::new();
+                    let _ = BufReader::new(&s).read_line(&mut line);
+                    hits.lock().unwrap().push(line.trim().to_string());
+                    let mut s = s;
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nopen");
+                }
+            });
+        }
+        let base = format!("http://{gw}:{port}");
+        let cmd = "echo uid=$(id -u); req() { python3 - \"$1\" \"$2\" <<'PY'\nimport sys,urllib.request as u\ntry:\n    r=u.urlopen(u.Request('@BASE@'+sys.argv[2],data=b'{}' if sys.argv[1]=='POST' else None,method=sys.argv[1]),timeout=8); print('status',r.status,r.read()[:20])\nexcept Exception as e: print('fail',type(e).__name__,str(e)[:60])\nPY\n}; echo ALLOWED:; req GET /ok; echo WRONGPATH:; req GET /secret; echo WRONGMETHOD:; req POST /ok; echo RAW:; (exec 3<>/dev/tcp/@GW@/@PORT@ && echo raw-connected) 2>&1 | head -c 100; echo; echo END:"
+            .replace("@BASE@", &base).replace("@GW@", gw).replace("@PORT@", &port.to_string());
         let (url, seen) = fake_scripted(vec![
             ("ToolSearch", serde_json::json!({"query": "select:mcp__omnigent__sys_os_shell", "max_results": 1})),
-            ("mcp__omnigent__sys_os_shell", serde_json::json!({"command": "echo uid=$(id -u); env | grep -i proxy | sed 's/^/ENV /'; req() { python3 - \"$1\" \"$2\" <<'PY'\nimport sys,urllib.request as u\ntry:\n    r=u.urlopen(u.Request('http://127.0.0.1:8080'+sys.argv[2],data=b'{}' if sys.argv[1]=='POST' else None,method=sys.argv[1]),timeout=8); print('status',r.status)\nexcept Exception as e: print('fail',type(e).__name__,str(e)[:100])\nPY\n}; echo ALLOWED:; req POST /v1/messages; echo FORBIDDEN:; req GET /v1/models; echo RAW:; (exec 3<>/dev/tcp/127.0.0.1/8080 && echo raw-connected) 2>&1 | head -c 100; echo NETDEV:; ls /sys/class/net 2>&1"})),
+            ("mcp__omnigent__sys_os_shell", serde_json::json!({"command": cmd})),
         ]);
         let dir = f.dir.join("sock");
         std::fs::create_dir_all(&dir).unwrap();
@@ -2178,14 +2229,20 @@ mod claude_in_container {
         let proxy = Arc::new(AuthProxy::start(&dir.join("p.sock"), &url, crate::proxy::Provider::Anthropic, Auth::Bearer { token: "REAL-SECRET-TOKEN".into(), oauth: true }).unwrap());
         let profile = f.dir.join("seccomp.json");
         std::fs::write(&profile, include_str!("../profiles/seccomp-nested-userns.json")).unwrap();
-        let t = task("eg1", "a", 1, &f.key_a);
+        let mut t = task("eg1", "a", 1, &f.key_a);
+        t.sandbox_profile.network_allowlist = vec![format!("GET {gw}/ok")];
         let mut sb = DockerSandbox::new("toto-omnigent-test");
+        sb.network = true;
         sb.bridge = Some(bridge);
         sb.proxy_socket = Some(proxy.socket().to_path_buf());
         sb.seccomp_profile = Some(profile);
         let ws = sb.create(&t, &t.sandbox_profile).unwrap();
         let mut h = OmnigentHarness::new(&f.dir).unwrap().in_container(proxy.clone(), crate::proxy::Provider::Anthropic);
-        h.sandbox_spec = Some(serde_json::json!({"type": "linux_bwrap", "write_paths": ["."], "allow_network": true, "egress_allow_private_destinations": true, "egress_rules": ["POST 127.0.0.1/v1/messages", "HEAD 127.0.0.1/**"]}));
+        // The spec comes from the task's rules; only the private-destination switch is added so the
+        // stand-in server on the bridge is reachable (a real task would reach public hosts).
+        let mut spec = crate::omnigent::egress_sandbox_spec(&t.sandbox_profile.network_allowlist).expect("rules give a spec");
+        spec["egress_allow_private_destinations"] = true.into();
+        h.sandbox_spec = Some(spec);
         let mut tm = task("eg1", "a", 100000, &f.key_a);
         tm.prompt = "RUN-THE-TOOL".into();
         tm.sandbox_profile.timeout_secs = 170;
@@ -2198,9 +2255,13 @@ mod claude_in_container {
         let shell = last.rfind("uid=").map(|i| last[i..].replace("\\n", "\n")).unwrap_or_default();
         let section = |from: &str, to: &str| -> String { shell.split(from).nth(1).and_then(|r| r.split(to).next()).unwrap_or("").trim().to_string() };
         assert!(shell.starts_with("uid=65534"), "tool runs unprivileged: {shell}");
-        assert!(section("ALLOWED:", "FORBIDDEN:").contains("status 200"), "rule-allowed request passes: {shell}");
-        assert!(section("FORBIDDEN:", "RAW:").contains("403"), "request outside the rules is refused: {shell}");
-        assert!(section("RAW:", "NETDEV:").contains("refused") && !section("RAW:", "NETDEV:").contains("raw-connected"), "no direct socket: {shell}");
+        assert!(section("ALLOWED:", "WRONGPATH:").contains("status 200"), "rule-allowed request passes: {shell}");
+        assert!(section("WRONGPATH:", "WRONGMETHOD:").contains("403"), "other paths are refused: {shell}");
+        assert!(section("WRONGMETHOD:", "RAW:").contains("403"), "other methods are refused: {shell}");
+        assert!(!section("RAW:", "END:").contains("raw-connected"), "no direct socket: {shell}");
+        let seen_paths = hits.lock().unwrap().clone();
+        assert!(seen_paths.iter().any(|l| l.starts_with("GET /ok")), "server got the allowed request: {seen_paths:?}");
+        assert!(!seen_paths.iter().any(|l| l.contains("/secret") || l.starts_with("POST")), "forbidden requests never reached the server: {seen_paths:?}");
         eprintln!("FACT model calls seen by the fake API: {}", bodies.iter().filter(|(h, _)| h.iter().any(|(k, v)| k == "path" && v.starts_with("/v1/messages"))).count());
         sb.destroy(ws).unwrap();
         r.expect("omnigent with a nested bwrap sandbox should finish");

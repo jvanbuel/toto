@@ -327,7 +327,10 @@ impl OmnigentHarness {
         let sh = with_env(&envs);
         // Agent config and prompt are written into the container; the prompt goes through a file so
         // it never appears in a process list or hits argument-length limits.
-        let cfg = container_agent_config(ctx, &self.harness, self.model.as_deref(), self.sandbox_spec.as_ref());
+        // Egress rules from the task (already checked against the contributor's policy) become the
+        // spec of Omnigent's nested sandbox; an explicit `sandbox_spec` overrides that.
+        let derived = egress_sandbox_spec(&task.sandbox_profile.network_allowlist);
+        let cfg = container_agent_config(ctx, &self.harness, self.model.as_deref(), self.sandbox_spec.as_ref().or(derived.as_ref()));
         let t = Duration::from_secs(30);
         exec_io(&sh, &["sh", "-c", "mkdir -p /tmp/agent /tmp/home && cat > /tmp/agent/config.yaml"], Some(cfg.as_bytes()), t, 4096)?;
         exec_io(&sh, &["sh", "-c", "cat > /tmp/prompt.txt"], Some(task.prompt.as_bytes()), t, 4096)?;
@@ -402,4 +405,14 @@ impl DockerName {
     fn of(id: &str) -> String {
         crate::sandbox::DockerSandbox::container_name(id)
     }
+}
+
+/// Omnigent sandbox spec that enforces the task's egress rules inside the container, or `None` when
+/// the task has no rules. Private and loopback destinations stay blocked (Omnigent's default), so
+/// tools cannot reach the contributor's LAN.
+pub fn egress_sandbox_spec(rules: &[String]) -> Option<serde_json::Value> {
+    if rules.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({"type": "linux_bwrap", "write_paths": ["."], "allow_network": true, "egress_rules": rules}))
 }

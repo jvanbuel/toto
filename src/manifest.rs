@@ -8,7 +8,9 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxProfile {
-    /// Hosts the task may reach. Empty means default-deny egress.
+    /// Egress rules in Omnigent's DSL (`METHODS host/path`, e.g. `GET api.github.com/repos/org/**`).
+    /// Empty means no network at all. The runner only validates and passes them on; Omnigent inside
+    /// the container enforces them.
     #[serde(default)]
     pub network_allowlist: Vec<String>,
     pub cpu_millis: u32,
@@ -103,4 +105,15 @@ pub fn generate_key() -> SigningKey {
     let mut seed = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut seed);
     SigningKey::from_bytes(&seed)
+}
+
+/// Whether `rule` is a well-formed Omnigent egress rule: `METHODS host/path`, where METHODS is `*`
+/// or comma-separated upper-case verbs, host is a DNS-safe name (optionally `*.domain`) and the
+/// path starts with `/`.
+pub fn valid_egress_rule(rule: &str) -> bool {
+    let Some((methods, target)) = rule.split_once(' ') else { return false };
+    let methods_ok = methods == "*" || methods.split(',').all(|m| !m.is_empty() && m.bytes().all(|b| b.is_ascii_uppercase()));
+    let Some((host, path)) = target.split_once('/') else { return false };
+    let host = host.strip_prefix("*.").unwrap_or(host);
+    methods_ok && !host.is_empty() && host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') && !path.contains(char::is_whitespace)
 }

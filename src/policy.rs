@@ -87,8 +87,11 @@ impl Policy {
             return deny("would exceed daily cap".into());
         }
         let (p, max) = (&m.sandbox_profile, &self.max_profile);
+        if let Some(r) = p.network_allowlist.iter().find(|r| !crate::manifest::valid_egress_rule(r)) {
+            return deny(format!("malformed egress rule `{r}`"));
+        }
         if let Some(h) = p.network_allowlist.iter().find(|h| !max.network_allowlist.contains(h)) {
-            return deny(format!("network host `{h}` outside policy"));
+            return deny(format!("egress rule `{h}` outside policy"));
         }
         if p.cpu_millis > max.cpu_millis || p.memory_mb > max.memory_mb || p.timeout_secs > max.timeout_secs {
             return deny("sandbox profile exceeds policy limits".into());

@@ -68,3 +68,13 @@ The credential stays outside the container (the proxy); the network rules can li
 - The image needs `bubblewrap` (see `docs/examples/omnigent-image/Dockerfile`).
 - Rules that reach beyond the relay (arbitrary internet hosts) need an upstream exit that the host proxy does not provide yet. Until then the host-side proxy remains the hard limit and Omnigent's rules can only narrow what the relay already offers.
 - Not verified: AppArmor `docker-default` interaction, hosts other than this Linux kernel, real credentials.
+
+## Update (2026-10-04): network access is the project's rules, enforced by Omnigent
+
+Decision: the host proxy is a credential boundary only (it swaps in the secret and meters usage); it does not filter general traffic. Network policy is authored by the project and enforced inside the container.
+
+- `sandbox_profile.network_allowlist` in the signed manifest now holds Omnigent egress rules (`METHODS host/path`, e.g. `GET api.github.com/repos/org/**`). The runner only checks the syntax (`valid_egress_rule`) and that each rule appears in the contributor's `max_profile.network_allowlist` (exact match, default none).
+- The docker sandbox gets a network (`--network bridge`) only when the contributor set `network = true` in the sandbox config **and** the task carries rules. Otherwise the task is refused (rules, no switch) or runs with `--network none` (no rules). Everything else stays hardened.
+- The Omnigent container placement turns the rules into the nested sandbox spec (`egress_sandbox_spec`: `linux_bwrap`, `allow_network`, `egress_rules`). Private and loopback destinations stay blocked, so tools cannot reach the contributor's LAN. This needs the nested-userns profile and the image prerequisites above.
+- Tested against a stand-in web server: `GET /ok` passed, another path and another method got 403 and never reached the server, and a raw socket failed.
+- Limit: the rules bind the tool sandbox. The harness process and stdio MCP servers run unsandboxed inside the container and, once the container has a network, can reach anything the container can. The project's image owns that risk. The credential is not in the container.

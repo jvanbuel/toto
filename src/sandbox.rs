@@ -129,8 +129,9 @@ impl Sandbox for DirSandbox {
 
 /// Hardened Docker/Podman sandbox: one throwaway container per task.
 ///
-/// - no network (`--network none`); manifests asking for an allowlist are refused until an
-///   egress proxy exists, so the sandbox fails closed;
+/// - no network (`--network none`) unless the contributor enabled `network` *and* the task has egress
+///   rules; the rules are enforced by Omnigent inside the container, not by the host. Without
+///   `network`, tasks asking for rules are refused (fail closed);
 /// - read-only root, all capabilities dropped, `no-new-privileges`, non-root user;
 /// - no host mounts: the workspace is a size-limited tmpfs inside the container;
 /// - CPU, memory and pids limits from the profile;
@@ -152,6 +153,8 @@ pub struct DockerSandbox {
     /// Seccomp profile file. `None` keeps Docker's default; `toto`'s opt-in profile allows a nested
     /// bubblewrap (see `profiles/README.md`).
     pub seccomp_profile: Option<PathBuf>,
+    /// Allow a network for tasks that carry egress rules. Off by default.
+    pub network: bool,
     /// Agent CLI files mounted read-only under `AGENT_DIR`, each under its own file name. The
     /// first is the executable; companions (e.g. Codex's `codex-code-mode-host`) must sit next to it.
     pub agent_files: Vec<PathBuf>,
@@ -161,7 +164,7 @@ pub struct DockerSandbox {
 
 impl DockerSandbox {
     pub fn new(image: impl Into<String>) -> Self {
-        Self { bin: "docker".into(), image: image.into(), runtime: None, workspace_mb: 512, bridge: None, proxy_socket: None, seccomp_profile: None, agent_files: vec![], baselines: Default::default() }
+        Self { bin: "docker".into(), image: image.into(), runtime: None, workspace_mb: 512, bridge: None, proxy_socket: None, seccomp_profile: None, network: false, agent_files: vec![], baselines: Default::default() }
     }
 
     pub fn container_name(task_id: &str) -> String {
@@ -171,12 +174,13 @@ impl DockerSandbox {
 
     /// The `run` argument list; pure so the hardening flags are unit-tested without a daemon.
     pub fn run_args(&self, task_id: &str, p: &SandboxProfile) -> Result<Vec<String>> {
-        if !p.network_allowlist.is_empty() {
-            return Err(Error::Sandbox("network allowlists are not supported yet; refusing to run".into()));
+        if !p.network_allowlist.is_empty() && !self.network {
+            return Err(Error::Sandbox("the task wants network access but this sandbox has `network` off; refusing to run".into()));
         }
+        let net = if p.network_allowlist.is_empty() { "none" } else { "bridge" };
         let mut a: Vec<String> = [
             "run", "-d", "--rm", "--name", &Self::container_name(task_id),
-            "--network", "none", "--read-only", "--cap-drop", "ALL",
+            "--network", net, "--read-only", "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges", "--user", "65534:65534",
             "--pids-limit", "256", "--workdir", "/workspace",
         ]
