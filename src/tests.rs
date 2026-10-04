@@ -480,7 +480,7 @@ echo "the answer""#;
         assert!(c.build().is_err(), "docker sandbox without the bridge must be refused");
         c.sandbox = crate::config::SandboxConfig::Bwrap;
         assert!(c.build().is_ok());
-        c.sandbox = crate::config::SandboxConfig::Docker { bin: "docker".into(), image: "alpine".into(), runtime: None, bridge: Some("/x/toto-mcp-exec".into()) };
+        c.sandbox = crate::config::SandboxConfig::Docker { bin: "docker".into(), image: "alpine".into(), runtime: None, bridge: Some("/x/toto-mcp-exec".into()), nested_userns: false };
         assert!(c.build().is_ok(), "docker + bridge is the container route");
     }
 }
@@ -1394,7 +1394,7 @@ mod claude_cli {
         assert!(c.build().is_err(), "docker without bridge");
         c.sandbox = crate::config::SandboxConfig::Bwrap;
         assert!(c.build().is_err(), "bwrap has no bridge");
-        c.sandbox = crate::config::SandboxConfig::Docker { bin: "docker".into(), image: "alpine".into(), runtime: None, bridge: Some("/x".into()) };
+        c.sandbox = crate::config::SandboxConfig::Docker { bin: "docker".into(), image: "alpine".into(), runtime: None, bridge: Some("/x".into()), nested_userns: false };
         assert!(c.build().is_ok());
     }
 }
@@ -1980,7 +1980,7 @@ mod claude_in_container {
         let (url, seen) = fake_anthropic("cat calc.txt; echo fixed > calc.txt; ls .claude/skills; cat AGENTS.md; id -u");
 
         let mut cfg = Config::starter(&f.dir);
-        cfg.sandbox = SandboxConfig::Docker { bin: "docker".into(), image: "debian:bookworm-slim".into(), runtime: None, bridge: Some(bridge) };
+        cfg.sandbox = SandboxConfig::Docker { bin: "docker".into(), image: "debian:bookworm-slim".into(), runtime: None, bridge: Some(bridge), nested_userns: false };
         cfg.harness = HarnessConfig::Claude { bin: "claude".into(), token_file: None, model: None, placement: PlacementConfig::Container, upstream: url, agent_binary: Some(claude), agent_extra_files: vec![], api_key_file: None };
         cfg.policy = super::policy();
         cfg.policy.allow_context = true;
@@ -2114,7 +2114,7 @@ mod claude_in_container {
             ("mcp__omnigent__sys_os_shell", serde_json::json!({"command": "cat calc.txt; echo fixed > calc.txt; ls .claude/skills; cat AGENTS.md; id -u"})),
         ]);
         let mut cfg = Config::starter(&f.dir);
-        cfg.sandbox = SandboxConfig::Docker { bin: "docker".into(), image: "toto-omnigent-test".into(), runtime: None, bridge: Some(bridge) };
+        cfg.sandbox = SandboxConfig::Docker { bin: "docker".into(), image: "toto-omnigent-test".into(), runtime: None, bridge: Some(bridge), nested_userns: false };
         cfg.harness = HarnessConfig::Omnigent { bin: "omnigent".into(), server_url: "http://unused".into(), harness: "claude-sdk".into(), placement: PlacementConfig::Container, provider: Default::default(), upstream: Some(url), token_file: None, api_key_file: None, agent_files: vec![], model: None };
         cfg.policy = super::policy();
         cfg.policy.allow_context = true;
@@ -2153,6 +2153,57 @@ mod claude_in_container {
         let log = runner.audit.entries().unwrap();
         assert!(log[0].outcome == "submitted" && log[0].tokens > 50, "{log:?}");
         assert!(!bodies.iter().any(|(_, b)| b.contains("REAL-SECRET")));
+    }
+
+    /// Experiment: Omnigent's own bwrap sandbox and egress rules, nested inside our container.
+    #[test]
+    fn omnigent_egress_rules_inside_the_container() {
+        use crate::context::ProjectContext;
+        use crate::harness::Harness;
+        use crate::meter::UsageMeter;
+        use crate::omnigent::OmnigentHarness;
+        let bridge = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/toto-mcp-exec");
+        if !bridge.exists() || !docker_has("toto-omnigent-test") {
+            eprintln!("skipping: needs docker, the musl bridge and the toto-omnigent-test image (with bwrap)");
+            return;
+        }
+        let f = fixture("omni-egress");
+        let (url, seen) = fake_scripted(vec![
+            ("ToolSearch", serde_json::json!({"query": "select:mcp__omnigent__sys_os_shell", "max_results": 1})),
+            ("mcp__omnigent__sys_os_shell", serde_json::json!({"command": "echo uid=$(id -u); env | grep -i proxy | sed 's/^/ENV /'; req() { python3 - \"$1\" \"$2\" <<'PY'\nimport sys,urllib.request as u\ntry:\n    r=u.urlopen(u.Request('http://127.0.0.1:8080'+sys.argv[2],data=b'{}' if sys.argv[1]=='POST' else None,method=sys.argv[1]),timeout=8); print('status',r.status)\nexcept Exception as e: print('fail',type(e).__name__,str(e)[:100])\nPY\n}; echo ALLOWED:; req POST /v1/messages; echo FORBIDDEN:; req GET /v1/models; echo RAW:; (exec 3<>/dev/tcp/127.0.0.1/8080 && echo raw-connected) 2>&1 | head -c 100; echo NETDEV:; ls /sys/class/net 2>&1"})),
+        ]);
+        let dir = f.dir.join("sock");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let proxy = Arc::new(AuthProxy::start(&dir.join("p.sock"), &url, crate::proxy::Provider::Anthropic, Auth::Bearer { token: "REAL-SECRET-TOKEN".into(), oauth: true }).unwrap());
+        let profile = f.dir.join("seccomp.json");
+        std::fs::write(&profile, include_str!("../profiles/seccomp-nested-userns.json")).unwrap();
+        let t = task("eg1", "a", 1, &f.key_a);
+        let mut sb = DockerSandbox::new("toto-omnigent-test");
+        sb.bridge = Some(bridge);
+        sb.proxy_socket = Some(proxy.socket().to_path_buf());
+        sb.seccomp_profile = Some(profile);
+        let ws = sb.create(&t, &t.sandbox_profile).unwrap();
+        let mut h = OmnigentHarness::new(&f.dir).unwrap().in_container(proxy.clone(), crate::proxy::Provider::Anthropic);
+        h.sandbox_spec = Some(serde_json::json!({"type": "linux_bwrap", "write_paths": ["."], "allow_network": true, "egress_allow_private_destinations": true, "egress_rules": ["POST 127.0.0.1/v1/messages", "HEAD 127.0.0.1/**"]}));
+        let mut tm = task("eg1", "a", 100000, &f.key_a);
+        tm.prompt = "RUN-THE-TOOL".into();
+        tm.sandbox_profile.timeout_secs = 170;
+        let started = std::time::Instant::now();
+        let r = h.run(&tm, &ProjectContext::default(), &ws, &mut UsageMeter::new(1_000_000, 25));
+        eprintln!("FACT egress experiment took {:?}: {:?}", started.elapsed(), r.as_ref().map(|s| s.chars().take(100).collect::<String>()).map_err(|e| e.to_string().chars().take(1500).collect::<String>()));
+        let bodies = seen.lock().unwrap().clone();
+        let last = bodies.iter().map(|(_, b)| b.as_str()).filter(|b| b.contains("tool_result")).max_by_key(|b| b.matches("tool_result").count()).unwrap_or("");
+        if let Some(i) = last.rfind("uid=") { eprintln!("FACT shell output: {}", &last[i.saturating_sub(10)..(i + 900).min(last.len())].replace("\\n", " | ")); }
+        let shell = last.rfind("uid=").map(|i| last[i..].replace("\\n", "\n")).unwrap_or_default();
+        let section = |from: &str, to: &str| -> String { shell.split(from).nth(1).and_then(|r| r.split(to).next()).unwrap_or("").trim().to_string() };
+        assert!(shell.starts_with("uid=65534"), "tool runs unprivileged: {shell}");
+        assert!(section("ALLOWED:", "FORBIDDEN:").contains("status 200"), "rule-allowed request passes: {shell}");
+        assert!(section("FORBIDDEN:", "RAW:").contains("403"), "request outside the rules is refused: {shell}");
+        assert!(section("RAW:", "NETDEV:").contains("refused") && !section("RAW:", "NETDEV:").contains("raw-connected"), "no direct socket: {shell}");
+        eprintln!("FACT model calls seen by the fake API: {}", bodies.iter().filter(|(h, _)| h.iter().any(|(k, v)| k == "path" && v.starts_with("/v1/messages"))).count());
+        sb.destroy(ws).unwrap();
+        r.expect("omnigent with a nested bwrap sandbox should finish");
     }
 
     #[test]
@@ -2429,5 +2480,87 @@ mod codex_in_container {
         let hay = exec_io(&mk(&[]), &["sh", "-c", "env; cat /proc/mounts; echo done"], None, Duration::from_secs(10), 1 << 20).unwrap();
         assert!(!String::from_utf8_lossy(&hay.stdout).contains("REAL-OPENAI"));
         sb.destroy(ws).unwrap();
+    }
+}
+
+mod nested_userns {
+    use super::proxy_container::docker_has;
+    use super::{fixture, task};
+    use crate::sandbox::{exec, DockerSandbox, Sandbox, AGENT_DIR};
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    const PROFILE: &str = include_str!("../profiles/seccomp-nested-userns.json");
+
+    /// Syscalls the profile allows with no argument filter and no capability condition.
+    fn unconditional(p: &serde_json::Value) -> BTreeSet<String> {
+        p["syscalls"].as_array().unwrap().iter()
+            .filter(|r| r["action"] == "SCMP_ACT_ALLOW" && r.get("args").is_none_or(|a| a.as_array().is_none_or(Vec::is_empty)) && r["includes"]["caps"].is_null())
+            .flat_map(|r| r["names"].as_array().unwrap().iter().map(|n| n.as_str().unwrap().to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn profile_adds_exactly_what_a_nested_bwrap_needs() {
+        let p: serde_json::Value = serde_json::from_str(PROFILE).unwrap();
+        let allowed = unconditional(&p);
+        for needed in ["clone", "unshare", "mount", "umount2", "pivot_root", "sethostname"] {
+            assert!(allowed.contains(needed), "{needed} must be allowed");
+        }
+        // Still blocked without capabilities, as in Docker's default: the surface we did not open.
+        for danger in ["bpf", "keyctl", "add_key", "request_key", "perf_event_open", "kexec_load", "kexec_file_load", "init_module", "finit_module", "delete_module", "reboot", "open_by_handle_at", "setns", "chroot", "swapon", "acct", "settimeofday", "clock_settime", "syslog", "ptrace_unused"] {
+            assert!(!allowed.contains(danger), "{danger} must stay blocked");
+        }
+        // clone3 keeps Docker's behaviour (ENOSYS without caps), so glibc falls back to clone.
+        let clone3: Vec<_> = p["syscalls"].as_array().unwrap().iter().filter(|r| r["names"].as_array().unwrap().iter().any(|n| n == "clone3")).collect();
+        assert!(clone3.iter().any(|r| r["action"] == "SCMP_ACT_ERRNO" && r["errnoRet"] == 38));
+        assert!(!allowed.contains("clone3"));
+        assert_eq!(p["defaultAction"], "SCMP_ACT_ERRNO", "deny by default");
+    }
+
+    #[test]
+    fn profile_is_opt_in_and_the_rest_of_the_hardening_stays() {
+        let mut sb = DockerSandbox::new("img");
+        let plain = sb.run_args("t", &Default::default()).unwrap().join(" ");
+        assert!(!plain.contains("seccomp"), "Docker's default profile unless opted in");
+        sb.seccomp_profile = Some("/p/seccomp.json".into());
+        let with = sb.run_args("t", &Default::default()).unwrap().join(" ");
+        assert!(with.contains("--security-opt seccomp=/p/seccomp.json"));
+        for kept in ["--network none", "--read-only", "--cap-drop ALL", "no-new-privileges", "--user 65534:65534", "--pids-limit 256"] {
+            assert!(with.contains(kept), "{kept} must remain: {with}");
+        }
+    }
+
+    #[test]
+    fn nested_bwrap_runs_with_the_profile_and_not_without_it() {
+        let bwrap = std::process::Command::new("which").arg("bwrap").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|p| !p.is_empty());
+        let (Some(bwrap), true) = (bwrap, docker_has("ubuntu:24.04")) else {
+            eprintln!("skipping: needs docker, ubuntu:24.04 and a host bwrap");
+            return;
+        };
+        let f = fixture("userns");
+        let profile = f.dir.join("seccomp.json");
+        std::fs::write(&profile, PROFILE).unwrap();
+        let t = task("us1", "a", 1, &f.key_a);
+        let run = |with_profile: bool, id: &str| {
+            let mut sb = DockerSandbox::new("ubuntu:24.04");
+            sb.agent_files = vec![bwrap.clone().into()]; // mounts the host's bwrap at /toto/agent/bwrap
+            sb.seccomp_profile = with_profile.then(|| profile.clone());
+            let mut t = t.clone();
+            t.id = id.into();
+            let ws = sb.create(&t, &t.sandbox_profile).unwrap();
+            let bw = format!("{AGENT_DIR}/bwrap");
+            // bwrap with its own user and network namespaces: what Omnigent's egress enforcement uses
+            let inner = exec(&ws, &[bw.as_str(), "--unshare-user", "--unshare-net", "--ro-bind", "/", "/", "--dev", "/dev", "sh", "-c", "id -u; ls /sys/class/net | tr '\\n' ' '"], Duration::from_secs(20)).unwrap();
+            let outer = exec(&ws, &["sh", "-c", "id -u; cat /proc/self/status | grep -E '^CapEff'; (wget -T 2 -q -O- http://1.1.1.1 >/dev/null 2>&1 && echo net-open) || echo net-closed"], Duration::from_secs(20)).unwrap();
+            sb.destroy(ws).unwrap();
+            (inner, String::from_utf8_lossy(&outer.stdout).to_string())
+        };
+        let (inner, outer) = run(true, "us1");
+        assert!(inner.status.success(), "nested bwrap must work with the profile: {}", String::from_utf8_lossy(&inner.stderr));
+        assert!(String::from_utf8_lossy(&inner.stdout).starts_with("65534") || String::from_utf8_lossy(&inner.stdout).starts_with("0"), "{}", String::from_utf8_lossy(&inner.stdout));
+        assert!(outer.contains("65534") && outer.contains("CapEff:\t0000000000000000") && outer.contains("net-closed"), "outer container is still unprivileged and offline: {outer}");
+        let (blocked, _) = run(false, "us2");
+        assert!(!blocked.status.success() && String::from_utf8_lossy(&blocked.stderr).contains("No permissions to create new namespace"), "without the profile Docker's default must refuse: {}", String::from_utf8_lossy(&blocked.stderr));
     }
 }

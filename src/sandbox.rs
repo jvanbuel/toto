@@ -149,6 +149,9 @@ pub struct DockerSandbox {
     /// Credential proxy socket (host side), bind-mounted at `PROXY_SOCKET_PATH`. When set, a
     /// loopback relay to it is started inside the container at `PROXY_ADDR` (ADR 12).
     pub proxy_socket: Option<PathBuf>,
+    /// Seccomp profile file. `None` keeps Docker's default; `toto`'s opt-in profile allows a nested
+    /// bubblewrap (see `profiles/README.md`).
+    pub seccomp_profile: Option<PathBuf>,
     /// Agent CLI files mounted read-only under `AGENT_DIR`, each under its own file name. The
     /// first is the executable; companions (e.g. Codex's `codex-code-mode-host`) must sit next to it.
     pub agent_files: Vec<PathBuf>,
@@ -158,7 +161,7 @@ pub struct DockerSandbox {
 
 impl DockerSandbox {
     pub fn new(image: impl Into<String>) -> Self {
-        Self { bin: "docker".into(), image: image.into(), runtime: None, workspace_mb: 512, bridge: None, proxy_socket: None, agent_files: vec![], baselines: Default::default() }
+        Self { bin: "docker".into(), image: image.into(), runtime: None, workspace_mb: 512, bridge: None, proxy_socket: None, seccomp_profile: None, agent_files: vec![], baselines: Default::default() }
     }
 
     pub fn container_name(task_id: &str) -> String {
@@ -187,6 +190,9 @@ impl DockerSandbox {
         ]);
         if let Some(b) = &self.bridge {
             a.extend(["--mount".into(), format!("type=bind,src={},dst={BRIDGE_PATH},readonly", b.display())]);
+        }
+        if let Some(profile) = &self.seccomp_profile {
+            a.extend(["--security-opt".into(), format!("seccomp={}", profile.display())]);
         }
         if let Some(sock) = &self.proxy_socket {
             a.extend(["--mount".into(), format!("type=bind,src={},dst={PROXY_SOCKET_PATH}", sock.display())]);

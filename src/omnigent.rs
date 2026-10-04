@@ -48,6 +48,10 @@ pub struct OmnigentHarness {
     /// Model name for the agent's `executor.model`. Needed in container placement, where Omnigent
     /// cannot discover models from the provider.
     pub model: Option<String>,
+    /// Omnigent `os_env.sandbox` spec used in container placement. `None` means `{type: none}`
+    /// (the container is the sandbox); a bwrap spec with `egress_rules` needs the nested-userns
+    /// seccomp profile and `bubblewrap` in the image.
+    pub sandbox_spec: Option<serde_json::Value>,
 }
 
 /// Builds the agent config handed to Omnigent for one task. Everything comes from validated
@@ -96,14 +100,14 @@ pub fn agent_config(ctx: &ProjectContext, bridge: Option<&[String]>) -> String {
 /// Agent config for Omnigent running inside the container: its own tools run in the container
 /// (`sandbox: none`, the container is the sandbox) and project command servers start there too.
 /// Project skills are found in `/workspace/.claude/skills`, where the runner unpacked them.
-pub fn container_agent_config(ctx: &ProjectContext, harness: &str, model: Option<&str>) -> String {
+pub fn container_agent_config(ctx: &ProjectContext, harness: &str, model: Option<&str>, sandbox: Option<&serde_json::Value>) -> String {
     let mut cfg = serde_json::json!({
         "spec_version": 1,
         "name": "toto-task",
         "description": "A task donated through toto",
         "executor": {"type": "omnigent", "config": {"harness": harness}},
         "prompt": "You are completing one self-contained task for a public-good project. Work in the current directory and reply with the final result only.",
-        "os_env": {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}},
+        "os_env": {"type": "caller_process", "cwd": ".", "sandbox": sandbox.cloned().unwrap_or_else(|| serde_json::json!({"type": "none"}))},
     });
     if let Some(m) = model {
         cfg["executor"]["model"] = m.into();
@@ -156,6 +160,7 @@ impl OmnigentHarness {
             poll: Duration::from_secs(5),
             placement: OmniPlacement::Host,
             model: None,
+            sandbox_spec: None,
         })
     }
 
@@ -322,7 +327,7 @@ impl OmnigentHarness {
         let sh = with_env(&envs);
         // Agent config and prompt are written into the container; the prompt goes through a file so
         // it never appears in a process list or hits argument-length limits.
-        let cfg = container_agent_config(ctx, &self.harness, self.model.as_deref());
+        let cfg = container_agent_config(ctx, &self.harness, self.model.as_deref(), self.sandbox_spec.as_ref());
         let t = Duration::from_secs(30);
         exec_io(&sh, &["sh", "-c", "mkdir -p /tmp/agent /tmp/home && cat > /tmp/agent/config.yaml"], Some(cfg.as_bytes()), t, 4096)?;
         exec_io(&sh, &["sh", "-c", "cat > /tmp/prompt.txt"], Some(task.prompt.as_bytes()), t, 4096)?;

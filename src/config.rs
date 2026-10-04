@@ -31,6 +31,10 @@ pub enum SandboxConfig {
         /// Path to the static `toto-mcp-exec` binary, mounted read-only into the container.
         #[serde(default)]
         bridge: Option<PathBuf>,
+        /// Use toto's seccomp profile that allows a nested bubblewrap, so tools like Omnigent can
+        /// run their own sandbox inside the container (see `profiles/README.md`). Opt-in.
+        #[serde(default)]
+        nested_userns: bool,
     },
     /// bubblewrap (Linux), no daemon or image.
     Bwrap,
@@ -147,6 +151,9 @@ fn which_claude() -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join("claude")).find(|c| c.is_file())).and_then(|c| std::fs::canonicalize(c).ok())
 }
 
+/// Docker's default seccomp profile plus what a nested bubblewrap needs (generated; see profiles/).
+const NESTED_USERNS_PROFILE: &str = include_str!("../profiles/seccomp-nested-userns.json");
+
 fn claude_bin() -> String {
     "claude".into()
 }
@@ -209,7 +216,7 @@ impl Config {
             state_dir: dir.join("state"),
             queue_dir: dir.join("queue"),
             poll_secs: default_poll(),
-            sandbox: SandboxConfig::Docker { bin: docker_bin(), image: "alpine".into(), runtime: None, bridge: None },
+            sandbox: SandboxConfig::Docker { bin: docker_bin(), image: "alpine".into(), runtime: None, bridge: None, nested_userns: false },
             harness: HarnessConfig::Echo { tokens_per_run: 100 },
             policy: Policy {
                 daily_token_cap: 100_000,
@@ -259,11 +266,17 @@ impl Config {
         match &self.sandbox {
             SandboxConfig::Dir => Box::new(DirSandbox { root: work }),
             SandboxConfig::Bwrap => Box::new(BwrapSandbox::new(work)),
-            SandboxConfig::Docker { bin, image, runtime, bridge } => {
+            SandboxConfig::Docker { bin, image, runtime, bridge, nested_userns } => {
                 let mut s = DockerSandbox::new(image);
                 s.bin = bin.clone();
                 s.runtime = runtime.clone();
                 s.bridge = bridge.clone();
+                if *nested_userns {
+                    let path = self.state_dir.join("seccomp-nested-userns.json");
+                    let _ = std::fs::create_dir_all(&self.state_dir);
+                    let _ = std::fs::write(&path, NESTED_USERNS_PROFILE);
+                    s.seccomp_profile = Some(path);
+                }
                 s.proxy_socket = proxy_socket;
                 s.agent_files = agent.unwrap_or_default();
                 Box::new(s)
