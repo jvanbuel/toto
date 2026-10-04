@@ -1,6 +1,6 @@
 # toto
 
-The local runner for **Tokens of Gratitude**: donate unused capacity from your own AI subscriptions or API keys to vetted public-good projects, without your credentials ever leaving your machine.
+**toto** — *Tokens Offered To Others* — is the local runner for donating compute: donate unused capacity from your own AI subscriptions or API keys to vetted public-good projects, without your credentials ever leaving your machine.
 
 `toto` pulls signed tasks from a shared queue, runs them in a sandbox with your own AI tools, and returns signed results — within the caps and policies you set.
 
