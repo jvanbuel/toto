@@ -95,7 +95,7 @@ A task is a self-contained, signed manifest plus an input bundle; runners need n
 
 | Module | Responsibility |
 | --- | --- |
-| Policy engine | Holds the contributor's consent: caps per day/week, quiet hours, allowed projects and task kinds, review-before-submit toggle |
+| Policy engine | Holds the contributor's consent: caps per day/week, per-project resource shares, quiet hours, allowed projects and task kinds, review-before-submit toggle |
 | Queue client | Authenticates the runner (its own keypair, not the AI account), claims leases, renews heartbeats, submits results |
 | Manifest verifier | Checks project signature, schema and that the sandbox profile is within contributor policy |
 | Harness (Omnigent) | A `Harness` trait implemented on top of a local [Omnigent](https://github.com/omnigent-ai/omnigent) server, which drives Claude Code, Codex, Cursor, raw API keys and more non-interactively and reports usage (see ADR 4) |

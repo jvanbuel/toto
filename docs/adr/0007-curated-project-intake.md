@@ -20,6 +20,10 @@ Projects apply and are approved by a review board against published criteria, wi
 - Higher contributor trust and abuse resistance.
 - Slower onboarding and ongoing board overhead.
 
+## Prior art: BOINC account managers
+
+In BOINC, curation lives in *account managers* (BAM!, Science United): contributors pick projects in one place and the account manager pushes that selection to their client, while projects run independently. Our review board and registry play the same role. If coordination federates later (ADR 8), the registry becomes an account manager: it keeps curating projects and distributing their endpoints and keys, without holding their queues.
+
 ## Simpler v1 option
 
 An allowlist file of approved repositories in this repo; projects apply by pull request and maintainers approve by merging. The board can come later.

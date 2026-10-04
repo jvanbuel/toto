@@ -21,9 +21,17 @@ Design it so the server is a convenience, not a trust anchor:
 - Runners verify project signatures on manifests themselves (ADR 3); a compromised or replaced coordinator cannot forge tasks or results.
 - `togra` can be configured with **multiple coordinator endpoints**, so moving to per-project queues later only changes where it polls.
 
+### Resource shares
+
+Contributors allocate capacity per project as **resource shares** (e.g. 60% project A, 40% project B), on top of their overall caps. `togra`'s policy engine enforces the shares locally when choosing which lease to claim, so consent stays with the contributor whether there is one coordinator or many.
+
+### Federation path
+
+The target for federation is BOINC's model: each project runs its own queue speaking the open protocol, and the registry acts as an *account manager* that curates projects and distributes their endpoints and keys (see ADR 7). `togra` already supports multiple endpoints and per-project shares, so this is a configuration change for runners.
+
 ## Alternatives considered
 
-- **Federation from day one**: each approved project hosts its own queue; runners subscribe to the projects they trust. No central operator or single point of trust, but cross-project fair scheduling, global contributor caps and a unified public ledger become much harder, and every project must run infrastructure.
+- **Federation from day one** (BOINC's model): each approved project hosts its own queue; runners subscribe to the projects they trust. No central operator or single point of trust, but cross-project fair scheduling, global contributor caps and a unified public ledger become much harder, and every project must run infrastructure.
 - **GitHub as the coordinator** (issues as tasks, PRs as results). No server at all, but limited to code tasks and gives up the trust model; rejected as too narrow.
 
 ## Consequences
