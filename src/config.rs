@@ -191,12 +191,53 @@ pub struct Config {
     pub projects: BTreeMap<String, String>,
 }
 
+/// Where tasks come from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueueEndpoint {
-    pub url: String,
-    /// File holding the bearer token for this coordinator, if it needs one.
-    #[serde(default)]
-    pub token_file: Option<PathBuf>,
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum QueueEndpoint {
+    /// A coordinator speaking the HTTP queue protocol (`docs/queue-protocol.md`).
+    Http {
+        url: String,
+        /// File holding the bearer token for this coordinator, if it needs one.
+        #[serde(default)]
+        token_file: Option<PathBuf>,
+    },
+    /// GitHub issues in `repo` (`owner/name`) labelled `label` (`docs/github-queue.md`). The token
+    /// needs only to comment on issues; without one the queue is read-only.
+    Github {
+        repo: String,
+        #[serde(default)]
+        token_file: Option<PathBuf>,
+        #[serde(default = "default_label")]
+        label: String,
+        #[serde(default = "default_api")]
+        api_url: String,
+    },
+}
+
+fn default_label() -> String {
+    crate::github_queue::DEFAULT_LABEL.into()
+}
+
+fn default_api() -> String {
+    crate::github_queue::DEFAULT_API.into()
+}
+
+impl QueueEndpoint {
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Http { url, .. } => url.clone(),
+            Self::Github { repo, .. } => format!("github:{repo}"),
+        }
+    }
+
+    pub fn build(&self) -> Result<Arc<dyn QueueClient>> {
+        let token = |f: &Option<PathBuf>| f.as_deref().map(crate::claude_cli::read_secret).transpose();
+        Ok(match self {
+            Self::Http { url, token_file } => Arc::new(crate::http_queue::HttpQueue::new(url, token(token_file)?)),
+            Self::Github { repo, token_file, label, api_url } => Arc::new(crate::github_queue::GitHubQueue::new(api_url, repo, label, token(token_file)?)),
+        })
+    }
 }
 
 fn default_poll() -> u64 {
@@ -321,11 +362,7 @@ impl Config {
         if self.queues.is_empty() {
             return Ok(Arc::new(DirQueue::new(&self.queue_dir)?));
         }
-        let mut endpoints: Vec<Arc<dyn QueueClient>> = vec![];
-        for e in &self.queues {
-            let token = e.token_file.as_deref().map(crate::claude_cli::read_secret).transpose()?;
-            endpoints.push(Arc::new(crate::http_queue::HttpQueue::new(&e.url, token)));
-        }
+        let endpoints = self.queues.iter().map(QueueEndpoint::build).collect::<Result<Vec<_>>>()?;
         Ok(Arc::new(crate::http_queue::MultiQueue::new(endpoints)))
     }
 

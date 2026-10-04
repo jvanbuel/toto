@@ -2826,3 +2826,436 @@ mod http_queue {
         e.server.stop();
     }
 }
+
+mod github_queue {
+    use crate::github_queue::*;
+    use crate::manifest::peek_manifest;
+    use crate::queue::QueueClient;
+    use serde_json::{json, Value};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    const TOKEN: &str = "gh-test-token";
+
+    #[derive(Default)]
+    struct Issue {
+        number: u64,
+        title: String,
+        body: String,
+        labels: Vec<String>,
+        pr: bool,
+        comments: Vec<(u64, String, i64, i64)>, // id, body, created, updated (unix secs)
+    }
+
+    #[derive(Default)]
+    struct State {
+        issues: Vec<Issue>,
+        assets: Vec<(u64, String, Vec<u8>)>,
+        release: bool,
+        next_id: u64,
+        not_modified: u64,
+        requests: u64,
+    }
+
+    /// A tiny stand-in for the parts of GitHub's REST API the queue uses. `advance` moves its clock.
+    struct Fake {
+        addr: std::net::SocketAddr,
+        state: Arc<Mutex<State>>,
+        offset: Arc<AtomicI64>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Fake {
+        fn start() -> Fake {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let state = Arc::new(Mutex::new(State { next_id: 1000, ..Default::default() }));
+            let offset = Arc::new(AtomicI64::new(0));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (st, off, flag) = (state.clone(), offset.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !flag.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((s, _)) => {
+                            let (st, off) = (st.clone(), off.clone());
+                            std::thread::spawn(move || {
+                                let _ = serve(s, &st, &off, addr);
+                            });
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                    }
+                }
+            });
+            Fake { addr, state, offset, stop }
+        }
+        fn api(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+        fn advance(&self, secs: i64) {
+            self.offset.fetch_add(secs, Ordering::Relaxed);
+        }
+        fn queue(&self, token: Option<&str>) -> GitHubQueue {
+            GitHubQueue::new(&self.api(), "org/proj", DEFAULT_LABEL, token.map(String::from))
+        }
+    }
+
+    impl Drop for Fake {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn now(off: &AtomicI64) -> i64 {
+        chrono::Utc::now().timestamp() + off.load(Ordering::Relaxed)
+    }
+
+    fn iso(t: i64) -> String {
+        chrono::DateTime::from_timestamp(t, 0).unwrap().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    fn serve(mut s: std::net::TcpStream, st: &Mutex<State>, off: &AtomicI64, addr: std::net::SocketAddr) -> std::io::Result<()> {
+        let mut r = BufReader::new(s.try_clone()?);
+        let mut line = String::new();
+        r.read_line(&mut line)?;
+        let mut p = line.split_whitespace();
+        let (method, target) = (p.next().unwrap_or("").to_string(), p.next().unwrap_or("").to_string());
+        let (mut len, mut auth, mut inm) = (0usize, String::new(), String::new());
+        loop {
+            let mut h = String::new();
+            if r.read_line(&mut h)? == 0 || h.trim().is_empty() {
+                break;
+            }
+            if let Some((k, v)) = h.split_once(':') {
+                match k.trim().to_ascii_lowercase().as_str() {
+                    "content-length" => len = v.trim().parse().unwrap_or(0),
+                    "authorization" => auth = v.trim().to_string(),
+                    "if-none-match" => inm = v.trim().to_string(),
+                    _ => {}
+                }
+            }
+        }
+        let mut body = vec![0u8; len];
+        r.read_exact(&mut body)?;
+        let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+        let q = |k: &str| query.split('&').filter_map(|kv| kv.split_once('=')).find(|(a, _)| *a == k).map(|(_, v)| v.to_string());
+        let page: usize = q("page").and_then(|p| p.parse().ok()).unwrap_or(1);
+        let per: usize = q("per_page").and_then(|p| p.parse().ok()).unwrap_or(30);
+        let t = now(off);
+        let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        let json_body = || serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+        let mut st = st.lock().unwrap();
+        st.requests += 1;
+        let writes_need_token = method != "GET";
+        let (status, ctype, out): (u16, &str, Vec<u8>) = if writes_need_token && auth != format!("Bearer {TOKEN}") {
+            (401, "application/json", br#"{"message":"Bad credentials"}"#.to_vec())
+        } else {
+            let comment_json = |c: &(u64, String, i64, i64)| json!({"id": c.0, "body": c.1, "created_at": iso(c.2), "updated_at": iso(c.3)});
+            match (method.as_str(), parts.as_slice()) {
+                ("GET", ["repos", "org", "proj", "issues"]) => {
+                    let label = q("labels").unwrap_or_default();
+                    let state_q = q("state").unwrap_or_default();
+                    let _ = state_q;
+                    let all: Vec<Value> = st.issues.iter().filter(|i| i.labels.contains(&label)).map(|i| {
+                        let mut v = json!({"number": i.number, "title": i.title, "body": i.body, "comments": i.comments.len()});
+                        if i.pr {
+                            v["pull_request"] = json!({"url": "x"});
+                        }
+                        v
+                    }).collect();
+                    (200, "application/json", serde_json::to_vec(&all.into_iter().skip((page - 1) * per).take(per).collect::<Vec<_>>()).unwrap())
+                }
+                ("POST", ["repos", "org", "proj", "issues"]) => {
+                    let v = json_body();
+                    st.next_id += 1;
+                    let number = st.issues.len() as u64 + 1;
+                    st.issues.push(Issue { number, title: v["title"].as_str().unwrap_or("").into(), body: v["body"].as_str().unwrap_or("").into(), labels: v["labels"].as_array().map(|l| l.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(), ..Default::default() });
+                    (201, "application/json", json!({"number": number}).to_string().into_bytes())
+                }
+                ("GET", ["repos", "org", "proj", "issues", n, "comments"]) => {
+                    let n: u64 = n.parse().unwrap_or(0);
+                    match st.issues.iter().find(|i| i.number == n) {
+                        Some(i) => (200, "application/json", serde_json::to_vec(&i.comments.iter().skip((page - 1) * per).take(per).map(comment_json).collect::<Vec<_>>()).unwrap()),
+                        None => (404, "application/json", b"{}".to_vec()),
+                    }
+                }
+                ("POST", ["repos", "org", "proj", "issues", n, "comments"]) => {
+                    let n: u64 = n.parse().unwrap_or(0);
+                    st.next_id += 1;
+                    let id = st.next_id;
+                    let text = json_body()["body"].as_str().unwrap_or("").to_string();
+                    match st.issues.iter_mut().find(|i| i.number == n) {
+                        Some(i) => {
+                            i.comments.push((id, text.clone(), t, t));
+                            (201, "application/json", json!({"id": id}).to_string().into_bytes())
+                        }
+                        None => (404, "application/json", b"{}".to_vec()),
+                    }
+                }
+                ("PATCH", ["repos", "org", "proj", "issues", "comments", id]) => {
+                    let id: u64 = id.parse().unwrap_or(0);
+                    let text = json_body()["body"].as_str().unwrap_or("").to_string();
+                    match st.issues.iter_mut().flat_map(|i| i.comments.iter_mut()).find(|c| c.0 == id) {
+                        Some(c) => {
+                            c.1 = text;
+                            c.3 = t;
+                            (200, "application/json", json!({"id": id}).to_string().into_bytes())
+                        }
+                        None => (404, "application/json", b"{}".to_vec()),
+                    }
+                }
+                ("GET", ["repos", "org", "proj", "releases", "tags", _]) if st.release => {
+                    let assets: Vec<Value> = st.assets.iter().map(|(id, name, _)| json!({"name": name, "url": format!("http://{addr}/assets/{id}")})).collect();
+                    (200, "application/json", json!({"id": 1, "upload_url": format!("http://{addr}/uploads/assets{{?name,label}}"), "assets": assets}).to_string().into_bytes())
+                }
+                ("GET", ["repos", "org", "proj", "releases", "tags", _]) => (404, "application/json", b"{}".to_vec()),
+                ("POST", ["repos", "org", "proj", "releases"]) => {
+                    st.release = true;
+                    (201, "application/json", json!({"id": 1, "upload_url": format!("http://{addr}/uploads/assets{{?name,label}}"), "assets": []}).to_string().into_bytes())
+                }
+                ("POST", ["uploads", "assets"]) => {
+                    st.next_id += 1;
+                    let id = st.next_id;
+                    let name = q("name").unwrap_or_default();
+                    st.assets.push((id, name, body.clone()));
+                    (201, "application/json", json!({"id": id}).to_string().into_bytes())
+                }
+                ("GET", ["assets", id]) => match st.assets.iter().find(|a| a.0.to_string() == *id) {
+                    Some(a) => (200, "application/octet-stream", a.2.clone()),
+                    None => (404, "application/json", b"{}".to_vec()),
+                },
+                _ => (404, "application/json", br#"{"message":"Not Found"}"#.to_vec()),
+            }
+        };
+        let etag = format!("\"{}\"", &crate::archive::sha256_hex(&out)[..16]);
+        let (status, out) = if method == "GET" && status == 200 && ctype == "application/json" && inm == etag {
+            st.not_modified += 1;
+            (304, vec![])
+        } else {
+            (status, out)
+        };
+        write!(s, "HTTP/1.1 {status} X\r\nContent-Type: {ctype}\r\nETag: {etag}\r\nDate: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", chrono::DateTime::from_timestamp(t, 0).unwrap().to_rfc2822(), out.len())?;
+        s.write_all(&out)
+    }
+
+    struct Project {
+        key: ed25519_dalek::SigningKey,
+        fake: Fake,
+    }
+
+    fn project() -> Project {
+        let f = super::fixture("ghq");
+        Project { key: f.key_a, fake: Fake::start() }
+    }
+
+    fn post(p: &Project, id: &str) -> u64 {
+        let env = super::task(id, "a", 10, &p.key).sign(&p.key).unwrap();
+        p.fake.queue(Some(TOKEN)).post_task(&env).unwrap()
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn the_lease_lifecycle_works_through_issue_comments() {
+        let p = project();
+        let runner = p.fake.queue(Some(TOKEN));
+        assert_eq!(post(&p, "g1"), 1);
+        // Things that look like tasks but are not: a pull request, an unsigned/garbled body, no marker.
+        {
+            let mut st = p.fake.state.lock().unwrap();
+            let env_body = st.issues[0].body.clone();
+            st.issues.push(Issue { number: 2, body: env_body, labels: vec!["toto".into()], pr: true, ..Default::default() });
+            st.issues.push(Issue { number: 3, body: "<!-- toto:task -->\n```json\n{not json}\n```".into(), labels: vec!["toto".into()], ..Default::default() });
+            st.issues.push(Issue { number: 4, body: "just a bug report".into(), labels: vec!["toto".into()], ..Default::default() });
+        }
+        let ids: Vec<String> = runner.available().unwrap().iter().map(|t| peek_manifest(t).unwrap().id).collect();
+        assert_eq!(ids, ["g1"], "only the real task issue is a task");
+
+        runner.claim("g1", "runner-a", secs(60)).unwrap();
+        let other = p.fake.queue(Some(TOKEN));
+        assert!(other.claim("g1", "runner-b", secs(60)).is_err(), "a second runner is refused");
+        assert!(other.heartbeat("g1", "runner-b", secs(60)).is_err(), "only the holder renews");
+        runner.heartbeat("g1", "runner-a", secs(60)).unwrap();
+        assert!(other.available().unwrap().is_empty(), "leased tasks are not offered");
+        assert_eq!(p.fake.state.lock().unwrap().issues[0].comments.len(), 1, "heartbeats edit the claim, they do not add comments");
+        runner.release("g1", "runner-a").unwrap();
+        assert_eq!(other.available().unwrap().len(), 1, "released tasks come back");
+        other.claim("g1", "runner-b", secs(60)).unwrap();
+    }
+
+    #[test]
+    fn leases_expire_and_heartbeats_extend_them_by_server_time() {
+        let p = project();
+        let (a, b) = (p.fake.queue(Some(TOKEN)), p.fake.queue(Some(TOKEN)));
+        post(&p, "g2");
+        a.claim("g2", "runner-a", secs(60)).unwrap();
+        p.fake.advance(40);
+        a.heartbeat("g2", "runner-a", secs(60)).unwrap();
+        p.fake.advance(40); // 80s after the claim, 40s after the heartbeat
+        assert!(b.claim("g2", "runner-b", secs(60)).is_err(), "the heartbeat kept the lease alive");
+        p.fake.advance(30); // now 70s after the heartbeat
+        assert_eq!(b.available().unwrap().len(), 1, "an expired lease frees the task");
+        b.claim("g2", "runner-b", secs(60)).unwrap();
+        assert!(a.heartbeat("g2", "runner-a", secs(60)).is_err(), "the old holder learns it lost the lease");
+    }
+
+    #[test]
+    fn exactly_one_of_many_simultaneous_claims_wins() {
+        let p = project();
+        post(&p, "g3");
+        let wins = Arc::new(AtomicU64::new(0));
+        let handles: Vec<_> = (0..8).map(|i| {
+            let (q, wins) = (p.fake.queue(Some(TOKEN)), wins.clone());
+            std::thread::spawn(move || {
+                q.available().unwrap(); // learn the issue number first, as the runner does
+                if q.claim("g3", &format!("{:064x}", i), secs(60)).is_ok() {
+                    wins.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        }).collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(wins.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn hostile_comments_cannot_hide_or_hold_a_task_for_long() {
+        let p = project();
+        let q = p.fake.queue(Some(TOKEN));
+        post(&p, "g4");
+        let junk = [
+            "<!-- toto:result runner=ab sum=000000000000 part=1/1 -->\n```json\n{}\n```".to_string(), // not a signed result
+            "<!-- toto:result runner=ab sum=000000000000 part=9/2 -->\n```json\nx\n```".to_string(), // bad part numbers
+            "<!-- toto:claim runner=zz lease=oops released=0 beat=0 -->".to_string(), // unparsable lease
+        ];
+        {
+            let mut st = p.fake.state.lock().unwrap();
+            for (i, j) in junk.iter().enumerate() {
+                let t = chrono::Utc::now().timestamp();
+                st.issues[0].comments.push((10 + i as u64, j.clone(), t, t));
+            }
+        }
+        assert_eq!(q.available().unwrap().len(), 1, "garbage comments change nothing");
+        // A genuine-looking result for a *different* task does not finish this one.
+        let other = crate::result::SignedResult::package("someone-else", "x".into(), 1, &crate::manifest::OutputSchema { format: "text".into(), max_bytes: 100, max_artifact_bytes: 0 }, &crate::manifest::generate_key(), None).unwrap();
+        {
+            let mut st = p.fake.state.lock().unwrap();
+            let json = serde_json::to_string(&other).unwrap();
+            let sum = &crate::archive::sha256_hex(json.as_bytes())[..12];
+            let t = chrono::Utc::now().timestamp();
+            st.issues[0].comments.push((20, format!("<!-- toto:result runner=x sum={sum} part=1/1 -->\n```json\n{json}\n```"), t, t));
+            // an absurd lease from a stranger is clamped to six hours
+            st.issues[0].comments.push((21, "<!-- toto:claim runner=stranger lease=999999999 released=0 beat=0 -->".into(), t, t));
+        }
+        assert!(q.available().unwrap().is_empty(), "the stranger holds the lease...");
+        p.fake.advance(6 * 3600 + 5);
+        assert_eq!(q.available().unwrap().len(), 1, "...but only for six hours");
+    }
+
+    #[test]
+    fn a_runner_completes_a_task_end_to_end_and_the_project_reads_the_result() {
+        let p = project();
+        let f = super::fixture("ghq-run");
+        let mut trusted = crate::manifest::TrustedProjects::default();
+        trusted.insert("a", p.key.verifying_key());
+        let q = Arc::new(p.fake.queue(Some(TOKEN)));
+        let mut runner = crate::runner::Runner::new(
+            super::policy(), trusted, crate::manifest::generate_key(), q.clone(),
+            crate::harness::EchoHarness { tokens_per_run: 10 }, crate::sandbox::DirSandbox { root: f.dir.join("work") },
+            |_: &crate::manifest::TaskManifest, _: &crate::result::SignedResult| false,
+            crate::audit::AuditLog::new(f.dir.join("audit.jsonl")),
+        );
+        post(&p, "g5");
+        assert_eq!(runner.tick(chrono::Local::now()).unwrap(), crate::runner::Tick::Submitted("g5".into()));
+        assert!(q.available().unwrap().is_empty(), "a finished task is gone");
+        let results = p.fake.queue(None).results().unwrap(); // the project reads without a token
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].open().unwrap().task_id, "g5");
+        let before = p.fake.state.lock().unwrap().issues[0].comments.len();
+        q.submit(&results[0]).unwrap();
+        assert_eq!(p.fake.state.lock().unwrap().issues[0].comments.len(), before, "resubmitting adds nothing");
+    }
+
+    #[test]
+    fn large_results_are_split_across_comments_and_reassembled() {
+        let p = project();
+        post(&p, "g6");
+        let q = p.fake.queue(Some(TOKEN));
+        q.available().unwrap();
+        let key = crate::manifest::generate_key();
+        let schema = crate::manifest::OutputSchema { format: "text".into(), max_bytes: 400_000, max_artifact_bytes: 0 };
+        let output: String = (0..150_000).map(|i| if i % 997 == 0 { 'é' } else { 'x' }).collect(); // multi-byte chars too
+        let r = crate::result::SignedResult::package("g6", output.clone(), 5, &schema, &key, None).unwrap();
+        q.submit(&r).unwrap();
+        let parts = p.fake.state.lock().unwrap().issues[0].comments.len();
+        assert!((3..=8).contains(&parts), "{parts} parts");
+        let back = p.fake.queue(None).results().unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].open().unwrap().output, output);
+        // too big for the limit is an error, not a silent truncation
+        let huge = crate::result::SignedResult::package("g6", "y".repeat(700_000), 5, &crate::manifest::OutputSchema { format: "text".into(), max_bytes: 800_000, max_artifact_bytes: 0 }, &key, None).unwrap();
+        assert!(q.submit(&huge).unwrap_err().to_string().contains("max_artifact_bytes"));
+        // a partial post is completed by a retry, not duplicated
+        {
+            let mut st = p.fake.state.lock().unwrap();
+            st.issues[0].comments.truncate(2);
+        }
+        assert!(p.fake.queue(None).results().unwrap().is_empty(), "an incomplete result is not a result");
+        q.submit(&r).unwrap();
+        assert_eq!(p.fake.state.lock().unwrap().issues[0].comments.len(), parts, "only the missing parts were posted");
+        assert_eq!(p.fake.queue(None).results().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bundles_are_release_assets_named_by_hash() {
+        let p = project();
+        let project_side = p.fake.queue(Some(TOKEN));
+        let runner = p.fake.queue(None); // downloads need no token
+        assert_eq!(runner.bundle(&"0".repeat(64)).unwrap(), None, "no release yet");
+        let h = project_side.upload_bundle(b"tar-bytes").unwrap();
+        assert_eq!(h, crate::archive::sha256_hex(b"tar-bytes"));
+        assert_eq!(project_side.upload_bundle(b"tar-bytes").unwrap(), h, "uploading twice stores once");
+        assert_eq!(p.fake.state.lock().unwrap().assets.len(), 1);
+        assert_eq!(runner.bundle(&h).unwrap().as_deref(), Some(&b"tar-bytes"[..]));
+        assert_eq!(runner.bundle(&"1".repeat(64)).unwrap(), None);
+        assert!(runner.bundle("../x").is_err());
+    }
+
+    #[test]
+    fn unchanged_polls_use_etags_and_failures_say_what_to_check() {
+        let p = project();
+        post(&p, "g7");
+        let q = p.fake.queue(Some(TOKEN));
+        q.available().unwrap();
+        q.available().unwrap();
+        assert!(p.fake.state.lock().unwrap().not_modified >= 1, "the second poll revalidated instead of re-downloading");
+        let anon = p.fake.queue(None);
+        let e = anon.claim("g7", "r", secs(60)).unwrap_err().to_string();
+        assert!(e.contains("401") && e.contains("token"), "{e}");
+        let wrong = GitHubQueue::new(&p.fake.api(), "org/other", DEFAULT_LABEL, Some(TOKEN.into()));
+        assert!(wrong.available().unwrap_err().to_string().contains("404"));
+    }
+
+    #[test]
+    fn claim_ordering_is_decided_by_comment_order() {
+        use chrono::{TimeZone, Utc};
+        let t = |s: i64| Utc.timestamp_opt(1_800_000_000 + s, 0).unwrap();
+        let claim = |id: u64, runner: &str, lease: u64, created: i64, updated: i64| (id, format!("<!-- toto:claim runner={runner} lease={lease} released=0 beat=0 -->"), t(created), t(updated));
+        // b's comment came second while a held the lease: a stays the holder.
+        let c = vec![claim(1, "a", 100, 0, 0), claim(2, "b", 100, 10, 10)];
+        assert_eq!(holder_at(&c, t(20)).unwrap().runner, "a");
+        // after a's lease ran out, b's later claim would have won, but b claimed too early: nobody holds it.
+        assert_eq!(holder_at(&c, t(150)), None);
+        // b claims after a's lease ended: b holds.
+        let c = vec![claim(1, "a", 100, 0, 0), claim(2, "b", 100, 150, 150)];
+        assert_eq!(holder_at(&c, t(160)).unwrap().runner, "b");
+        // a heartbeat (edit) keeps a's lease past b's attempt.
+        let c = vec![claim(1, "a", 100, 0, 120), claim(2, "b", 100, 110, 110)];
+        assert_eq!(holder_at(&c, t(130)).unwrap().runner, "a");
+    }
+}

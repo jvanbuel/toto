@@ -12,6 +12,7 @@ pub mod context;
 pub mod daemon;
 pub mod doctor;
 pub mod dsse;
+pub mod github_queue;
 pub mod harness;
 pub mod manifest;
 pub mod http_queue;

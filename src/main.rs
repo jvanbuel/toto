@@ -51,6 +51,26 @@ enum Cmd {
         #[arg(long)]
         context: Option<PathBuf>,
         task: PathBuf,
+        /// Post to GitHub issues in this repository (`owner/name`) instead of the spool directory.
+        /// The token needs to create issues and labels, and to upload release assets for bundles.
+        #[arg(long)]
+        github: Option<String>,
+        #[arg(long, requires = "github")]
+        github_token_file: Option<PathBuf>,
+        #[arg(long, default_value = toto::github_queue::DEFAULT_API)]
+        github_api: String,
+    },
+    /// Download the verified results found on a GitHub queue's issues, one file per result, ready
+    /// for `extract-result`.
+    GithubResults {
+        /// `owner/name`
+        repo: String,
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        #[arg(long, default_value = toto::github_queue::DEFAULT_API)]
+        api: String,
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Write a result's artifacts (changed files) into a new directory and list deletions.
     ExtractResult {
@@ -220,26 +240,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Cmd::PostTask { key, config, bundle, context, task } => {
+        Cmd::GithubResults { repo, token_file, api, out } => {
+            let token = token_file.as_deref().map(toto::claude_cli::read_secret).transpose()?;
+            let q = toto::github_queue::GitHubQueue::new(&api, &repo, toto::github_queue::DEFAULT_LABEL, token);
+            fs::create_dir_all(&out)?;
+            let results = q.results()?;
+            for r in &results {
+                let b = r.open()?;
+                let path = out.join(format!("{}.{}.json", b.task_id, &b.runner_id[..16]));
+                fs::write(&path, serde_json::to_vec_pretty(r)?)?;
+                println!("{} ({} tokens)", path.display(), b.tokens_used);
+            }
+            println!("{} results", results.len());
+        }
+        Cmd::PostTask { key, config, bundle, context, task, github, github_token_file, github_api } => {
             let cfg = toto::config::Config::load(&config_path(config))?;
             let seed: [u8; 32] = hex::decode(fs::read_to_string(&key)?.trim()).ok().and_then(|b| b.try_into().ok()).ok_or("project key must be a 32-byte hex seed")?;
             let mut manifest: TaskManifest = serde_json::from_slice(&fs::read(&task)?)?;
-            let queue = toto::queue::DirQueue::new(&cfg.queue_dir)?;
+            // Where the task and its bundles go: the spool directory, or GitHub issues.
+            let gh = match &github {
+                Some(repo) => {
+                    let token = github_token_file.as_deref().map(toto::claude_cli::read_secret).transpose()?;
+                    Some(toto::github_queue::GitHubQueue::new(&github_api, repo, toto::github_queue::DEFAULT_LABEL, token))
+                }
+                None => None,
+            };
+            let spool = toto::queue::DirQueue::new(&cfg.queue_dir)?;
+            let store = |bytes: &[u8]| -> Result<String, toto::Error> {
+                match &gh {
+                    Some(g) => g.upload_bundle(bytes),
+                    None => spool.post_bundle(bytes),
+                }
+            };
             if let Some(dir) = bundle {
                 let records = toto::archive::pack_dir(&dir, toto::archive::Limits::new(cfg.policy.max_input_bytes))?;
-                manifest.inputs = queue.post_bundle(&toto::archive::to_bytes(&records)?)?;
+                manifest.inputs = store(&toto::archive::to_bytes(&records)?)?;
                 println!("bundled {} files from {} as {}", records.len(), dir.display(), manifest.inputs);
             }
             if let Some(dir) = context {
                 let limits = toto::archive::Limits::new(cfg.policy.max_context_bytes.max(1 << 20));
                 let bytes = toto::archive::to_bytes(&toto::archive::pack_dir(&dir, limits)?)?;
                 let ctx = toto::context::ProjectContext::parse(&bytes, limits)?; // same checks the runner applies
-                manifest.context = Some(queue.post_bundle(&bytes)?);
+                manifest.context = Some(store(&bytes)?);
                 println!("context from {}: {}", dir.display(), ctx.summary());
             }
             let signed = manifest.sign(&ed25519_dalek::SigningKey::from_bytes(&seed))?;
-            queue.post(&signed)?;
-            println!("posted {} to {}", manifest.id, cfg.queue_dir.display());
+            match (&gh, &github) {
+                (Some(g), Some(repo)) => println!("posted {} as issue #{} in {repo}", manifest.id, g.post_task(&signed)?),
+                _ => {
+                    spool.post(&signed)?;
+                    println!("posted {} to {}", manifest.id, cfg.queue_dir.display());
+                }
+            }
         }
         Cmd::Login { config } => {
             let cfg = toto::config::Config::load(&config_path(config))?;

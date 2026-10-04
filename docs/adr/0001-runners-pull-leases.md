@@ -25,3 +25,7 @@ Runners pull work. A runner claims a task lease for a fixed window, renews it wi
 ## Simpler v1 option
 
 Use GitHub issues in approved repositories as the queue: an issue with a `toto` label is a task, assigning it (or a claim comment) is the lease. Removes the queue server; costs race handling on claims and GitHub rate limits.
+
+## Update (2026-10-04): the GitHub-issues queue is built
+
+The simple v1 option is implemented: `docs/github-queue.md` describes the format (task = labelled issue, lease = claim comment decided by comment order and server time, heartbeat = edit, result = signed comments in parts, bundles = release assets). Tested against a stand-in for GitHub's REST API (lease lifecycle and expiry, 8 racing claimants with one winner, hostile comments, chunked results, bundles, ETags); not yet run against github.com. It suits pilots where the project can moderate comments; an open crowd needs a coordinator that authenticates runners.

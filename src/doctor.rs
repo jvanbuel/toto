@@ -1,7 +1,8 @@
 //! `toto doctor`: checks the whole setup and says what works, what is risky and what is missing.
 //! Every check runs independently, so one failure does not hide the others.
 
-use crate::config::{Config, HarnessConfig, SandboxConfig};
+use crate::config::{Config, HarnessConfig, QueueEndpoint, SandboxConfig};
+use crate::queue::QueueClient;
 use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,13 +60,16 @@ pub fn run_all(cfg: &Config) -> Vec<Check> {
         c.push(Check::new(Level::Ok, "policy", format!("daily cap {} tokens, {} kinds", cfg.policy.daily_token_cap, cfg.policy.allowed_kinds.len())));
     }
     for e in &cfg.queues {
-        let plain = e.url.starts_with("http://") && !e.url.contains("//127.") && !e.url.contains("//localhost");
-        let token = e.token_file.as_deref().map(crate::claude_cli::read_secret).transpose();
-        c.push(match token.map(|t| crate::http_queue::HttpQueue::new(&e.url, t)).and_then(|q| crate::queue::QueueClient::available(&q)) {
-            Ok(tasks) if plain => Check::new(Level::Warn, "queue", format!("{} reachable ({} tasks) but uses plain http; tasks and results cross the network unencrypted", e.url, tasks.len())),
-            Ok(tasks) => Check::new(Level::Ok, "queue", format!("{} reachable, {} tasks available", e.url, tasks.len())),
-            Err(err) => Check::new(Level::Fail, "queue", format!("{}: {err}", e.url)),
+        let name = e.describe();
+        let plain = matches!(e, QueueEndpoint::Http { url, .. } if url.starts_with("http://") && !url.contains("//127.") && !url.contains("//localhost"));
+        c.push(match e.build().and_then(|q| q.available()) {
+            Ok(tasks) if plain => Check::new(Level::Warn, "queue", format!("{name} reachable ({} tasks) but uses plain http; tasks and results cross the network unencrypted", tasks.len())),
+            Ok(tasks) => Check::new(Level::Ok, "queue", format!("{name} reachable, {} tasks available", tasks.len())),
+            Err(err) => Check::new(Level::Fail, "queue", format!("{name}: {err}")),
         });
+        if matches!(e, QueueEndpoint::Github { token_file: None, .. }) {
+            c.push(Check::new(Level::Warn, "queue", format!("{name} has no token: reads only, at GitHub's low anonymous rate limit; claiming and submitting need a token")));
+        }
     }
     if cfg.queues.is_empty() {
         c.push(if cfg.queue_dir.is_dir() { Check::new(Level::Ok, "queue", cfg.queue_dir.display().to_string()) } else { Check::new(Level::Warn, "queue", format!("{} does not exist yet", cfg.queue_dir.display())) });

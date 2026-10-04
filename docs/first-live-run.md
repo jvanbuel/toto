@@ -112,7 +112,11 @@ Only for tasks whose manifest carries `network_allowlist` rules. As root: `toto 
 
 ## Variant: a queue over HTTP
 
-`toto serve-queue --dir <spool> --addr 127.0.0.1:8787 [--token-file f]` serves a spool directory (the layout `post-task` writes) over the queue protocol (`docs/queue-protocol.md`). On the runner, add `"queues": [{"url": "http://127.0.0.1:8787", "token_file": "f"}]` to the config instead of relying on `queue_dir`. With several entries the runner considers tasks from all of them. `toto doctor` checks each endpoint.
+`toto serve-queue --dir <spool> --addr 127.0.0.1:8787 [--token-file f]` serves a spool directory (the layout `post-task` writes) over the queue protocol (`docs/queue-protocol.md`). On the runner, add `"queues": [{"kind": "http", "url": "http://127.0.0.1:8787", "token_file": "f"}]` to the config instead of relying on `queue_dir`. With several entries the runner considers tasks from all of them. `toto doctor` checks each endpoint.
+
+## Variant: GitHub issues as the queue
+
+For a pilot with no server: the project posts tasks with `toto post-task --github org/repo --github-token-file gh.token ...`; the runner config gets `"queues": [{"kind": "github", "repo": "org/repo", "token_file": "gh.token"}]`. The runner token only needs to comment on issues. See `docs/github-queue.md` for the format, limits and what a hostile commenter can do, and run `toto doctor` to check the endpoint.
 
 ## What to look for
 
