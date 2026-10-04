@@ -18,7 +18,7 @@ use crate::context::{McpEntry, ProjectContext};
 use crate::manifest::TaskManifest;
 use crate::meter::UsageMeter;
 use crate::proxy::AuthProxy;
-use crate::sandbox::{Workspace, AGENT_PATH, PROXY_ADDR};
+use crate::sandbox::{Workspace, AGENT_DIR, PROXY_ADDR};
 use crate::{Error, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -49,6 +49,8 @@ pub struct ClaudeCliHarness {
     pub model: Option<String>,
     pub max_turns: u32,
     pub placement: Placement,
+    /// Executable name under `AGENT_DIR` in container placement (the mounted agent's file name).
+    pub agent_name: String,
 }
 
 impl ClaudeCliHarness {
@@ -56,7 +58,7 @@ impl ClaudeCliHarness {
         let (home_dir, runs_dir) = (state_dir.join("claude-home"), state_dir.join("runs"));
         std::fs::create_dir_all(&home_dir)?;
         std::fs::create_dir_all(&runs_dir)?;
-        Ok(Self { bin: "claude".into(), token_file, home_dir, runs_dir, model: None, max_turns: 40, placement: Placement::Host })
+        Ok(Self { bin: "claude".into(), token_file, home_dir, runs_dir, model: None, max_turns: 40, placement: Placement::Host, agent_name: "claude".into() })
     }
 
     /// Runs the agent inside the container behind `proxy` instead of on the host.
@@ -205,7 +207,7 @@ impl Harness for ClaudeCliHarness {
             for e in [format!("ANTHROPIC_BASE_URL=http://{PROXY_ADDR}"), "ANTHROPIC_AUTH_TOKEN=not-a-credential".into(), "HOME=/tmp/home".into(), "CLAUDE_CONFIG_DIR=/tmp/home/.claude".into(), "DISABLE_AUTOUPDATER=1".into(), "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1".into(), "TERM=dumb".into()] {
                 c.args(["-e", &e]);
             }
-            c.args(["-w", "/workspace", name, AGENT_PATH]).args(common).args(["--tools", &builtins.join(",")]).arg(format!("--allowedTools={}", allowed.join(",")));
+            c.args(["-w", "/workspace", name, &format!("{AGENT_DIR}/{}", self.agent_name)]).args(common).args(["--tools", &builtins.join(",")]).arg(format!("--allowedTools={}", allowed.join(",")));
             // Only what the CLI needs to reach the container runtime: nothing else from the host.
             c.env_clear();
             for k in ["PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "CONTAINER_HOST", "XDG_RUNTIME_DIR", "TMPDIR"] {

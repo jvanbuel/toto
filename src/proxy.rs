@@ -17,6 +17,25 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Which API the proxy fronts: decides the endpoint allowlist and how usage is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Provider {
+    /// Anthropic Messages API: `POST /v1/messages`, `/v1/messages/count_tokens`.
+    #[default]
+    Anthropic,
+    /// OpenAI Responses API (what Codex uses): `POST /v1/responses`.
+    OpenAi,
+}
+
+impl Provider {
+    fn allows(self, method: &str, path: &str) -> bool {
+        match self {
+            Provider::Anthropic => matches!((method, path), ("POST", "/v1/messages") | ("POST", "/v1/messages/count_tokens")),
+            Provider::OpenAi => matches!((method, path), ("POST", "/v1/responses")),
+        }
+    }
+}
+
 /// How the proxy authenticates upstream. The secret never leaves the proxy process.
 pub enum Auth {
     /// `Authorization: Bearer <token>`; with `oauth` the `oauth-2025-04-20` beta flag is added,
@@ -47,6 +66,7 @@ const DROP: [&str; 12] = [
 ];
 
 struct Shared {
+    provider: Provider,
     upstream: String,
     auth: Auth,
     tokens: AtomicU64,
@@ -64,13 +84,13 @@ pub struct AuthProxy {
 impl AuthProxy {
     /// Starts serving on `socket` (its parent directory should be private to the runner user).
     /// `upstream` is the API origin, e.g. `https://api.anthropic.com`.
-    pub fn start(socket: &Path, upstream: &str, auth: Auth) -> Result<Self> {
+    pub fn start(socket: &Path, upstream: &str, provider: Provider, auth: Auth) -> Result<Self> {
         let _ = std::fs::remove_file(socket);
         let listener = UnixListener::bind(socket)?;
         // The container user must be able to connect through the bind mount; the private parent
         // directory keeps other host users out.
         std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o666))?;
-        let shared = Arc::new(Shared { upstream: upstream.trim_end_matches('/').to_string(), auth, tokens: 0.into(), requests: 0.into(), active: 0.into(), stop: false.into() });
+        let shared = Arc::new(Shared { provider, upstream: upstream.trim_end_matches('/').to_string(), auth, tokens: 0.into(), requests: 0.into(), active: 0.into(), stop: false.into() });
         let s = shared.clone();
         let thread = std::thread::spawn(move || {
             for conn in listener.incoming() {
@@ -143,11 +163,6 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-/// Only what an agent needs to talk to the Messages API.
-fn allowed(method: &str, path: &str) -> bool {
-    matches!((method, path), ("POST", "/v1/messages") | ("POST", "/v1/messages/count_tokens"))
-}
-
 fn handle(sh: &Shared, conn: UnixStream) -> std::io::Result<()> {
     conn.set_read_timeout(Some(Duration::from_secs(60)))?;
     let mut reader = BufReader::new(&conn);
@@ -174,8 +189,8 @@ fn handle(sh: &Shared, conn: UnixStream) -> std::io::Result<()> {
     if (method == "HEAD" || method == "GET") && path == "/api/hello" {
         return write!(&conn, "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
     }
-    if !allowed(&method, path) {
-        return respond_error(&conn, 403, "this proxy only forwards POST /v1/messages");
+    if !sh.provider.allows(&method, path) {
+        return respond_error(&conn, 403, "this proxy does not forward that endpoint");
     }
     if headers.iter().any(|(k, v)| k == "transfer-encoding" && !v.eq_ignore_ascii_case("identity")) {
         return respond_error(&conn, 400, "chunked request bodies are not supported");
@@ -241,7 +256,7 @@ fn forward(sh: &Shared, method: &str, path: &str, query: &str, headers: &[(Strin
     }
     write!(out, "connection: close\r\n\r\n")?; // the body is delimited by closing the connection (or content-length)
 
-    let mut scanner = UsageScanner::default();
+    let mut scanner = UsageScanner::new(sh.provider);
     let (mut reader, mut buf) = (body.into_reader(), [0u8; 8192]);
     loop {
         let n = reader.read(&mut buf)?;
@@ -257,8 +272,8 @@ fn forward(sh: &Shared, method: &str, path: &str, query: &str, headers: &[(Strin
 }
 
 /// Counts tokens in a Messages API response, streamed (SSE) or not.
-#[derive(Default)]
 pub struct UsageScanner {
+    provider: Provider,
     line: Vec<u8>,
     json_body: Vec<u8>,
     input: u64,
@@ -267,6 +282,10 @@ pub struct UsageScanner {
 }
 
 impl UsageScanner {
+    pub fn new(provider: Provider) -> Self {
+        Self { provider, line: vec![], json_body: vec![], input: 0, cache_creation: 0, output: 0 }
+    }
+
     pub fn feed(&mut self, bytes: &[u8], sse: bool) {
         if !sse {
             if self.json_body.len() < 16 * 1024 * 1024 {
@@ -287,6 +306,13 @@ impl UsageScanner {
     fn sse_line(&mut self) {
         let Some(data) = self.line.strip_prefix(b"data:") else { return };
         let Ok(v) = serde_json::from_slice::<Value>(data.trim_ascii()) else { return };
+        if self.provider == Provider::OpenAi {
+            // Responses API: the figures arrive once, on the terminal event.
+            if matches!(v["type"].as_str(), Some("response.completed" | "response.incomplete" | "response.failed")) {
+                self.take_openai(&v["response"]["usage"]);
+            }
+            return;
+        }
         match v["type"].as_str() {
             Some("message_start") => self.take(&v["message"]["usage"], true),
             Some("message_delta") => self.take(&v["usage"], false),
@@ -310,9 +336,21 @@ impl UsageScanner {
         }
     }
 
+    fn take_openai(&mut self, u: &Value) {
+        let n = |k: &str| u[k].as_u64().unwrap_or(0);
+        // `input_tokens` already includes cached tokens in this API.
+        self.input = n("input_tokens");
+        self.cache_creation = 0;
+        self.output = n("output_tokens");
+    }
+
     pub fn total(&mut self) -> u64 {
         if !self.json_body.is_empty() {
             if let Ok(v) = serde_json::from_slice::<Value>(&self.json_body) {
+                if self.provider == Provider::OpenAi {
+                    self.take_openai(&v["usage"]);
+                    return self.input + self.output;
+                }
                 let u = &v["usage"];
                 let n = |k: &str| u[k].as_u64().unwrap_or(0);
                 self.input = n("input_tokens");

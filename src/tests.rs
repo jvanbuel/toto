@@ -1390,7 +1390,7 @@ mod claude_cli {
     fn config_requires_a_container_with_the_bridge() {
         let f = fixture("claude-cfg");
         let mut c = crate::config::Config::starter(&f.dir);
-        c.harness = crate::config::HarnessConfig::Claude { bin: "claude".into(), token_file: None, model: None, placement: Default::default(), upstream: "https://api.anthropic.com".into(), agent_binary: None, api_key_file: None };
+        c.harness = crate::config::HarnessConfig::Claude { bin: "claude".into(), token_file: None, model: None, placement: Default::default(), upstream: "https://api.anthropic.com".into(), agent_binary: None, agent_extra_files: vec![], api_key_file: None };
         assert!(c.build().is_err(), "docker without bridge");
         c.sandbox = crate::config::SandboxConfig::Bwrap;
         assert!(c.build().is_err(), "bwrap has no bridge");
@@ -1557,7 +1557,7 @@ mod proxy {
         let dir = f.dir.join("sock");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        AuthProxy::start(&dir.join("p.sock"), upstream, auth).unwrap()
+        AuthProxy::start(&dir.join("p.sock"), upstream, crate::proxy::Provider::Anthropic, auth).unwrap()
     }
 
     const SSE: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":999,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":20}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
@@ -1680,6 +1680,52 @@ mod proxy {
         assert!(!sock.exists());
     }
 
+    const RESPONSES_SSE: &str = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"input_tokens_details\":{\"cached_tokens\":40},\"output_tokens\":20,\"total_tokens\":120}}}\n\n";
+
+    fn start_openai(f: &super::Fixture, upstream: &str) -> AuthProxy {
+        let dir = f.dir.join("sock");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        AuthProxy::start(&dir.join("p.sock"), upstream, crate::proxy::Provider::OpenAi, Auth::Bearer { token: "sk-REAL-OPENAI".into(), oauth: false }).unwrap()
+    }
+
+    #[test]
+    fn openai_profile_has_its_own_endpoints_credential_and_usage_format() {
+        let f = fixture("px-openai");
+        let (url, seen) = upstream(200, "text/event-stream", RESPONSES_SSE.as_bytes().to_vec());
+        let p = start_openai(&f, &url);
+        let hdr = "authorization: Bearer dummy-from-container\r\nx-api-key: dummy\r\nchatgpt-account-id: someone-else\r\nx-codex-turn-metadata: {}\r\n";
+        let (st, body) = call(p.socket(), &post("/v1/responses", hdr, r#"{"stream":true}"#));
+        assert_eq!(st, 200);
+        assert_eq!(String::from_utf8(body).unwrap(), RESPONSES_SSE, "byte-exact passthrough");
+        let s = seen.lock().unwrap()[0].clone();
+        assert_eq!(s.header("authorization"), ["Bearer sk-REAL-OPENAI"]);
+        assert!(s.header("x-api-key").is_empty() && s.header("anthropic-beta").is_empty(), "{:?}", s.headers);
+        assert_eq!(s.header("x-codex-turn-metadata"), ["{}"], "client metadata headers pass through");
+        assert_eq!(p.tokens(), 120, "input (cached tokens already included) + output");
+        // other endpoints, including the Anthropic ones, are refused
+        for path in ["/v1/messages", "/v1/chat/completions", "/v1/models", "/v1/files", "/v1/responses/resp_1", "/v1/responses/../models"] {
+            assert_eq!(call(p.socket(), &post(path, "", "{}")).0, 403, "POST {path}");
+        }
+        assert_eq!(call(p.socket(), format!("GET /v1/responses HTTP/1.1\r\nhost: x\r\n\r\n").as_bytes()).0, 403);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn openai_usage_from_plain_and_incomplete_responses() {
+        let f = fixture("px-openai-json");
+        let (url, _) = upstream(200, "application/json", br#"{"id":"resp_2","usage":{"input_tokens":7,"output_tokens":5,"total_tokens":12}}"#.to_vec());
+        let p = start_openai(&f, &url);
+        call(p.socket(), &post("/v1/responses", "", "{}"));
+        assert_eq!(p.tokens(), 12);
+        let f2 = fixture("px-openai-incomplete");
+        let incomplete = "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"usage\":{\"input_tokens\":9,\"output_tokens\":1}}}\n\n";
+        let (url2, _) = upstream(200, "text/event-stream", incomplete.as_bytes().to_vec());
+        let p2 = start_openai(&f2, &url2);
+        call(p2.socket(), &post("/v1/responses", "", "{}"));
+        assert_eq!(p2.tokens(), 10, "a cut-off response is still billed");
+    }
+
     #[test]
     fn secrets_are_not_printable() {
         let a = Auth::Bearer { token: "SECRET-VALUE".into(), oauth: true };
@@ -1750,7 +1796,7 @@ mod proxy_container {
         let dir = f.dir.join("sock");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let proxy = AuthProxy::start(&dir.join("p.sock"), &url, Auth::Bearer { token: "REAL-SECRET-TOKEN".into(), oauth: false }).unwrap();
+        let proxy = AuthProxy::start(&dir.join("p.sock"), &url, crate::proxy::Provider::Anthropic, Auth::Bearer { token: "REAL-SECRET-TOKEN".into(), oauth: false }).unwrap();
 
         let t = task("pxc1", "a", 1, &f.key_a);
         let mut sb = DockerSandbox::new("alpine");
@@ -1786,7 +1832,7 @@ mod claude_in_container {
     use super::proxy_container::docker_has;
     use super::{fixture, task};
     use crate::proxy::{Auth, AuthProxy};
-    use crate::sandbox::{exec_io, DockerSandbox, Sandbox, Workspace, AGENT_PATH, PROXY_ADDR};
+    use crate::sandbox::{exec_io, DockerSandbox, Sandbox, Workspace, AGENT_DIR, PROXY_ADDR};
     use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Mutex};
@@ -1935,7 +1981,7 @@ mod claude_in_container {
 
         let mut cfg = Config::starter(&f.dir);
         cfg.sandbox = SandboxConfig::Docker { bin: "docker".into(), image: "debian:bookworm-slim".into(), runtime: None, bridge: Some(bridge) };
-        cfg.harness = HarnessConfig::Claude { bin: "claude".into(), token_file: None, model: None, placement: PlacementConfig::Container, upstream: url, agent_binary: Some(claude), api_key_file: None };
+        cfg.harness = HarnessConfig::Claude { bin: "claude".into(), token_file: None, model: None, placement: PlacementConfig::Container, upstream: url, agent_binary: Some(claude), agent_extra_files: vec![], api_key_file: None };
         cfg.policy = super::policy();
         cfg.policy.allow_context = true;
         cfg.policy.daily_token_cap = 10_000_000;
@@ -1996,7 +2042,7 @@ mod claude_in_container {
         let dir = f.dir.join("sock");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let proxy = AuthProxy::start(&dir.join("p.sock"), &url, Auth::Bearer { token: "REAL-SECRET-TOKEN".into(), oauth: true }).unwrap();
+        let proxy = AuthProxy::start(&dir.join("p.sock"), &url, crate::proxy::Provider::Anthropic, Auth::Bearer { token: "REAL-SECRET-TOKEN".into(), oauth: true }).unwrap();
         let t = task("oic1", "a", 1, &f.key_a);
         let mut sb = DockerSandbox::new("toto-omnigent-test");
         sb.bridge = Some(bridge);
@@ -2063,13 +2109,13 @@ mod claude_in_container {
         let dir = f.dir.join("sock");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let proxy = AuthProxy::start(&dir.join("p.sock"), &url, Auth::Bearer { token: "REAL-SECRET-TOKEN".into(), oauth: true }).unwrap();
+        let proxy = AuthProxy::start(&dir.join("p.sock"), &url, crate::proxy::Provider::Anthropic, Auth::Bearer { token: "REAL-SECRET-TOKEN".into(), oauth: true }).unwrap();
 
         let t = task("cic1", "a", 1, &f.key_a);
         let mut sb = DockerSandbox::new("debian:bookworm-slim");
         sb.bridge = Some(bridge);
         sb.proxy_socket = Some(proxy.socket().to_path_buf());
-        sb.agent_binary = Some(claude);
+        sb.agent_files = vec![claude];
         let ws = sb.create(&t, &t.sandbox_profile).unwrap();
 
         // Run the agent inside the container: env flags go before the container name in `docker exec`.
@@ -2080,7 +2126,8 @@ mod claude_in_container {
         }
         prefix.extend(["-w".into(), "/workspace".into(), name.clone()]);
         let agent_ws = Workspace { exec_prefix: prefix, ..Workspace { task_id: ws.task_id.clone(), path: ws.path.clone(), exec_prefix: vec![], bridge: true } };
-        let args = [AGENT_PATH, "-p", "--output-format", "stream-json", "--verbose", "--no-session-persistence", "--setting-sources", "project", "--permission-mode", "dontAsk", "--allowedTools=Bash", "--tools", "Bash", "--max-turns", "5"];
+        let exe = format!("{AGENT_DIR}/claude");
+        let args = [exe.as_str(), "-p", "--output-format", "stream-json", "--verbose", "--no-session-persistence", "--setting-sources", "project", "--permission-mode", "dontAsk", "--allowedTools=Bash", "--tools", "Bash", "--max-turns", "5"];
         let out = exec_io(&agent_ws, &args, Some(b"RUN-THE-TOOL please"), Duration::from_secs(120), 8 << 20).unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -2110,6 +2157,166 @@ mod claude_in_container {
         assert!(proxy.tokens() > 50, "the proxy metered the traffic itself: {}", proxy.tokens());
         let env = exec_io(&Workspace { task_id: "x".into(), path: ws.path.clone(), exec_prefix: ws.exec_prefix.clone(), bridge: true }, &["sh", "-c", "env; cat /proc/mounts"], None, Duration::from_secs(10), 1 << 20).unwrap();
         assert!(!String::from_utf8_lossy(&env.stdout).contains("REAL-SECRET"));
+        sb.destroy(ws).unwrap();
+    }
+}
+
+mod codex_in_container {
+    use super::proxy_container::docker_has;
+    use super::{fixture, task};
+    use crate::proxy::{Auth, AuthProxy, Provider};
+    use crate::sandbox::{exec_io, DockerSandbox, Sandbox, Workspace, AGENT_DIR, PROXY_ADDR};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    type Bodies = Arc<Mutex<Vec<(Vec<(String, String)>, String)>>>;
+
+    fn ev(kind: &str, data: serde_json::Value) -> String {
+        format!("event: {kind}\ndata: {data}\n\n")
+    }
+
+    fn completed(output: serde_json::Value) -> String {
+        ev("response.completed", serde_json::json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed", "output": output, "usage": {"input_tokens": 30, "output_tokens": 12, "total_tokens": 42}}}))
+    }
+
+    /// Responses stream: a final assistant message.
+    fn message_stream(text: &str) -> String {
+        let item = serde_json::json!({"type": "message", "id": "msg_1", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": text}]});
+        ev("response.created", serde_json::json!({"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}}))
+            + &ev("response.output_item.added", serde_json::json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "message", "id": "msg_1", "role": "assistant", "status": "in_progress", "content": []}}))
+            + &ev("response.output_item.done", serde_json::json!({"type": "response.output_item.done", "output_index": 0, "item": item}))
+            + &completed(serde_json::json!([item]))
+    }
+
+    /// Responses stream: a call to Codex's JavaScript `exec` custom tool.
+    fn exec_stream(js: &str) -> String {
+        let item = serde_json::json!({"type": "custom_tool_call", "id": "ctc_1", "call_id": "call_1", "name": "exec", "input": js, "status": "completed"});
+        ev("response.created", serde_json::json!({"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}}))
+            + &ev("response.output_item.added", serde_json::json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "custom_tool_call", "id": "ctc_1", "call_id": "call_1", "name": "exec", "input": "", "status": "in_progress"}}))
+            + &ev("response.output_item.done", serde_json::json!({"type": "response.output_item.done", "output_index": 0, "item": item}))
+            + &completed(serde_json::json!([item]))
+    }
+
+    /// A fake Responses API: runs one `exec` call (the JS in `js`) after RUN-THE-TOOL, then answers.
+    fn fake_responses(js: String) -> (String, Bodies) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let seen: Bodies = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                let (log, js) = (log.clone(), js.clone());
+                std::thread::spawn(move || {
+                    let mut r = BufReader::new(s.try_clone().unwrap());
+                    let mut first = String::new();
+                    if r.read_line(&mut first).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let mut headers = vec![("path".to_string(), first.split_whitespace().nth(1).unwrap_or("").to_string())];
+                    loop {
+                        let mut h = String::new();
+                        r.read_line(&mut h).unwrap();
+                        if h.trim().is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = h.split_once(':') {
+                            headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+                        }
+                    }
+                    let len: usize = headers.iter().find(|(k, _)| k == "content-length").and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
+                    let mut b = vec![0u8; len];
+                    r.read_exact(&mut b).unwrap();
+                    let body = String::from_utf8_lossy(&b).to_string();
+                    log.lock().unwrap().push((headers, body.clone()));
+                    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                    let has_output = parsed["input"].as_array().into_iter().flatten().any(|i| i["type"] == "custom_tool_call_output");
+                    let payload = if has_output {
+                        message_stream("DONE-FROM-FAKE-API")
+                    } else if body.contains("RUN-THE-TOOL") {
+                        exec_stream(&js)
+                    } else {
+                        message_stream("ok")
+                    };
+                    let mut s = s;
+                    let _ = write!(s, "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}", payload.len());
+                });
+            }
+        });
+        (url, seen)
+    }
+
+    fn codex_bin() -> Option<std::path::PathBuf> {
+        if let Some(p) = std::env::var_os("CODEX_BIN") {
+            return std::fs::canonicalize(p).ok();
+        }
+        let out = std::process::Command::new("which").arg("codex").output().ok()?;
+        let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!p.is_empty()).then(|| std::fs::canonicalize(p).ok()).flatten()
+    }
+
+    #[test]
+    fn codex_runs_a_tool_in_the_container_behind_the_openai_profile() {
+        let bridge = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/toto-mcp-exec");
+        let (Some(codex), true) = (codex_bin(), bridge.exists() && docker_has("debian:bookworm-slim")) else {
+            eprintln!("skipping: needs docker, debian:bookworm-slim, the musl bridge and a static codex binary (CODEX_BIN)");
+            return;
+        };
+        let f = fixture("codex-c");
+        let (url, seen) = fake_responses(r#"text(JSON.stringify(await tools.exec_command({cmd: "echo hello-from-codex > /workspace/x.txt; id -u; echo key=${OPENAI_API_KEY:-unset}"})));"#.to_string());
+        let dir = f.dir.join("sock");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let proxy = AuthProxy::start(&dir.join("p.sock"), &url, Provider::OpenAi, Auth::Bearer { token: "sk-REAL-OPENAI".into(), oauth: false }).unwrap();
+
+        let t = task("cx1", "a", 1, &f.key_a);
+        let mut sb = DockerSandbox::new("debian:bookworm-slim");
+        sb.bridge = Some(bridge);
+        sb.proxy_socket = Some(proxy.socket().to_path_buf());
+        let host = codex.with_file_name("codex-code-mode-host");
+        assert!(host.exists(), "the codex package ships codex-code-mode-host next to codex");
+        sb.agent_files = vec![codex, host];
+        let ws = sb.create(&t, &t.sandbox_profile).unwrap();
+        let (name, head) = ws.exec_prefix.split_last().unwrap();
+        let mk = |envs: &[(&str, String)]| {
+            let mut prefix: Vec<String> = head.to_vec();
+            for (k, v) in envs {
+                prefix.extend(["-e".into(), format!("{k}={v}")]);
+            }
+            prefix.extend(["-w".into(), "/workspace".into(), name.clone()]);
+            Workspace { task_id: ws.task_id.clone(), path: ws.path.clone(), exec_prefix: prefix, bridge: true }
+        };
+        let agent_ws = mk(&[("OPENAI_API_KEY", "not-a-credential".into()), ("HOME", "/tmp/home".into()), ("CODEX_HOME", "/tmp/home/.codex".into()), ("TERM", "dumb".into())]);
+        exec_io(&agent_ws, &["mkdir", "-p", "/tmp/home/.codex"], None, Duration::from_secs(10), 1024).unwrap();
+        let provider = format!("model_providers.toto={{name=\"toto\",base_url=\"http://{PROXY_ADDR}/v1\",env_key=\"OPENAI_API_KEY\",wire_api=\"responses\"}}");
+        // The container is the sandbox: Codex's own sandbox is switched off inside it.
+        let exe = format!("{AGENT_DIR}/codex");
+        let args = [exe.as_str(), "exec", "--ephemeral", "--skip-git-repo-check", "--ignore-user-config", "--json", "--dangerously-bypass-approvals-and-sandbox", "-c", "model_provider=\"toto\"", "-c", &provider, "RUN-THE-TOOL please"];
+        let out = exec_io(&agent_ws, &args, None, Duration::from_secs(120), 8 << 20).unwrap();
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout).to_string(), String::from_utf8_lossy(&out.stderr).to_string());
+        assert!(out.status.success(), "codex failed.\nstdout tail: {}\nstderr: {}", stdout.lines().rev().take(4).collect::<Vec<_>>().join("\n"), stderr.chars().take(600).collect::<String>());
+        let events: Vec<serde_json::Value> = stdout.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        assert!(events.iter().any(|e| e["item"]["text"] == "DONE-FROM-FAKE-API"), "{stdout}");
+
+        let check = exec_io(&mk(&[]), &["cat", "/workspace/x.txt"], None, Duration::from_secs(10), 1024).unwrap();
+        let tool_out = seen.lock().unwrap().iter().map(|(_, b)| b.clone()).filter(|b| b.contains("custom_tool_call_output")).last().map(|b| {
+            let v: serde_json::Value = serde_json::from_str(&b).unwrap_or_default();
+            v["input"].as_array().into_iter().flatten().filter(|i| i["type"] == "custom_tool_call_output").map(|i| i["output"].to_string()).collect::<Vec<_>>().join(" | ")
+        }).unwrap_or_default();
+        assert_eq!(String::from_utf8_lossy(&check.stdout), "hello-from-codex\n", "the tool ran in the container. Codex reported: {tool_out}");
+        let bodies = seen.lock().unwrap().clone();
+        let last = bodies.iter().map(|(_, b)| b.as_str()).filter(|b| serde_json::from_str::<serde_json::Value>(b).is_ok_and(|v| v["input"].as_array().into_iter().flatten().any(|i| i["type"] == "custom_tool_call_output"))).last().expect("the tool output reached the model");
+        assert!(last.contains("65534") && last.contains("key=not-a-credential"), "ran as nobody; only the dummy key exists inside: {last}");
+        let calls: Vec<_> = bodies.iter().filter(|(h, _)| h.iter().any(|(k, v)| k == "path" && v == "/v1/responses")).collect();
+        assert!(calls.len() >= 2);
+        for (h, _) in &calls {
+            let auth: Vec<&str> = h.iter().filter(|(k, _)| k == "authorization").map(|(_, v)| v.as_str()).collect();
+            assert_eq!(auth, ["Bearer sk-REAL-OPENAI"], "the proxy's credential, never the dummy");
+        }
+        assert_eq!(proxy.tokens(), 42 * calls.len() as u64, "metered by the proxy from response.completed");
+        let hay = exec_io(&mk(&[]), &["sh", "-c", "env; cat /proc/mounts; echo done"], None, Duration::from_secs(10), 1 << 20).unwrap();
+        assert!(!String::from_utf8_lossy(&hay.stdout).contains("REAL-OPENAI"));
         sb.destroy(ws).unwrap();
     }
 }

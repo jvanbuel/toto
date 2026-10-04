@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 pub const BRIDGE_PATH: &str = "/toto/mcp-exec";
 /// Where the credential proxy's unix socket and the agent binary appear inside the container.
 pub const PROXY_SOCKET_PATH: &str = "/toto/proxy.sock";
-pub const AGENT_PATH: &str = "/toto/claude";
+pub const AGENT_DIR: &str = "/toto/agent";
 /// Loopback address the in-container relay serves; the agent's API base URL points here.
 pub const PROXY_ADDR: &str = "127.0.0.1:8080";
 
@@ -149,15 +149,16 @@ pub struct DockerSandbox {
     /// Credential proxy socket (host side), bind-mounted at `PROXY_SOCKET_PATH`. When set, a
     /// loopback relay to it is started inside the container at `PROXY_ADDR` (ADR 12).
     pub proxy_socket: Option<PathBuf>,
-    /// Agent CLI binary (glibc, e.g. the host's `claude`) mounted read-only at `AGENT_PATH`.
-    pub agent_binary: Option<PathBuf>,
+    /// Agent CLI files mounted read-only under `AGENT_DIR`, each under its own file name. The
+    /// first is the executable; companions (e.g. Codex's `codex-code-mode-host`) must sit next to it.
+    pub agent_files: Vec<PathBuf>,
     /// Content baselines of unpacked inputs, by task id (kept on the host, never in the container).
     baselines: std::sync::Mutex<std::collections::HashMap<String, std::collections::BTreeMap<String, String>>>,
 }
 
 impl DockerSandbox {
     pub fn new(image: impl Into<String>) -> Self {
-        Self { bin: "docker".into(), image: image.into(), runtime: None, workspace_mb: 512, bridge: None, proxy_socket: None, agent_binary: None, baselines: Default::default() }
+        Self { bin: "docker".into(), image: image.into(), runtime: None, workspace_mb: 512, bridge: None, proxy_socket: None, agent_files: vec![], baselines: Default::default() }
     }
 
     pub fn container_name(task_id: &str) -> String {
@@ -190,8 +191,8 @@ impl DockerSandbox {
         if let Some(sock) = &self.proxy_socket {
             a.extend(["--mount".into(), format!("type=bind,src={},dst={PROXY_SOCKET_PATH}", sock.display())]);
         }
-        if let Some(bin) = &self.agent_binary {
-            a.extend(["--mount".into(), format!("type=bind,src={},dst={AGENT_PATH},readonly", bin.display())]);
+        for f in &self.agent_files {
+            a.extend(["--mount".into(), format!("type=bind,src={},dst={AGENT_DIR}/{},readonly", f.display(), f.file_name().unwrap_or_default().to_string_lossy())]);
         }
         if let Some(rt) = &self.runtime {
             a.extend(["--runtime".into(), rt.clone()]);
@@ -211,6 +212,11 @@ impl DockerSandbox {
 }
 
 impl DockerSandbox {
+    /// Path of the agent executable inside the container, if agent files are configured.
+    pub fn agent_exe(&self) -> Option<String> {
+        self.agent_files.first().map(|f| format!("{AGENT_DIR}/{}", f.file_name().unwrap_or_default().to_string_lossy()))
+    }
+
     /// Starts the loopback relay to the credential proxy inside the container and waits until it
     /// accepts connections. Needs the bridge binary (which provides `relay` and `probe`).
     fn start_relay(&self, container: &str) -> Result<()> {
@@ -235,10 +241,14 @@ impl Sandbox for DockerSandbox {
             .map_err(|e| Error::Sandbox(format!("{} daemon unreachable: {e}", self.bin)))?;
         self.docker(&["image".into(), "inspect".into(), self.image.clone()])
             .map_err(|_| Error::Sandbox(format!("image `{}` not present; run `{} pull {}`", self.image, self.bin, self.image)))?;
-        if let Some(agent) = &self.agent_binary {
-            // The mounted agent must run in this image (it is a glibc binary: Alpine/musl images will not do).
-            let mount = format!("type=bind,src={},dst={AGENT_PATH},readonly", agent.display());
-            self.docker(&["run".into(), "--rm".into(), "--network".into(), "none".into(), "--mount".into(), mount, self.image.clone(), AGENT_PATH.into(), "--version".into()])
+        if let Some(exe) = self.agent_exe() {
+            // The mounted agent must run in this image (the Claude CLI is a glibc binary: Alpine/musl images will not do).
+            let mut args: Vec<String> = ["run", "--rm", "--network", "none"].map(String::from).into();
+            for f in &self.agent_files {
+                args.extend(["--mount".into(), format!("type=bind,src={},dst={AGENT_DIR}/{},readonly", f.display(), f.file_name().unwrap_or_default().to_string_lossy())]);
+            }
+            args.extend([self.image.clone(), exe, "--version".into()]);
+            self.docker(&args)
                 .map_err(|e| Error::Sandbox(format!("the agent binary does not run in image `{}` (it needs a glibc-based image such as debian or ubuntu): {e}", self.image)))?;
         }
         Ok(())

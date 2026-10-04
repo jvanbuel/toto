@@ -65,6 +65,9 @@ pub enum HarnessConfig {
         /// Agent binary mounted into the container; default: the `claude` found on PATH.
         #[serde(default)]
         agent_binary: Option<PathBuf>,
+        /// Companion files mounted next to the agent executable (container placement).
+        #[serde(default)]
+        agent_extra_files: Vec<PathBuf>,
         /// Use an API key (from this file) instead of the subscription token (container placement).
         #[serde(default)]
         api_key_file: Option<PathBuf>,
@@ -203,7 +206,7 @@ impl Config {
         self.build_sandbox_with(None, None)
     }
 
-    fn build_sandbox_with(&self, proxy_socket: Option<PathBuf>, agent: Option<PathBuf>) -> Box<dyn Sandbox> {
+    fn build_sandbox_with(&self, proxy_socket: Option<PathBuf>, agent: Option<Vec<PathBuf>>) -> Box<dyn Sandbox> {
         let work = self.state_dir.join("work");
         match &self.sandbox {
             SandboxConfig::Dir => Box::new(DirSandbox { root: work }),
@@ -214,7 +217,7 @@ impl Config {
                 s.runtime = runtime.clone();
                 s.bridge = bridge.clone();
                 s.proxy_socket = proxy_socket;
-                s.agent_binary = agent;
+                s.agent_files = agent.unwrap_or_default();
                 Box::new(s)
             }
         }
@@ -230,10 +233,10 @@ impl Config {
             let bytes: [u8; 32] = hex::decode(k).ok().and_then(|b| b.try_into().ok()).ok_or_else(|| Error::Verify(format!("bad key for project `{id}`")))?;
             trusted.insert(id, VerifyingKey::from_bytes(&bytes).map_err(|_| Error::Verify(format!("bad key for project `{id}`")))?);
         }
-        let (mut proxy_socket, mut agent): (Option<PathBuf>, Option<PathBuf>) = (None, None);
+        let (mut proxy_socket, mut agent): (Option<PathBuf>, Option<Vec<PathBuf>>) = (None, None);
         let harness: Box<dyn Harness> = match &self.harness {
             HarnessConfig::Echo { tokens_per_run } => Box::new(EchoHarness { tokens_per_run: *tokens_per_run }),
-            HarnessConfig::Claude { bin, token_file, model, placement, upstream, agent_binary, api_key_file } => {
+            HarnessConfig::Claude { bin, token_file, model, placement, upstream, agent_binary, agent_extra_files, api_key_file } => {
                 if !matches!(self.sandbox, SandboxConfig::Docker { bridge: Some(_), .. }) {
                     return Err(Error::Policy("the claude harness needs a Docker/Podman sandbox with `bridge` set to the static toto-mcp-exec binary".into()));
                 }
@@ -250,9 +253,11 @@ impl Config {
                     let dir = self.state_dir.join("proxy");
                     std::fs::create_dir_all(&dir)?;
                     std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
-                    let proxy = std::sync::Arc::new(crate::proxy::AuthProxy::start(&dir.join("p.sock"), upstream, auth)?);
+                    let proxy = std::sync::Arc::new(crate::proxy::AuthProxy::start(&dir.join("p.sock"), upstream, crate::proxy::Provider::Anthropic, auth)?);
                     proxy_socket = Some(proxy.socket().to_path_buf());
-                    agent = Some(agent_binary.clone().or_else(which_claude).ok_or_else(|| Error::Policy("no `claude` binary found for the container; set `agent_binary`".into()))?);
+                    let exe = agent_binary.clone().or_else(which_claude).ok_or_else(|| Error::Policy("no `claude` binary found for the container; set `agent_binary`".into()))?;
+                    h.agent_name = exe.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    agent = Some(std::iter::once(exe).chain(agent_extra_files.iter().cloned()).collect::<Vec<_>>());
                     h = h.in_container(proxy);
                 }
                 Box::new(h)
