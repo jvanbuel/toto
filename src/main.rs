@@ -74,6 +74,28 @@ enum Cmd {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Check the whole setup (sandbox, network fence, nested sandbox, credentials, harness) and
+    /// report what works, what is risky and what is missing. Exits 1 if anything failed.
+    Doctor {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Create (and with --apply, install) the firewalled docker network that tasks with egress
+    /// rules run on: no route to private ranges, other containers or this host. Needs root.
+    NetSetup {
+        #[arg(long, default_value = toto::netfence::DEFAULT_NETWORK)]
+        name: String,
+        #[arg(long, default_value = toto::netfence::DEFAULT_SUBNET)]
+        subnet: String,
+        #[arg(long, default_value = "docker")]
+        bin: String,
+        /// Run the script instead of printing it.
+        #[arg(long)]
+        apply: bool,
+        /// Remove the rules and the network.
+        #[arg(long)]
+        remove: bool,
+    },
     /// Run one signed task end to end against an in-memory queue and an echo harness.
     Demo,
 }
@@ -131,6 +153,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             println!("queue empty; audit log: {}", cfg.state_dir.join("audit.jsonl").display());
+        }
+        Cmd::Doctor { config } => {
+            let cfg = toto::config::Config::load(&config_path(config))?;
+            let checks = toto::doctor::run_all(&cfg);
+            for c in &checks {
+                println!("{c}");
+            }
+            if !toto::doctor::passed(&checks) {
+                std::process::exit(1);
+            }
+        }
+        Cmd::NetSetup { name, subnet, bin, apply, remove } => {
+            let dns = toto::netfence::resolvers(&fs::read_to_string("/etc/resolv.conf").unwrap_or_default());
+            let script = if remove { toto::netfence::teardown_script(&bin, &name, &subnet, &dns) } else { toto::netfence::script(&bin, &name, &subnet, &dns) };
+            if !apply {
+                println!("# run as root (or re-run with --apply):\n{script}# then set \"network\": \"{name}\" in the docker sandbox config");
+            } else if !std::process::Command::new("sh").args(["-c", &script]).status()?.success() {
+                return Err("the script failed (are you root, and is iptables available?)".into());
+            } else if remove {
+                println!("removed the fence rules and network `{name}`");
+            } else {
+                println!("done; set \"network\": \"{name}\" in the docker sandbox config, then run `toto doctor`");
+            }
         }
         Cmd::ProjectKey { out } => {
             let key = toto::manifest::generate_key();

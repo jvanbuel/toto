@@ -102,6 +102,14 @@ docker build -t toto-omnigent docs/examples/omnigent-image
 
 Same task, same commands. This runs the Claude CLI that Anthropic ships inside the `claude-agent-sdk` wheel, not your own install, and each task takes about 20 seconds longer. For Codex with an API key see the README (`provider: openai`, `api_key_file`, `agent_files`). What this settles beyond the other variants: whether your credential works through the proxy for a harness Omnigent drives.
 
+## Check the setup first: `toto doctor`
+
+Before the first task, run `toto doctor` (add `--config` if the config is not in the default place). It checks the runner key, trusted projects, policy, queue, sandbox, the network fence, the nested sandbox prerequisites and the harness, and exits 1 on any `FAIL`. Warnings say what is missing or risky.
+
+## Variant: tasks that need the web (egress rules)
+
+Only for tasks whose manifest carries `network_allowlist` rules. As root: `toto net-setup --apply` creates the fenced bridge `toto-egress` (no route to private ranges, other containers or this host). Then set `"network": "toto-egress"` in the docker sandbox config, add the exact rules you accept to `policy.max_profile.network_allowlist`, and run `toto doctor`, which refuses to pass if the fence does not hold. `toto net-setup --remove --apply` undoes it. Without `network`, tasks with rules are refused.
+
 ## What to look for
 
 Success: `Submitted("live-1")`; `toto extract-result ~/.config/toto/queue/results/live-1.*.json ./out` lists `file    hello.txt (...)` and `out/hello.txt` contains the line (the task's changed files come back as signed artifacts); the audit line shows `submitted` and a plausible `tokens=` figure; the result in `~/.config/toto/queue/results/` has an `output` that reports `hello from the sandbox`, `65534` for `id -u`, and an error or empty listing for `ls /home`.

@@ -185,9 +185,9 @@ mod docker {
         let p = SandboxProfile { network_allowlist: vec!["GET pypi.org/**".into()], ..Default::default() };
         assert!(DockerSandbox::new("alpine").run_args("t1", &p).is_err(), "network off: refuse");
         let mut sb = DockerSandbox::new("alpine");
-        sb.network = true;
+        sb.network = Some("toto-egress".into());
         let a = sb.run_args("t1", &p).unwrap().join(" ");
-        assert!(a.contains("--network bridge") && a.contains("--cap-drop ALL") && a.contains("--read-only"), "{a}");
+        assert!(a.contains("--network toto-egress") && a.contains("--cap-drop ALL") && a.contains("--read-only"), "{a}");
         let none = sb.run_args("t1", &SandboxProfile::default()).unwrap().join(" ");
         assert!(none.contains("--network none"), "no rules, no network even when allowed: {none}");
     }
@@ -509,7 +509,7 @@ echo "the answer""#;
         assert!(c.build().is_err(), "docker sandbox without the bridge must be refused");
         c.sandbox = crate::config::SandboxConfig::Bwrap;
         assert!(c.build().is_ok());
-        c.sandbox = crate::config::SandboxConfig::Docker { bin: "docker".into(), image: "alpine".into(), runtime: None, bridge: Some("/x/toto-mcp-exec".into()), nested_userns: false, network: false };
+        c.sandbox = crate::config::SandboxConfig::Docker { bin: "docker".into(), image: "alpine".into(), runtime: None, bridge: Some("/x/toto-mcp-exec".into()), nested_userns: false, network: None };
         assert!(c.build().is_ok(), "docker + bridge is the container route");
     }
 }
@@ -1423,7 +1423,7 @@ mod claude_cli {
         assert!(c.build().is_err(), "docker without bridge");
         c.sandbox = crate::config::SandboxConfig::Bwrap;
         assert!(c.build().is_err(), "bwrap has no bridge");
-        c.sandbox = crate::config::SandboxConfig::Docker { bin: "docker".into(), image: "alpine".into(), runtime: None, bridge: Some("/x".into()), nested_userns: false, network: false };
+        c.sandbox = crate::config::SandboxConfig::Docker { bin: "docker".into(), image: "alpine".into(), runtime: None, bridge: Some("/x".into()), nested_userns: false, network: None };
         assert!(c.build().is_ok());
     }
 }
@@ -2011,7 +2011,7 @@ mod claude_in_container {
         let (url, seen) = fake_anthropic("cat calc.txt; echo fixed > calc.txt; ls .claude/skills; cat AGENTS.md; id -u");
 
         let mut cfg = Config::starter(&f.dir);
-        cfg.sandbox = SandboxConfig::Docker { bin: "docker".into(), image: "debian:bookworm-slim".into(), runtime: None, bridge: Some(bridge), nested_userns: false, network: false };
+        cfg.sandbox = SandboxConfig::Docker { bin: "docker".into(), image: "debian:bookworm-slim".into(), runtime: None, bridge: Some(bridge), nested_userns: false, network: None };
         cfg.harness = HarnessConfig::Claude { bin: "claude".into(), token_file: None, model: None, placement: PlacementConfig::Container, upstream: url, agent_binary: Some(claude), agent_extra_files: vec![], api_key_file: None };
         cfg.policy = super::policy();
         cfg.policy.allow_context = true;
@@ -2145,7 +2145,7 @@ mod claude_in_container {
             ("mcp__omnigent__sys_os_shell", serde_json::json!({"command": "cat calc.txt; echo fixed > calc.txt; ls .claude/skills; cat AGENTS.md; id -u"})),
         ]);
         let mut cfg = Config::starter(&f.dir);
-        cfg.sandbox = SandboxConfig::Docker { bin: "docker".into(), image: "toto-omnigent-test".into(), runtime: None, bridge: Some(bridge), nested_userns: false, network: false };
+        cfg.sandbox = SandboxConfig::Docker { bin: "docker".into(), image: "toto-omnigent-test".into(), runtime: None, bridge: Some(bridge), nested_userns: false, network: None };
         cfg.harness = HarnessConfig::Omnigent { bin: "omnigent".into(), server_url: "http://unused".into(), harness: "claude-sdk".into(), placement: PlacementConfig::Container, provider: Default::default(), upstream: Some(url), token_file: None, api_key_file: None, agent_files: vec![], model: None };
         cfg.policy = super::policy();
         cfg.policy.allow_context = true;
@@ -2234,7 +2234,7 @@ mod claude_in_container {
         let mut t = task("eg1", "a", 1, &f.key_a);
         t.sandbox_profile.network_allowlist = vec![format!("GET {gw}/ok")];
         let mut sb = DockerSandbox::new("toto-omnigent-test");
-        sb.network = true;
+        sb.network = Some("bridge".into());
         sb.bridge = Some(bridge);
         sb.proxy_socket = Some(proxy.socket().to_path_buf());
         sb.seccomp_profile = Some(profile);
@@ -2625,5 +2625,89 @@ mod nested_userns {
         assert!(outer.contains("65534") && outer.contains("CapEff:\t0000000000000000") && outer.contains("net-closed"), "outer container is still unprivileged and offline: {outer}");
         let (blocked, _) = run(false, "us2");
         assert!(!blocked.status.success() && String::from_utf8_lossy(&blocked.stderr).contains("No permissions to create new namespace"), "without the profile Docker's default must refuse: {}", String::from_utf8_lossy(&blocked.stderr));
+    }
+}
+
+mod netfence {
+    use crate::netfence::*;
+    use std::process::Command;
+
+    fn sh(script: &str) -> bool {
+        Command::new("sh").args(["-c", script]).status().is_ok_and(|s| s.success())
+    }
+
+    #[test]
+    fn the_script_covers_every_private_range_and_dns() {
+        let s = script("docker", "toto-egress", "172.30.0.0/24", &resolvers("nameserver 127.0.0.53\nnameserver 192.168.1.1\nsearch x\nnameserver 8.8.8.8"));
+        for r in PRIVATE_RANGES {
+            assert!(s.contains(&format!("-s 172.30.0.0/24 -d {r} -j DROP")), "{r}");
+        }
+        assert!(s.contains("INPUT -s 172.30.0.0/24 -j DROP"), "host itself");
+        assert!(s.contains("-d 192.168.1.1 -p udp --dport 53 -j ACCEPT") && s.contains("-d 8.8.8.8 -p tcp --dport 53 -j ACCEPT"));
+        assert!(!s.contains("127.0.0.53"), "loopback resolvers are not reachable from a container");
+        assert!(s.matches("iptables -C").count() == s.matches("|| iptables -I").count(), "every rule is idempotent");
+    }
+
+    /// Live: an unfenced bridge is refused, the generated script fences it, teardown removes it.
+    #[test]
+    fn verify_refuses_an_unfenced_network_and_accepts_the_fenced_one() {
+        let have = |c: &str| Command::new("sh").args(["-c", &format!("command -v {c}")]).output().is_ok_and(|o| o.status.success());
+        if !have("docker") || !have("iptables") || !super::proxy_container::docker_has("toto-omnigent-test") || !sh("iptables -S >/dev/null 2>&1") {
+            eprintln!("skipping: needs docker, root iptables and the toto-omnigent-test image");
+            return;
+        }
+        let (net, subnet, image) = ("toto-test-fence", "172.31.77.0/24", "toto-omnigent-test");
+        assert!(sh(&format!("docker network rm {net} >/dev/null 2>&1; docker network create --subnet {subnet} {net} >/dev/null")));
+        let dns = resolvers(&std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default());
+        let unfenced = verify("docker", net, image);
+        assert!(unfenced.as_ref().is_err_and(|e| e.to_string().contains("not fenced")), "{unfenced:?}");
+        assert!(sh(&script("docker", net, subnet, &dns)), "script runs (and twice, idempotently)");
+        assert!(sh(&script("docker", net, subnet, &dns)));
+        let fenced = verify("docker", net, image);
+        assert!(sh(&teardown_script("docker", net, subnet, &dns)));
+        assert!(sh(&format!("! iptables -S INPUT | grep -q -- '-s {subnet}'")), "teardown removes the rules");
+        fenced.expect("fenced network passes");
+    }
+}
+
+mod doctor {
+    use crate::config::{Config, HarnessConfig, SandboxConfig};
+    use crate::doctor::*;
+
+    fn cfg(name: &str) -> Config {
+        let dir = std::env::temp_dir().join(format!("toto-test-doctor-{name}-{}", std::process::id()));
+        let mut c = Config::starter(&dir);
+        c.sandbox = SandboxConfig::Dir;
+        c.harness = HarnessConfig::Echo { tokens_per_run: 1 };
+        c
+    }
+
+    #[test]
+    fn a_dev_setup_passes_with_warnings_that_say_what_is_missing() {
+        let checks = run_all(&cfg("dev"));
+        assert!(passed(&checks), "{checks:?}");
+        let text: String = checks.iter().map(|c| c.to_string()).collect::<Vec<_>>().join("\n");
+        for want in ["no trusted project keys", "no isolation", "placeholder"] {
+            assert!(text.contains(want), "missing `{want}` in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn a_missing_image_or_unfenced_network_fails() {
+        let mut c = cfg("img");
+        c.sandbox = SandboxConfig::Docker { bin: "docker".into(), image: "toto-no-such-image".into(), runtime: None, bridge: None, nested_userns: false, network: None };
+        let checks = run_all(&c);
+        assert!(!passed(&checks), "{checks:?}");
+        assert!(checks.iter().any(|k| k.level == Level::Fail && k.name == "sandbox"));
+    }
+
+    #[test]
+    fn nested_sandbox_with_gvisor_is_flagged() {
+        // `build_sandbox().probe()` fails first without a daemon, so only assert when docker answers.
+        if std::process::Command::new("docker").arg("info").output().is_ok_and(|o| o.status.success()) && super::proxy_container::docker_has("alpine") {
+            let mut c = cfg("gv");
+            c.sandbox = SandboxConfig::Docker { bin: "docker".into(), image: "alpine".into(), runtime: Some("runsc".into()), bridge: None, nested_userns: true, network: None };
+            assert!(!passed(&run_all(&c)));
+        }
     }
 }

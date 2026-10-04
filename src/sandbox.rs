@@ -129,9 +129,9 @@ impl Sandbox for DirSandbox {
 
 /// Hardened Docker/Podman sandbox: one throwaway container per task.
 ///
-/// - no network (`--network none`) unless the contributor enabled `network` *and* the task has egress
-///   rules; the rules are enforced by Omnigent inside the container, not by the host. Without
-///   `network`, tasks asking for rules are refused (fail closed);
+/// - no network (`--network none`) unless the contributor named a fenced `network` (`netfence`) *and*
+///   the task has egress rules; the rules are enforced by Omnigent inside the container. Without
+///   `network`, tasks asking for rules are refused (fail closed); `probe` checks the fence;
 /// - read-only root, all capabilities dropped, `no-new-privileges`, non-root user;
 /// - no host mounts: the workspace is a size-limited tmpfs inside the container;
 /// - CPU, memory and pids limits from the profile;
@@ -153,8 +153,9 @@ pub struct DockerSandbox {
     /// Seccomp profile file. `None` keeps Docker's default; `toto`'s opt-in profile allows a nested
     /// bubblewrap (see `profiles/README.md`).
     pub seccomp_profile: Option<PathBuf>,
-    /// Allow a network for tasks that carry egress rules. Off by default.
-    pub network: bool,
+    /// Name of a fenced user-defined docker network (see `netfence`) for tasks that carry egress
+    /// rules. `None` (the default): such tasks are refused.
+    pub network: Option<String>,
     /// Agent CLI files mounted read-only under `AGENT_DIR`, each under its own file name. The
     /// first is the executable; companions (e.g. Codex's `codex-code-mode-host`) must sit next to it.
     pub agent_files: Vec<PathBuf>,
@@ -164,7 +165,7 @@ pub struct DockerSandbox {
 
 impl DockerSandbox {
     pub fn new(image: impl Into<String>) -> Self {
-        Self { bin: "docker".into(), image: image.into(), runtime: None, workspace_mb: 512, bridge: None, proxy_socket: None, seccomp_profile: None, network: false, agent_files: vec![], baselines: Default::default() }
+        Self { bin: "docker".into(), image: image.into(), runtime: None, workspace_mb: 512, bridge: None, proxy_socket: None, seccomp_profile: None, network: None, agent_files: vec![], baselines: Default::default() }
     }
 
     pub fn container_name(task_id: &str) -> String {
@@ -174,10 +175,11 @@ impl DockerSandbox {
 
     /// The `run` argument list; pure so the hardening flags are unit-tested without a daemon.
     pub fn run_args(&self, task_id: &str, p: &SandboxProfile) -> Result<Vec<String>> {
-        if !p.network_allowlist.is_empty() && !self.network {
-            return Err(Error::Sandbox("the task wants network access but this sandbox has `network` off; refusing to run".into()));
-        }
-        let net = if p.network_allowlist.is_empty() { "none" } else { "bridge" };
+        let net = match (&self.network, p.network_allowlist.is_empty()) {
+            (_, true) => "none",
+            (Some(name), false) => name.as_str(),
+            (None, false) => return Err(Error::Sandbox("the task wants network access but this sandbox has no `network` configured; refusing to run".into())),
+        };
         let mut a: Vec<String> = [
             "run", "-d", "--rm", "--name", &Self::container_name(task_id),
             "--network", net, "--read-only", "--cap-drop", "ALL",
@@ -251,6 +253,9 @@ impl Sandbox for DockerSandbox {
             .map_err(|e| Error::Sandbox(format!("{} daemon unreachable: {e}", self.bin)))?;
         self.docker(&["image".into(), "inspect".into(), self.image.clone()])
             .map_err(|_| Error::Sandbox(format!("image `{}` not present; run `{} pull {}`", self.image, self.bin, self.image)))?;
+        if let Some(net) = &self.network {
+            crate::netfence::verify(&self.bin, net, &self.image)?;
+        }
         if let Some(exe) = self.agent_exe() {
             // The mounted agent must run in this image (the Claude CLI is a glibc binary: Alpine/musl images will not do).
             let mut args: Vec<String> = ["run", "--rm", "--network", "none"].map(String::from).into();

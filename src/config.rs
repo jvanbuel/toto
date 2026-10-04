@@ -35,8 +35,9 @@ pub enum SandboxConfig {
         /// run their own sandbox inside the container (see `profiles/README.md`). Opt-in.
         #[serde(default)]
         nested_userns: bool,
+        /// Fenced docker network for tasks with egress rules (`toto net-setup`).
         #[serde(default)]
-        network: bool,
+        network: Option<String>,
     },
     /// bubblewrap (Linux), no daemon or image.
     Bwrap,
@@ -218,7 +219,7 @@ impl Config {
             state_dir: dir.join("state"),
             queue_dir: dir.join("queue"),
             poll_secs: default_poll(),
-            sandbox: SandboxConfig::Docker { bin: docker_bin(), image: "alpine".into(), runtime: None, bridge: None, nested_userns: false, network: false },
+            sandbox: SandboxConfig::Docker { bin: docker_bin(), image: "alpine".into(), runtime: None, bridge: None, nested_userns: false, network: None },
             harness: HarnessConfig::Echo { tokens_per_run: 100 },
             policy: Policy {
                 daily_token_cap: 100_000,
@@ -273,7 +274,7 @@ impl Config {
                 s.bin = bin.clone();
                 s.runtime = runtime.clone();
                 s.bridge = bridge.clone();
-                s.network = *network;
+                s.network = network.clone();
                 if *nested_userns {
                     let path = self.state_dir.join("seccomp-nested-userns.json");
                     let _ = std::fs::create_dir_all(&self.state_dir);
