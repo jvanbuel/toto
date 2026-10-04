@@ -11,6 +11,12 @@ pub trait Harness: Send {
         Ok(())
     }
 
+    /// Whether this harness can deliver project-supplied skills and MCP servers (ADR 9).
+    /// Tasks carrying context are refused by harnesses that cannot.
+    fn supports_context(&self) -> bool {
+        false
+    }
+
     /// Runs the task against the workspace, reporting every usage increment to `meter`
     /// and aborting with its error when a limit is hit. Returns the raw output.
     fn run(&self, task: &TaskManifest, ws: &Workspace, meter: &mut UsageMeter) -> Result<String>;
@@ -19,6 +25,9 @@ pub trait Harness: Send {
 impl<T: Harness + ?Sized> Harness for Box<T> {
     fn probe(&self) -> Result<()> {
         (**self).probe()
+    }
+    fn supports_context(&self) -> bool {
+        (**self).supports_context()
     }
     fn run(&self, task: &TaskManifest, ws: &Workspace, meter: &mut UsageMeter) -> Result<String> {
         (**self).run(task, ws, meter)

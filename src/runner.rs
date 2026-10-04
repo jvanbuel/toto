@@ -79,7 +79,8 @@ impl<Q: QueueClient, H: Harness, S: Sandbox, R: Reviewer> Runner<Q, H, S, R> {
             if self.refused.contains(&m.id) {
                 continue;
             }
-            match self.trusted.verify(&m).and_then(|_| self.policy.admit(&m, used_today, now)) {
+            let supported = if m.context.is_empty() || self.harness.supports_context() { Ok(()) } else { Err(Error::Policy("harness cannot deliver skills or MCP servers".into())) };
+            match self.trusted.verify(&m).and_then(|_| self.policy.admit(&m, used_today, now)).and_then(|_| supported) {
                 Ok(()) => ok.push(m),
                 Err(e) => {
                     self.log(&m, "rejected", &e, 0, now)?;
@@ -130,7 +131,8 @@ impl<Q: QueueClient, H: Harness, S: Sandbox, R: Reviewer> Runner<Q, H, S, R> {
 
         // 9. Submit and record.
         self.queue.submit(&result)?;
-        self.log(&task, "submitted", &result.output_hash, result.tokens_used, now)?;
+        let detail = if task.context.is_empty() { result.output_hash.clone() } else { format!("{} {}", result.output_hash, task.context.summary()) };
+        self.log(&task, "submitted", detail, result.tokens_used, now)?;
         Ok(Tick::Submitted(task.id))
     }
 }

@@ -27,6 +27,18 @@ pub struct Policy {
     pub abort_margin_pct: u64,
     /// Tools this runner can drive (e.g. `claude-code`, `api-key`).
     pub available_tools: Vec<String>,
+    /// Accept project-supplied skills (ADR 9).
+    #[serde(default)]
+    pub allow_skills: bool,
+    /// Hosts whose remote MCP servers tasks may use; empty allows none.
+    #[serde(default)]
+    pub allowed_mcp_hosts: Vec<String>,
+    #[serde(default = "default_context_bytes")]
+    pub max_context_bytes: u64,
+}
+
+fn default_context_bytes() -> u64 {
+    64 * 1024
 }
 
 fn default_margin() -> u64 {
@@ -68,6 +80,27 @@ impl Policy {
         }
         if p.cpu_millis > max.cpu_millis || p.memory_mb > max.memory_mb || p.timeout_secs > max.timeout_secs {
             return deny("sandbox profile exceeds policy limits".into());
+        }
+        self.admit_context(m)
+    }
+
+    fn admit_context(&self, m: &TaskManifest) -> Result<()> {
+        let c = &m.context;
+        if c.is_empty() {
+            return Ok(());
+        }
+        c.validate().map_err(|e| Error::Policy(e.to_string()))?;
+        if !c.skills.is_empty() && !self.allow_skills {
+            return Err(Error::Policy("skills are not allowed".into()));
+        }
+        if c.bytes() as u64 > self.max_context_bytes {
+            return Err(Error::Policy(format!("context is {} bytes, limit {}", c.bytes(), self.max_context_bytes)));
+        }
+        for s in &c.mcp_servers {
+            let host = s.host().map_err(|e| Error::Policy(e.to_string()))?;
+            if !self.allowed_mcp_hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+                return Err(Error::Policy(format!("mcp host `{host}` not allowed")));
+            }
         }
         Ok(())
     }

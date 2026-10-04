@@ -122,6 +122,9 @@ impl Config {
                 max_profile: Default::default(),
                 abort_margin_pct: 25,
                 available_tools: vec!["echo".into()],
+                allow_skills: false,
+                allowed_mcp_hosts: vec![],
+                max_context_bytes: 64 * 1024,
             },
             projects: BTreeMap::new(),
         }

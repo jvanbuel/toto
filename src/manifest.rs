@@ -29,6 +29,104 @@ pub struct OutputSchema {
     pub max_bytes: usize,
 }
 
+/// A project-supplied skill: instructions plus optional reference files (ADR 9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Skill {
+    /// Lowercase kebab-case identifier.
+    pub name: String,
+    pub description: String,
+    /// Markdown body of `SKILL.md`.
+    pub content: String,
+    /// Extra text files, by relative path.
+    #[serde(default)]
+    pub files: BTreeMap<String, String>,
+}
+
+/// A remote MCP server. Deliberately just a name and an `https` URL: there is no way to express
+/// a command, headers or environment, so stdio servers and credential forwarding are impossible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServer {
+    pub name: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskContext {
+    #[serde(default)]
+    pub skills: Vec<Skill>,
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServer>,
+}
+
+fn ident(s: &str, extra: &[char]) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || extra.contains(&c))
+}
+
+fn safe_path(p: &str) -> bool {
+    let parts: Vec<&str> = p.split('/').collect();
+    parts.len() <= 4
+        && p.len() <= 128
+        && parts.iter().all(|c| !c.is_empty() && *c != "." && *c != ".." && !c.starts_with('.') && c.chars().all(|ch| ch.is_ascii_alphanumeric() || "._-".contains(ch)))
+        && !p.eq_ignore_ascii_case("SKILL.md")
+}
+
+impl McpServer {
+    /// Host of the URL after checking it is a plain `https` URL.
+    pub fn host(&self) -> Result<&str> {
+        let bad = |why: &str| Err(Error::Verify(format!("mcp server `{}`: {why}", self.name)));
+        let Some(rest) = self.url.strip_prefix("https://") else { return bad("url must start with https://") };
+        if self.url.len() > 512 || self.url.chars().any(|c| c.is_whitespace() || c.is_control() || c == '$' || c == '\\') {
+            return bad("url contains forbidden characters");
+        }
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        if authority.is_empty() || authority.contains('@') {
+            return bad("url must have a host and no userinfo");
+        }
+        Ok(authority.rsplit_once(':').map_or(authority, |(h, port)| if port.chars().all(|c| c.is_ascii_digit()) { h } else { authority }))
+    }
+}
+
+impl TaskContext {
+    pub fn is_empty(&self) -> bool {
+        self.skills.is_empty() && self.mcp_servers.is_empty()
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.skills.iter().map(|s| s.name.len() + s.description.len() + s.content.len() + s.files.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()).sum::<usize>()
+            + self.mcp_servers.iter().map(|m| m.name.len() + m.url.len()).sum::<usize>()
+    }
+
+    /// Structural checks that do not depend on contributor policy.
+    pub fn validate(&self) -> Result<()> {
+        let bad = |s: String| Err(Error::Verify(s));
+        let mut seen = std::collections::HashSet::new();
+        for sk in &self.skills {
+            if !ident(&sk.name, &[]) || !seen.insert(format!("s:{}", sk.name)) {
+                return bad(format!("invalid or duplicate skill name `{}`", sk.name));
+            }
+            if sk.description.len() > 1024 || sk.description.chars().any(char::is_control) {
+                return bad(format!("skill `{}`: description too long or has control characters", sk.name));
+            }
+            if let Some(p) = sk.files.keys().find(|p| !safe_path(p)) {
+                return bad(format!("skill `{}`: unsafe file path `{p}`", sk.name));
+            }
+        }
+        for m in &self.mcp_servers {
+            if !ident(&m.name, &['_']) || !seen.insert(format!("m:{}", m.name)) {
+                return bad(format!("invalid or duplicate mcp server name `{}`", m.name));
+            }
+            m.host()?;
+        }
+        Ok(())
+    }
+
+    /// For the audit log, e.g. `skills=a,b mcp=host1`.
+    pub fn summary(&self) -> String {
+        let hosts: Vec<&str> = self.mcp_servers.iter().filter_map(|m| m.host().ok()).collect();
+        format!("skills={} mcp={}", self.skills.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(","), hosts.join(","))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskManifest {
     pub id: String,
@@ -44,6 +142,10 @@ pub struct TaskManifest {
     pub cost_estimate: u64,
     pub output_schema: OutputSchema,
     pub redundancy: u32,
+    /// Optional skills and MCP servers (ADR 9). Omitted from the signed bytes when empty, so
+    /// manifests signed before this field existed still verify.
+    #[serde(default, skip_serializing_if = "TaskContext::is_empty")]
+    pub context: TaskContext,
     /// Hex ed25519 signature by the project key over the manifest minus this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,

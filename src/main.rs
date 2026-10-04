@@ -131,6 +131,9 @@ fn demo() -> Result<(), Box<dyn std::error::Error>> {
         max_profile: SandboxProfile::default(),
         abort_margin_pct: 25,
         available_tools: vec!["echo".into()],
+        allow_skills: false,
+        allowed_mcp_hosts: vec![],
+        max_context_bytes: 64 * 1024,
     };
     let queue = InMemoryQueue::default();
     queue.post(
@@ -145,6 +148,7 @@ fn demo() -> Result<(), Box<dyn std::error::Error>> {
             cost_estimate: 500,
             output_schema: OutputSchema { format: "text".into(), max_bytes: 4096 },
             redundancy: 1,
+            context: Default::default(),
             signature: None,
         }
         .sign(&project_key)?,
