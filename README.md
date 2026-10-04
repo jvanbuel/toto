@@ -63,7 +63,7 @@ Contributors opt in per kind of context, deny by default, in the policy: `"allow
 
 ## Task inputs and outputs
 
-A task's `inputs` is the SHA-256 of an input bundle in the queue (`bundles/<hash>`); all zeros means no inputs. The bundle is a togra archive (regular files and deletions only, validated paths, size limits; see `src/archive.rs`). The runner checks the hash against the signed manifest, enforces `max_input_bytes` from policy, and unpacks it into the sandbox workspace (inside the container via the bridge's `unpack` command, so the image needs no `tar`). If the task's `output_schema.max_artifact_bytes` is greater than zero, files the agent changed, added or deleted come back in the signed result as artifacts, capped at that size.
+A task's `inputs` is the SHA-256 of an input bundle in the queue (`bundles/<hash>`); all zeros means no inputs. The bundle is a standard tar (only regular files and directories at safe relative paths are accepted; see `src/archive.rs`). The runner checks the hash against the signed manifest, enforces `max_input_bytes` from policy, and unpacks it into the sandbox workspace (inside the container with plain `tar -x`, so the task image must provide `tar`). If the task's `output_schema.max_artifact_bytes` is greater than zero, files the agent changed, added or deleted come back in the signed result as a tar of the changed files, with deletions as OCI-style whiteouts (`.wh.<name>`), capped at that size.
 
 ```
 togra post-task --key pilot.key --bundle ./repo task.json     # pack ./repo as the inputs

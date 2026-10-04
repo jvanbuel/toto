@@ -1,19 +1,14 @@
-#![allow(dead_code)] // shared with the static bridge binary, which uses only part of it
-//! The togra archive: a minimal, safe container for task inputs and outputs.
+//! Task inputs and outputs as standard tar archives, parsed safely on the host.
 //!
-//! Only regular files and deletions can be expressed: no symlinks, hardlinks, devices or
-//! absolute paths, so unpacking cannot escape its root. Used by the library (host side) and,
-//! via `#[path]`, by the static `togra-mcp-exec` bridge inside containers, so it depends on
-//! `std`, `serde_json`, `sha2` and `hex` only.
-//!
-//! Wire format: for each record a JSON header line, then (for files) exactly `size` raw bytes.
-//! `{"t":"file","path":"a/b.txt","mode":420,"size":12}\n<12 bytes>`, `{"t":"del","path":"x"}\n`,
-//! and a final `{"t":"end"}\n`.
+//! Inputs are strict: only regular files and directories, safe relative paths, bounded sizes.
+//! Outputs are changed files plus deletions, using the OCI image-layer convention for removals
+//! (whiteout entries named `.wh.<name>`). Nothing here ever extracts a tar with a general-purpose
+//! tool: entries are validated and written one by one, so a hostile archive cannot escape its
+//! root.
 
-use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::io::{BufRead, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,66 +43,161 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 
-pub fn write_records<W: Write>(w: &mut W, records: &[Record]) -> Result<()> {
-    let io = |e: std::io::Error| e.to_string();
+/// Builds a standard tar: files as regular entries, deletions as OCI-layer whiteouts
+/// (`dir/.wh.<name>`, an empty file), the convention image layers use for "removed".
+pub fn to_bytes(records: &[Record]) -> Result<Vec<u8>> {
+    let mut b = tar::Builder::new(Vec::new());
     for r in records {
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_mtime(0);
+        h.set_uid(0);
+        h.set_gid(0);
         match r {
             Record::File { path, mode, data } => {
-                writeln!(w, "{}", json!({"t": "file", "path": path, "mode": mode, "size": data.len()})).map_err(io)?;
-                w.write_all(data).map_err(io)?;
+                h.set_size(data.len() as u64);
+                h.set_mode(*mode);
+                b.append_data(&mut h, path, &data[..]).map_err(|e| format!("{path}: {e}"))?;
             }
-            Record::Deleted { path } => writeln!(w, "{}", json!({"t": "del", "path": path})).map_err(io)?,
+            Record::Deleted { path } => {
+                h.set_size(0);
+                h.set_mode(0o644);
+                let (dir, name) = path.rsplit_once('/').map_or(("", path.as_str()), |(d, n)| (d, n));
+                let wh = if dir.is_empty() { format!(".wh.{name}") } else { format!("{dir}/.wh.{name}") };
+                b.append_data(&mut h, wh, std::io::empty()).map_err(|e| format!("{path}: {e}"))?;
+            }
         }
     }
-    writeln!(w, "{}", json!({"t": "end"})).map_err(io)
+    b.into_inner().map_err(|e| e.to_string())
 }
 
-pub fn to_bytes(records: &[Record]) -> Result<Vec<u8>> {
-    let mut v = Vec::new();
-    write_records(&mut v, records)?;
-    Ok(v)
+pub fn write_records<W: Write>(w: &mut W, records: &[Record]) -> Result<()> {
+    w.write_all(&to_bytes(records)?).map_err(|e| e.to_string())
 }
 
-/// Reads and validates a whole archive; sizes are checked before any allocation.
-pub fn read_records<R: BufRead>(r: &mut R, limits: Limits) -> Result<Vec<Record>> {
-    let (mut out, mut total) = (Vec::new(), 0u64);
-    loop {
-        let mut line = String::new();
-        let n = r.by_ref().take(4096).read_line(&mut line).map_err(|e| e.to_string())?;
-        if n == 0 || !line.ends_with('\n') {
-            return Err("truncated archive (no end marker)".into());
+/// What to do with entries that are not regular files or directories.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Reject symlinks, hardlinks, devices and so on (task inputs).
+    Strict,
+    /// Skip them (a dump of a workspace the agent has been writing to).
+    Lenient,
+}
+
+/// One interpreted tar entry.
+enum Item {
+    File { path: String, mode: u32, size: u64 },
+    Deleted(String),
+    Skip,
+}
+
+fn mode_bits(m: u32) -> u32 {
+    if m & 0o111 != 0 { 0o755 } else { 0o644 }
+}
+
+/// Maps a tar entry header to a safe, normalised item (no data is read here).
+fn classify<R: Read>(e: &tar::Entry<'_, R>, mode: Mode) -> Result<Item> {
+    use tar::EntryType as T;
+    let ty = e.header().entry_type();
+    let raw = e.path().map_err(|e| format!("bad entry path: {e}"))?;
+    let raw = raw.to_str().ok_or("entry path is not valid UTF-8")?.to_string();
+    let path = raw.trim_start_matches("./").trim_end_matches('/').to_string();
+    match ty {
+        T::Directory => return Ok(Item::Skip),
+        T::Regular | T::Continuous => {}
+        _ if mode == Mode::Lenient => return Ok(Item::Skip),
+        other => return Err(format!("unsupported entry type {other:?} for `{raw}`")),
+    }
+    if path.is_empty() || path == "." {
+        return Ok(Item::Skip);
+    }
+    let size = e.header().size().map_err(|e| e.to_string())?;
+    let (dir, name) = path.rsplit_once('/').map_or(("", path.as_str()), |(d, n)| (d, n));
+    if let Some(target) = name.strip_prefix(".wh.") {
+        if target == ".wh..opq" || target.is_empty() || size != 0 {
+            return Err(format!("unsupported whiteout `{raw}`"));
         }
-        let h: Value = serde_json::from_str(line.trim_end()).map_err(|e| format!("bad header: {e}"))?;
-        let path = h["path"].as_str().unwrap_or("").to_string();
-        match h["t"].as_str() {
-            Some("end") => return Ok(out),
-            Some("file") => {
-                let size = h["size"].as_u64().ok_or("file without size")?;
-                if !valid_path(&path) {
-                    return Err(format!("unsafe path `{path}`"));
-                }
+        let deleted = if dir.is_empty() { target.to_string() } else { format!("{dir}/{target}") };
+        return if valid_path(&deleted) { Ok(Item::Deleted(deleted)) } else { Err(format!("unsafe path `{raw}`")) };
+    }
+    if !valid_path(&path) {
+        return Err(format!("unsafe path `{raw}`"));
+    }
+    Ok(Item::File { path, mode: mode_bits(e.header().mode().unwrap_or(0o644)), size })
+}
+
+/// Reads and validates a whole tar; entry sizes are checked before any allocation.
+pub fn read_records<R: Read>(r: R, limits: Limits, mode: Mode) -> Result<Vec<Record>> {
+    let (mut out, mut total) = (Vec::new(), 0u64);
+    let mut ar = tar::Archive::new(r);
+    for entry in ar.entries().map_err(|e| format!("not a tar archive: {e}"))? {
+        let mut e = entry.map_err(|e| format!("bad tar entry: {e}"))?;
+        match classify(&e, mode)? {
+            Item::Skip => {}
+            Item::Deleted(path) => out.push(Record::Deleted { path }),
+            Item::File { path, mode, size } => {
                 total = total.saturating_add(size);
                 if total > limits.max_total_bytes || out.len() >= limits.max_files {
                     return Err(format!("archive exceeds limits ({} bytes / {} files)", limits.max_total_bytes, limits.max_files));
                 }
                 let mut data = vec![0u8; size as usize];
-                r.read_exact(&mut data).map_err(|_| "truncated file data".to_string())?;
-                let mode = if h["mode"].as_u64().unwrap_or(0o644) & 0o111 != 0 { 0o755 } else { 0o644 };
+                e.read_exact(&mut data).map_err(|_| "truncated file data".to_string())?;
                 out.push(Record::File { path, mode, data });
             }
-            Some("del") => {
-                if !valid_path(&path) {
-                    return Err(format!("unsafe path `{path}`"));
-                }
-                out.push(Record::Deleted { path });
-            }
-            other => return Err(format!("unknown record type {other:?}")),
         }
     }
+    Ok(out)
 }
 
+/// Strict parse of inputs (hostile entry types are errors).
 pub fn from_bytes(bytes: &[u8], limits: Limits) -> Result<Vec<Record>> {
-    read_records(&mut std::io::BufReader::new(bytes), limits)
+    read_records(bytes, limits, Mode::Strict)
+}
+
+/// Compares a (streamed) workspace tar against `base` without keeping unchanged files in memory:
+/// each file is hashed as it streams past and only changed files up to `limits` are retained.
+pub fn changes_from_tar<R: Read>(r: R, base: &BTreeMap<String, String>, limits: Limits) -> Result<Vec<Record>> {
+    let (mut out, mut total) = (Vec::new(), 0u64);
+    let mut seen = std::collections::BTreeSet::new();
+    let mut ar = tar::Archive::new(r);
+    for entry in ar.entries().map_err(|e| format!("not a tar archive: {e}"))? {
+        let mut e = entry.map_err(|e| format!("bad tar entry: {e}"))?;
+        let Item::File { path, mode, size } = classify(&e, Mode::Lenient)? else { continue };
+        if seen.len() >= 500_000 {
+            return Err("workspace has too many files".into());
+        }
+        let keep = size <= limits.max_total_bytes;
+        let (mut hasher, mut data, mut buf) = (Sha256::new(), Vec::new(), [0u8; 64 * 1024]);
+        loop {
+            let n = e.read(&mut buf).map_err(|e| format!("{path}: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            if keep {
+                data.extend_from_slice(&buf[..n]);
+            }
+        }
+        seen.insert(path.clone());
+        if base.get(&path).is_some_and(|h| *h == hex::encode(hasher.finalize())) {
+            continue;
+        }
+        if !keep {
+            return Err(format!("changed file `{path}` is larger than the artifact limit ({} bytes)", limits.max_total_bytes));
+        }
+        total = total.saturating_add(size);
+        if total > limits.max_total_bytes || out.len() >= limits.max_files {
+            return Err(format!("changes exceed the artifact limit ({} bytes)", limits.max_total_bytes));
+        }
+        out.push(Record::File { path, mode, data });
+    }
+    out.extend(base.keys().filter(|p| !seen.contains(*p)).map(|p| Record::Deleted { path: p.clone() }));
+    Ok(out)
+}
+
+/// Content hashes of parsed input records: the baseline `changes_from_tar` compares against.
+pub fn baseline_of(records: &[Record]) -> BTreeMap<String, String> {
+    records.iter().filter_map(|r| if let Record::File { path, data, .. } = r { Some((path.clone(), sha256_hex(data))) } else { None }).collect()
 }
 
 /// Regular files under `root` (symlinks and special files are ignored), keyed by relative path.

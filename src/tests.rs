@@ -993,19 +993,82 @@ mod io_artifacts {
         assert!(std::fs::metadata(dst.join("sub/run.sh")).unwrap().permissions().mode() & 0o111 != 0, "exec bit kept");
     }
 
+    /// A raw tar entry with an arbitrary name and type (bypasses the builder's path checks).
+    fn raw_entry(name: &str, ty: tar::EntryType, size: u64, link: Option<&str>, data: &[u8]) -> Vec<u8> {
+        let mut h = tar::Header::new_gnu();
+        h.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+        h.set_entry_type(ty);
+        h.set_size(size);
+        h.set_mode(0o644);
+        if let Some(l) = link {
+            h.set_link_name(l).unwrap();
+        }
+        h.set_cksum();
+        let mut v = h.as_bytes().to_vec();
+        v.extend_from_slice(data);
+        v.resize(v.len().div_ceil(512) * 512, 0);
+        v
+    }
+
+    fn tar_of(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut v: Vec<u8> = entries.concat();
+        v.extend(std::iter::repeat(0u8).take(1024));
+        v
+    }
+
     #[test]
     fn archive_rejects_hostile_input() {
+        use tar::EntryType as T;
         let lim = Limits::new(1000);
         for p in ["../x", "/abs", "a/../b", "a//b", "", "a/./b", "a\\b"] {
             assert!(!archive::valid_path(p), "{p:?}");
         }
-        assert!(archive::from_bytes(&bundle(&[file("../escape", "x")]), lim).is_err());
-        assert!(archive::from_bytes(b"{\"t\":\"file\",\"path\":\"a\",\"size\":5}\nabc", lim).is_err(), "truncated data");
-        assert!(archive::from_bytes(b"{\"t\":\"file\",\"path\":\"a\",\"size\":1}\nx", lim).is_err(), "missing end marker");
-        assert!(archive::from_bytes(b"{\"t\":\"symlink\",\"path\":\"a\"}\n{\"t\":\"end\"}\n", lim).is_err(), "unknown record type");
-        let huge = b"{\"t\":\"file\",\"path\":\"a\",\"size\":999999999999999}\n";
-        assert!(archive::from_bytes(huge, lim).is_err(), "size claim is checked before allocating");
-        assert!(archive::from_bytes(&bundle(&[file("a", &"x".repeat(600)), file("b", &"x".repeat(600))]), lim).is_err(), "total limit");
+        let reg = |name: &str| raw_entry(name, T::Regular, 1, None, b"x");
+        for bad in ["../escape", "/etc/passwd", "a/../../b", "x/../../../y"] {
+            assert!(archive::from_bytes(&tar_of(&[reg(bad)]), lim).is_err(), "path {bad:?}");
+        }
+        assert!(archive::from_bytes(&tar_of(&[reg("fine.txt")]), lim).is_ok());
+        assert!(archive::from_bytes(&tar_of(&[raw_entry("l", T::Symlink, 0, Some("/etc/passwd"), b"")]), lim).is_err(), "symlink");
+        assert!(archive::from_bytes(&tar_of(&[raw_entry("l", T::Link, 0, Some("fine.txt"), b"")]), lim).is_err(), "hardlink");
+        assert!(archive::from_bytes(&tar_of(&[raw_entry("d", T::Char, 0, None, b"")]), lim).is_err(), "device");
+        assert!(archive::from_bytes(&tar_of(&[raw_entry("p", T::Fifo, 0, None, b"")]), lim).is_err(), "fifo");
+        assert!(archive::from_bytes(&tar_of(&[raw_entry(".wh..wh..opq", T::Regular, 0, None, b"")]), lim).is_err(), "opaque whiteout");
+        assert!(archive::from_bytes(&tar_of(&[raw_entry("a/.wh.b", T::Regular, 1, None, b"x")]), lim).is_err(), "whiteout with content");
+        assert!(archive::from_bytes(&tar_of(&[raw_entry("../.wh.x", T::Regular, 0, None, b"")]), lim).is_err(), "whiteout path traversal");
+        // truncated data, and a size claim far beyond the limit (checked before allocating)
+        let mut cut = raw_entry("a", T::Regular, 5, None, b"abc");
+        cut.truncate(512 + 3);
+        assert!(archive::from_bytes(&cut, lim).is_err(), "truncated");
+        assert!(archive::from_bytes(&tar_of(&[raw_entry("big", T::Regular, 1 << 33, None, b"")]), lim).is_err(), "size lie");
+        assert!(archive::from_bytes(&tar_of(&[reg("a"), raw_entry("b", T::Regular, 999, None, &[0u8; 999]), raw_entry("c", T::Regular, 999, None, &[0u8; 999])]), lim).is_err(), "total limit");
+        assert!(archive::from_bytes(b"this is not a tar archive at all", lim).is_err(), "garbage");
+        // Lenient mode (workspace dumps) skips special entries instead of failing.
+        let dump = tar_of(&[raw_entry("l", T::Symlink, 0, Some("/etc/passwd"), b""), reg("kept.txt")]);
+        let kept = archive::read_records(&dump[..], lim, archive::Mode::Lenient).unwrap();
+        assert_eq!(kept, vec![file("kept.txt", "x")]);
+    }
+
+    #[test]
+    fn whiteouts_roundtrip_and_interoperate_with_system_tar() {
+        let f = fixture("tar-interop");
+        let recs = vec![file("top.txt", "T"), file("dir/inner.txt", "I"), Record::Deleted { path: "gone.txt".into() }, Record::Deleted { path: "dir/old.txt".into() }];
+        let bytes = bundle(&recs);
+        assert_eq!(archive::from_bytes(&bytes, Limits::new(1000)).unwrap(), recs);
+        // our tar is a real tar: the system tool lists it, with OCI-style whiteout names
+        let path = f.dir.join("out.tar");
+        std::fs::write(&path, &bytes).unwrap();
+        let ls = std::process::Command::new("tar").args(["-tf"]).arg(&path).output().unwrap();
+        let names: Vec<String> = String::from_utf8_lossy(&ls.stdout).lines().map(String::from).collect();
+        assert_eq!(names, ["top.txt", "dir/inner.txt", ".wh.gone.txt", "dir/.wh.old.txt"], "{names:?}");
+        // and a tar made by the system tool (with ./ prefixes and directory entries) is accepted
+        let src = f.dir.join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), "A").unwrap();
+        std::fs::write(src.join("sub/b.txt"), "B").unwrap();
+        let made = std::process::Command::new("tar").args(["-c", "-C"]).arg(&src).arg(".").output().unwrap().stdout;
+        let mut got = archive::from_bytes(&made, Limits::new(1000)).unwrap();
+        got.sort_by_key(path_of);
+        assert_eq!(got, vec![file("a.txt", "A"), file("sub/b.txt", "B")]);
     }
 
     #[test]

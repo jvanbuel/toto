@@ -3,6 +3,7 @@
 use crate::manifest::{SandboxProfile, TaskManifest};
 use crate::{Error, Result};
 use std::path::PathBuf;
+use std::io::Read as _;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -138,11 +139,13 @@ pub struct DockerSandbox {
     /// Static `togra-mcp-exec` binary to mount read-only at `BRIDGE_PATH`: the only host path a
     /// task container can see.
     pub bridge: Option<PathBuf>,
+    /// Content baselines of unpacked inputs, by task id (kept on the host, never in the container).
+    baselines: std::sync::Mutex<std::collections::HashMap<String, std::collections::BTreeMap<String, String>>>,
 }
 
 impl DockerSandbox {
     pub fn new(image: impl Into<String>) -> Self {
-        Self { bin: "docker".into(), image: image.into(), runtime: None, workspace_mb: 512, bridge: None }
+        Self { bin: "docker".into(), image: image.into(), runtime: None, workspace_mb: 512, bridge: None, baselines: Default::default() }
     }
 
     pub fn container_name(task_id: &str) -> String {
@@ -206,40 +209,71 @@ impl Sandbox for DockerSandbox {
         Ok(Workspace { task_id: task.id.clone(), path: PathBuf::new(), exec_prefix, bridge: self.bridge.is_some() })
     }
 
-    fn put_inputs(&self, ws: &Workspace, bundle: &[u8], _max_bytes: u64) -> Result<()> {
-        let mut argv = ws.bridge_argv().ok_or_else(|| Error::Sandbox("inputs need the exec bridge in a container sandbox".into()))?;
-        argv.push("unpack".into());
-        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let out = exec_io(&Workspace { exec_prefix: vec![], ..clone_ws(ws) }, &refs, Some(bundle), Duration::from_secs(300), 64 * 1024)?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(Error::Sandbox(format!("unpacking inputs failed: {}", String::from_utf8_lossy(&out.stderr).trim())))
+    fn put_inputs(&self, ws: &Workspace, bundle: &[u8], max_bytes: u64) -> Result<()> {
+        // Validate on the host first, so the tar the container extracts holds only regular files
+        // and directories at safe relative paths.
+        let records = crate::archive::from_bytes(bundle, crate::archive::Limits::new(max_bytes)).map_err(Error::Sandbox)?;
+        let out = exec_io(ws, &["tar", "-x", "-f", "-", "-C", "/workspace"], Some(bundle), Duration::from_secs(300), 64 * 1024)?;
+        if !out.status.success() {
+            return Err(Error::Sandbox(format!("unpacking inputs failed (the image must provide `tar`): {}", String::from_utf8_lossy(&out.stderr).trim())));
         }
+        self.baselines.lock().unwrap().insert(ws.task_id.clone(), crate::archive::baseline_of(&records));
+        Ok(())
     }
 
     fn collect_outputs(&self, ws: &Workspace, max_bytes: u64) -> Result<Vec<u8>> {
-        let mut argv = ws.bridge_argv().ok_or_else(|| Error::Sandbox("outputs need the exec bridge in a container sandbox".into()))?;
-        argv.extend(["collect".into(), max_bytes.to_string()]);
-        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let cap = (max_bytes as usize).saturating_mul(2).saturating_add(64 * 1024);
-        let out = exec_io(&Workspace { exec_prefix: vec![], ..clone_ws(ws) }, &refs, None, Duration::from_secs(300), cap)?;
-        if out.status.success() {
-            Ok(out.stdout)
-        } else {
-            Err(Error::Sandbox(format!("collecting outputs failed: {}", String::from_utf8_lossy(&out.stderr).trim())))
+        use std::sync::{Arc, Mutex};
+        let base = self.baselines.lock().unwrap().get(&ws.task_id).cloned().unwrap_or_default();
+        let (prog, rest) = ws.exec_prefix.split_first().ok_or_else(|| Error::Sandbox("not a container workspace".into()))?;
+        let mut child = Command::new(prog)
+            .args(rest)
+            .args(["tar", "-c", "-f", "-", "-C", "/workspace", "."])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let (stdout, mut stderr) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+        let err = std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = std::io::Read::take(&mut stderr, 1 << 16).read_to_string(&mut s);
+            s
+        });
+        // Watchdog: a hung `tar` must not stall the runner.
+        let child = Arc::new(Mutex::new(child));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (wc, wd) = (child.clone(), done.clone());
+        let watchdog = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(300);
+            while !wd.load(std::sync::atomic::Ordering::Relaxed) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if !wd.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = wc.lock().unwrap().kill();
+            }
+        });
+        let limits = crate::archive::Limits::new(max_bytes);
+        let parsed = crate::archive::changes_from_tar(stdout, &base, limits);
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = watchdog.join();
+        let mut child = child.lock().unwrap();
+        if parsed.is_err() {
+            let _ = child.kill();
         }
+        let status = child.wait()?;
+        let stderr = err.join().unwrap_or_default();
+        let changes = parsed.map_err(|e| Error::Sandbox(format!("collecting outputs failed: {e}")))?;
+        if !status.success() {
+            return Err(Error::Sandbox(format!("collecting outputs failed (the image must provide `tar`): {}", stderr.trim())));
+        }
+        crate::archive::to_bytes(&changes).map_err(Error::Sandbox)
     }
 
     fn destroy(&self, ws: Workspace) -> Result<()> {
+        self.baselines.lock().unwrap().remove(&ws.task_id);
         // `--rm` removes it once stopped; `-t 0` kills immediately. Ignore "already gone".
         let _ = self.docker(&["stop".into(), "-t".into(), "0".into(), Self::container_name(&ws.task_id)]);
         Ok(())
     }
-}
-
-fn clone_ws(ws: &Workspace) -> Workspace {
-    Workspace { task_id: ws.task_id.clone(), path: ws.path.clone(), exec_prefix: ws.exec_prefix.clone(), bridge: ws.bridge }
 }
 
 /// Runs `argv` inside the sandbox (prefixed by `ws.exec_prefix`) and kills it at `timeout`.
