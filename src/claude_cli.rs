@@ -14,7 +14,8 @@
 //! subscription login.
 
 use crate::harness::Harness;
-use crate::manifest::{TaskContext, TaskManifest};
+use crate::context::{McpEntry, ProjectContext};
+use crate::manifest::TaskManifest;
 use crate::meter::UsageMeter;
 use crate::sandbox::Workspace;
 use crate::{Error, Result};
@@ -70,30 +71,50 @@ pub fn save_token(path: &Path, token: &str) -> Result<()> {
     Ok(())
 }
 
-/// MCP config for `--mcp-config`: the runner's bridge plus any project URL servers.
-pub fn mcp_config(ctx: &TaskContext, bridge: &[String]) -> Value {
+/// MCP config for `--mcp-config`, built from the project's `.mcp.json`:
+/// - remote servers pass through (the host connects; policy has already checked the host);
+/// - command servers are run **inside the sandbox container** as `docker exec -i [-e K=V] <name> cmd args`,
+///   never on the host;
+/// - the runner's own bridge is inserted last so a project can never replace it.
+pub fn mcp_config(ctx: &ProjectContext, exec_prefix: &[String], bridge: &[String]) -> Value {
     let mut servers = serde_json::Map::new();
-    for m in &ctx.mcp_servers {
-        let kind = if m.url.split(['?', '#']).next().unwrap_or("").ends_with("/sse") { "sse" } else { "http" };
-        servers.insert(m.name.clone(), json!({"type": kind, "url": m.url}));
+    for m in &ctx.mcp {
+        match m {
+            McpEntry::Remote { name, sse, url } => {
+                servers.insert(name.clone(), json!({"type": if *sse { "sse" } else { "http" }, "url": url}));
+            }
+            McpEntry::Stdio { name, command, args, env } => {
+                let (container, head) = exec_prefix.split_last().expect("a container sandbox has an exec prefix");
+                let mut argv: Vec<String> = head.to_vec();
+                for (k, v) in env {
+                    argv.extend(["-e".into(), format!("{k}={v}")]);
+                }
+                argv.push(container.clone());
+                argv.push(command.clone());
+                argv.extend(args.iter().cloned());
+                servers.insert(name.clone(), json!({"command": argv[0], "args": &argv[1..]}));
+            }
+        }
     }
-    // Inserted last so a project server can never replace the runner's own bridge.
     servers.insert(crate::manifest::BRIDGE_SERVER_NAME.into(), json!({"command": bridge[0], "args": &bridge[1..]}));
     json!({"mcpServers": servers})
 }
 
-/// Writes the task's skills under `dir/.claude/skills`, the only place the CLI will look.
-pub fn write_skills(dir: &Path, ctx: &TaskContext) -> Result<()> {
+/// Writes the project's skills and instruction files where the CLI looks for them. Skills go
+/// under `.claude/skills`; `AGENTS.md` is made visible to Claude Code through a `CLAUDE.md` import.
+pub fn write_context(dir: &Path, ctx: &ProjectContext) -> Result<()> {
     for sk in &ctx.skills {
-        let sd = dir.join(".claude/skills").join(&sk.name);
-        std::fs::create_dir_all(&sd)?;
-        let front = format!("---\nname: {}\ndescription: {}\n---\n", sk.name, serde_json::to_string(&sk.description)?);
-        std::fs::write(sd.join("SKILL.md"), format!("{front}{}", sk.content))?;
-        for (path, text) in &sk.files {
-            let target = sd.join(path);
+        for (path, data) in &sk.files {
+            let target = dir.join(".claude/skills").join(&sk.name).join(path);
             std::fs::create_dir_all(target.parent().unwrap())?;
-            std::fs::write(target, text)?;
+            std::fs::write(target, data)?;
         }
+    }
+    for (name, text) in &ctx.instructions {
+        std::fs::write(dir.join(name), text)?;
+    }
+    if ctx.instructions.contains_key("AGENTS.md") && !ctx.instructions.contains_key("CLAUDE.md") {
+        std::fs::write(dir.join("CLAUDE.md"), "@AGENTS.md\n")?;
     }
     Ok(())
 }
@@ -131,22 +152,24 @@ impl Harness for ClaudeCliHarness {
         true
     }
 
-    fn run(&self, task: &TaskManifest, ws: &Workspace, meter: &mut UsageMeter) -> Result<String> {
+    fn run(&self, task: &TaskManifest, ctx: &ProjectContext, ws: &Workspace, meter: &mut UsageMeter) -> Result<String> {
         let bridge = ws.bridge_argv().ok_or_else(|| Error::Harness("the claude harness needs a container sandbox with the exec bridge".into()))?;
-        task.context.validate()?;
         let token = self.read_token()?;
 
         let run_dir = self.runs_dir.join(crate::sandbox::DockerSandbox::container_name(&task.id));
         std::fs::create_dir_all(&run_dir)?;
         let _cleanup = RemoveOnDrop(run_dir.clone());
-        write_skills(&run_dir, &task.context)?;
-        let mcp_path = run_dir.join("mcp.json");
-        std::fs::write(&mcp_path, serde_json::to_vec(&mcp_config(&task.context, &bridge))?)?;
-        let allowed: Vec<String> = task.context.mcp_servers.iter().map(|m| format!("mcp__{}", m.name)).chain([format!("mcp__{}", crate::manifest::BRIDGE_SERVER_NAME)]).collect();
+        write_context(&run_dir, ctx)?;
+        // The raw project `.mcp.json` is never written: only the translated config is passed.
+        let mcp_path = run_dir.join("togra-mcp.json");
+        std::fs::write(&mcp_path, serde_json::to_vec(&mcp_config(ctx, &ws.exec_prefix, &bridge))?)?;
+        // Built-in tools stay off, except `Skill` (loads instructions, runs nothing) when the project ships skills.
+        let skill_tool = !ctx.skills.is_empty();
+        let allowed: Vec<String> = ctx.mcp.iter().map(|m| format!("mcp__{}", m.name())).chain([format!("mcp__{}", crate::manifest::BRIDGE_SERVER_NAME)]).chain(skill_tool.then(|| "Skill".to_string())).collect();
 
         let mut cmd = Command::new(&self.bin);
         cmd.args(["-p", "--output-format", "stream-json", "--verbose", "--no-session-persistence"])
-            .args(["--tools", ""])
+            .args(["--tools", if skill_tool { "Skill" } else { "" }])
             .args(["--strict-mcp-config", "--mcp-config"]).arg(&mcp_path)
             .args(["--setting-sources", "project", "--permission-mode", "dontAsk", "--permission-prompts", "none"])
             .arg(format!("--allowedTools={}", allowed.join(",")))
@@ -199,7 +222,7 @@ impl Harness for ClaudeCliHarness {
                     match (ev["type"].as_str(), ev["subtype"].as_str()) {
                         (Some("system"), Some("init")) => {
                             // Defence in depth: only our MCP tools may exist, and every MCP server must have loaded.
-                            let builtin = ev["tools"].as_array().into_iter().flatten().filter_map(Value::as_str).find(|t| !t.starts_with("mcp__"));
+                            let builtin = ev["tools"].as_array().into_iter().flatten().filter_map(Value::as_str).find(|t| !t.starts_with("mcp__") && !(skill_tool && *t == "Skill"));
                             if let Some(t) = builtin {
                                 return Err(abort(&mut child, Error::Harness(format!("built-in tool `{t}` is enabled; refusing to run"))));
                             }

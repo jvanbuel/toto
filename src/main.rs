@@ -46,6 +46,10 @@ enum Cmd {
         /// Directory to pack as the task's input bundle (sets `inputs` to its hash).
         #[arg(long)]
         bundle: Option<PathBuf>,
+        /// Directory laid out like a project root with `.mcp.json`, `.claude/skills/` and/or
+        /// `AGENTS.md`; packed as the task's context (anything else in it is rejected).
+        #[arg(long)]
+        context: Option<PathBuf>,
         task: PathBuf,
     },
     /// Write a result's artifacts (changed files) into a new directory and list deletions.
@@ -150,7 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Cmd::PostTask { key, config, bundle, task } => {
+        Cmd::PostTask { key, config, bundle, context, task } => {
             let cfg = togra::config::Config::load(&config_path(config))?;
             let seed: [u8; 32] = hex::decode(fs::read_to_string(&key)?.trim()).ok().and_then(|b| b.try_into().ok()).ok_or("project key must be a 32-byte hex seed")?;
             let mut manifest: TaskManifest = serde_json::from_slice(&fs::read(&task)?)?;
@@ -159,6 +163,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let records = togra::archive::pack_dir(&dir, togra::archive::Limits::new(cfg.policy.max_input_bytes))?;
                 manifest.inputs = queue.post_bundle(&togra::archive::to_bytes(&records)?)?;
                 println!("bundled {} files from {} as {}", records.len(), dir.display(), manifest.inputs);
+            }
+            if let Some(dir) = context {
+                let limits = togra::archive::Limits::new(cfg.policy.max_context_bytes.max(1 << 20));
+                let bytes = togra::archive::to_bytes(&togra::archive::pack_dir(&dir, limits)?)?;
+                let ctx = togra::context::ProjectContext::parse(&bytes, limits)?; // same checks the runner applies
+                manifest.context = Some(queue.post_bundle(&bytes)?);
+                println!("context from {}: {}", dir.display(), ctx.summary());
             }
             let signed = manifest.sign(&ed25519_dalek::SigningKey::from_bytes(&seed))?;
             queue.post(&signed)?;
@@ -225,7 +236,8 @@ fn demo() -> Result<(), Box<dyn std::error::Error>> {
         max_profile: SandboxProfile::default(),
         abort_margin_pct: 25,
         available_tools: vec!["echo".into()],
-        allow_skills: false,
+        allow_context: false,
+                allow_stdio_mcp: false,
         allowed_mcp_hosts: vec![],
         max_context_bytes: 64 * 1024,
                 max_input_bytes: 64 * 1024 * 1024,

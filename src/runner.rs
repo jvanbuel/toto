@@ -83,7 +83,7 @@ impl<Q: QueueClient, H: Harness, S: Sandbox, R: Reviewer> Runner<Q, H, S, R> {
             }
             let verdict = self.trusted.verify(&env).and_then(|m| {
                 self.policy.admit(&m, used_today, now)?;
-                if !m.context.is_empty() && !self.harness.supports_context() {
+                if m.context.is_some() && !self.harness.supports_context() {
                     return Err(Error::Policy("harness cannot deliver skills or MCP servers".into()));
                 }
                 Ok(m)
@@ -147,12 +147,37 @@ impl<Q: QueueClient, H: Harness, S: Sandbox, R: Reviewer> Runner<Q, H, S, R> {
         Ok(any.then_some(bytes))
     }
 
+    /// Fetches, verifies and parses the task's context bundle, then applies contributor policy.
+    /// Returns an empty context when the task has none.
+    fn prepare_context(&self, task: &TaskManifest) -> Result<crate::context::ProjectContext> {
+        let Some(hash) = &task.context else { return Ok(Default::default()) };
+        if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(Error::Verify("context must be a 64-character hex SHA-256".into()));
+        }
+        let bundle = self.queue.bundle(hash)?.ok_or_else(|| Error::Queue("context bundle not available".into()))?;
+        if crate::archive::sha256_hex(&bundle) != *hash {
+            return Err(Error::Verify("context bundle does not match the signed hash".into()));
+        }
+        let ctx = crate::context::ProjectContext::parse(&bundle, crate::archive::Limits::new(self.policy.max_context_bytes))?;
+        self.policy.admit_context(&ctx)?;
+        Ok(ctx)
+    }
+
     fn run_claimed(&mut self, task: TaskManifest, id: &str, now: DateTime<Local>) -> Result<Tick> {
         let id = id.to_string();
+        let ctx = match self.prepare_context(&task) {
+            Ok(c) => c,
+            Err(e) => {
+                let outcome = if matches!(e, Error::Policy(_)) { "rejected" } else { "failed" };
+                self.log(&task, outcome, &e, 0, now)?;
+                self.queue.release(&task.id, &id)?;
+                return Ok(Tick::Dropped(task.id));
+            }
+        };
         // 4-7. Sandboxed run under the usage meter, then package.
         let mut meter = UsageMeter::new(task.cost_estimate, self.policy.abort_margin_pct);
         let ws = self.sandbox.create(&task, &task.sandbox_profile)?;
-        let run = self.prepare_inputs(&task, &ws).and_then(|_| self.harness.run(&task, &ws, &mut meter));
+        let run = self.prepare_inputs(&task, &ws).and_then(|_| self.harness.run(&task, &ctx, &ws, &mut meter));
         let artifacts = if run.is_ok() { self.collect_artifacts(&task, &ws) } else { Ok(None) };
         self.sandbox.destroy(ws)?;
         let packaged = run.and_then(|out| SignedResult::package(&task.id, out, meter.used(), &task.output_schema, &self.key, artifacts?));
@@ -176,7 +201,7 @@ impl<Q: QueueClient, H: Harness, S: Sandbox, R: Reviewer> Runner<Q, H, S, R> {
         // 9. Submit and record.
         self.queue.submit(&result)?;
         let hash = result.open()?.output_hash;
-        let detail = if task.context.is_empty() { hash } else { format!("{hash} {}", task.context.summary()) };
+        let detail = if ctx.is_empty() { hash } else { format!("{hash} {}", ctx.summary()) };
         self.log(&task, "submitted", detail, meter.used(), now)?;
         Ok(Tick::Submitted(task.id))
     }

@@ -66,6 +66,18 @@ togra run --once
 togra extract-result ~/.config/togra/queue/results/live-2.*.json ./fixed   # ./fixed/calc.py is the fixed file
 ```
 
+## Optional: project context (skills, MCP servers)
+
+```
+mkdir -p /tmp/ctx/.claude/skills/greeter
+printf -- '---\nname: greeter\ndescription: How to greet people in this project\n---\nAlways greet with "Ahoy" and nothing else.\n' > /tmp/ctx/.claude/skills/greeter/SKILL.md
+echo 'Answer in one short sentence.' > /tmp/ctx/AGENTS.md
+# policy: "allow_context": true   then edit hello-task.json: id "live-3", prompt "Use the greeter skill to greet me"
+togra post-task --key ./pilot.key --context /tmp/ctx docs/examples/hello-task.json && togra run --once
+```
+
+This also checks the one thing unit tests cannot: that Claude Code lists the `Skill` tool alongside our MCP tools under `--tools "Skill"` and uses the skill (the answer should contain "Ahoy"). If the harness aborts with ``built-in tool `Skill` ...`` or the skill is ignored, send back the message.
+
 ## What to look for
 
 Success: `Submitted("live-1")`; `togra extract-result ~/.config/togra/queue/results/live-1.*.json ./out` lists `file    hello.txt (...)` and `out/hello.txt` contains the line (the task's changed files come back as signed artifacts); the audit line shows `submitted` and a plausible `tokens=` figure; the result in `~/.config/togra/queue/results/` has an `output` that reports `hello from the sandbox`, `65534` for `id -u`, and an error or empty listing for `ls /home`.
@@ -73,7 +85,7 @@ Success: `Submitted("live-1")`; `togra extract-result ~/.config/togra/queue/resu
 Things this run is meant to settle (note what you see):
 
 1. **Does `setup-token` work, and is `CLAUDE_CODE_OAUTH_TOKEN` accepted?** Failure shows as `authentication_failed` in the error, or a `claude exited ... no result` message.
-2. **Does the CLI honour `--tools ""` and `--strict-mcp-config`?** The harness aborts with `built-in tool ... is enabled` or `sandbox bridge did not connect` if not. Either message is a useful result, not a crash.
+2. **Does the CLI honour `--tools ""` (or `"Skill"`) and `--strict-mcp-config`?** The harness aborts with `built-in tool ... is enabled` or `sandbox bridge did not connect` if not. Either message is a useful result, not a crash.
 3. **Is the usage figure right?** Compare `tokens=` in the audit line with the usage shown by your account (`/usage` in an interactive `claude` session).
 4. **Did anything touch your personal Claude profile?** Your own `~/.claude` should be unchanged (no new sessions, no memory); the harness uses `~/.config/togra/state/claude-home`.
 5. **Limits.** If you hit the subscription limit, what exactly did the CLI print? That is the missing signal for "donate only unused capacity".

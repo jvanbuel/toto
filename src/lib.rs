@@ -8,6 +8,7 @@ pub mod archive;
 pub mod audit;
 pub mod claude_cli;
 pub mod config;
+pub mod context;
 pub mod daemon;
 pub mod dsse;
 pub mod harness;

@@ -44,18 +44,22 @@ Until the HTTP coordinator exists, the queue is a spool directory (`queue_dir`: 
 
 `{"harness":{"kind":"omnigent"}}` runs tasks through a local [Omnigent](https://github.com/omnigent-ai/omnigent) install (`pip install omnigent`, Python 3.12+, version pinned to 0.16.x). The daemon generates an agent with `allow_network: false`, which makes Omnigent keep the AI login with the unwrapped CLI and run all file and shell access in its own sandbox helpers (see ADR 5). It needs sandbox `dir` or `bwrap`, because Omnigent, not the `togra` sandbox, isolates the task. Token usage is read from the Omnigent server per session and enforced by the usage meter, which kills the run on overrun. Only tested with a stub CLI and a mock server so far: a real-login run is still to do.
 
-## Skills and MCP servers from projects
+## Project context: skills, MCP servers, instructions
 
-A signed task manifest may carry a `context` (see ADR 9):
+A task's `context` is the SHA-256 of a tar laid out like a project root, using formats agents already know (ADR 9):
 
-```json
-"context": {
-  "skills": [{"name": "triage", "description": "How to triage issues", "content": "# Steps\n...", "files": {"ref/labels.md": "..."}}],
-  "mcp_servers": [{"name": "tracker", "url": "https://mcp.example.org/sse"}]
-}
+```
+.mcp.json                       # {"mcpServers": {"tracker": {"command": "node", "args": ["srv.js"]}, "docs": {"type": "http", "url": "https://mcp.example.org/mcp"}}}
+.claude/skills/triage/SKILL.md  # Agent Skills: frontmatter name (= directory) + description, then instructions
+.claude/skills/triage/ref/...   # optional files
+AGENTS.md                       # optional agent instructions
 ```
 
-Contributors opt in per kind of context, deny by default, in the policy: `"allow_skills": true`, `"allowed_mcp_hosts": ["mcp.example.org"]`, `"max_context_bytes": 65536`. MCP servers are remote `https` URLs only: no commands, headers or environment, so a project cannot run code on the runner or request a contributor's keys. Only the Omnigent harness delivers context; other harnesses refuse such tasks. The audit log records the skill names and MCP hosts each task used.
+```
+togra post-task --key pilot.key --context ./project-agent-files task.json
+```
+
+Only those paths are accepted. Everything else, notably `.claude/settings.json`, hooks, commands and agents, is refused, because Claude Code would run them on the contributor's host. In `.mcp.json`, command servers run **inside the task container**; remote servers must be https; headers, OAuth fields and `$` are refused. Contributors opt in per kind, deny by default, in the policy: `"allow_context": true`, `"allow_stdio_mcp": true` (command servers), `"allowed_mcp_hosts": ["mcp.example.org"]` (remote servers), `"max_context_bytes": 65536`. Only the Claude harness runs command servers; the Omnigent harness refuses them. The audit log records the skill names and MCP hosts each task used.
 
 ## Claude subscription harness
 

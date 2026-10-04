@@ -1,5 +1,6 @@
 //! Harness seam (ADR 4): Omnigent is the primary implementation, behind this trait.
 
+use crate::context::ProjectContext;
 use crate::manifest::TaskManifest;
 use crate::meter::UsageMeter;
 use crate::sandbox::Workspace;
@@ -19,7 +20,7 @@ pub trait Harness: Send {
 
     /// Runs the task against the workspace, reporting every usage increment to `meter`
     /// and aborting with its error when a limit is hit. Returns the raw output.
-    fn run(&self, task: &TaskManifest, ws: &Workspace, meter: &mut UsageMeter) -> Result<String>;
+    fn run(&self, task: &TaskManifest, ctx: &ProjectContext, ws: &Workspace, meter: &mut UsageMeter) -> Result<String>;
 }
 
 impl<T: Harness + ?Sized> Harness for Box<T> {
@@ -29,8 +30,8 @@ impl<T: Harness + ?Sized> Harness for Box<T> {
     fn supports_context(&self) -> bool {
         (**self).supports_context()
     }
-    fn run(&self, task: &TaskManifest, ws: &Workspace, meter: &mut UsageMeter) -> Result<String> {
-        (**self).run(task, ws, meter)
+    fn run(&self, task: &TaskManifest, ctx: &ProjectContext, ws: &Workspace, meter: &mut UsageMeter) -> Result<String> {
+        (**self).run(task, ctx, ws, meter)
     }
 }
 
@@ -40,7 +41,7 @@ pub struct EchoHarness {
 }
 
 impl Harness for EchoHarness {
-    fn run(&self, task: &TaskManifest, _ws: &Workspace, meter: &mut UsageMeter) -> Result<String> {
+    fn run(&self, task: &TaskManifest, _ctx: &ProjectContext, _ws: &Workspace, meter: &mut UsageMeter) -> Result<String> {
         meter.record(self.tokens_per_run)?;
         Ok(format!("echo: {}", task.prompt))
     }

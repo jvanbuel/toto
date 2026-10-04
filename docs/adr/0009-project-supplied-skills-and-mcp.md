@@ -1,7 +1,25 @@
 # 9. Projects may supply skills and remote MCP servers, under contributor policy
 
-- Status: Proposed
+- Status: Revised 2026-10-04 (supersedes the first version below)
 - Date: 2026-10-04
+
+## Revision (2026-10-04): use the existing formats
+
+The first version below invented its own `context` structs in the manifest. They are replaced by the formats agents already use, shipped as a tar laid out like a repository root and referenced from the signed manifest by SHA-256 (like `inputs`):
+
+- `.mcp.json`: Claude Code's MCP server config. Entries are restricted to `command`/`args`/`env` (a command to run **inside the sandbox container**, started by the runner as `docker exec -i ...`, never on the host) or `type` + `url` (a remote https server). Headers, OAuth fields, unknown keys and any value containing `$` are refused: the CLI expands `${VAR}` from its own environment, which includes the subscription token. The name `sandbox` is reserved for the runner's bridge.
+- `.claude/skills/<name>/SKILL.md` and files: [Agent Skills](https://agentskills.io) (open standard). Frontmatter `name` must equal the directory.
+- `AGENTS.md` / `CLAUDE.md`: agent instructions (at most 32 KiB each).
+
+**Only exactly those paths are accepted; anything else rejects the whole bundle.** In particular `.claude/settings.json`, hooks, commands and agents are refused, because Claude Code runs hooks and similar configuration as commands on the host.
+
+Contributor policy is still deny by default: `allow_context`, `allow_stdio_mcp` (command servers), `allowed_mcp_hosts` (remote servers, since the host connects to them), `max_context_bytes`. The runner fetches the bundle after claiming the task, checks its hash against the signed manifest, parses it and applies policy before any agent runs. Stdio MCP servers are now supported (in the container), which the first version could not do.
+
+Limits to know: built-in tools are off, so a skill's bundled reference files are not readable by the agent unless the `Skill` tool exposes them (to verify in the live run); only the Claude harness runs command servers, and the Omnigent harness refuses them.
+
+---
+
+## First version (superseded)
 
 ## Context
 
