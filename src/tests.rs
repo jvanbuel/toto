@@ -1808,6 +1808,62 @@ mod claude_in_container {
 
     type Bodies = Arc<Mutex<Vec<(Vec<(String, String)>, String)>>>;
 
+    fn tool_use_named(id: &str, name: &str, input: &serde_json::Value) -> String {
+        let partial = serde_json::to_string(&input.to_string()).unwrap();
+        sse(&format!("event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"{id}\",\"name\":\"{name}\",\"input\":{{}}}}}}\n\nevent: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":{partial}}}}}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n"), "tool_use", 30)
+    }
+
+    /// A fake model that performs `script` (one tool call per step, advancing as tool results
+    /// come back) once it sees RUN-THE-TOOL, then answers DONE-FROM-FAKE-API.
+    fn fake_scripted(script: Vec<(&'static str, serde_json::Value)>) -> (String, Bodies) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let seen: Bodies = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                let (log, script) = (log.clone(), script.clone());
+                std::thread::spawn(move || {
+                    let mut r = BufReader::new(s.try_clone().unwrap());
+                    let mut first = String::new();
+                    if r.read_line(&mut first).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let mut headers = vec![("path".to_string(), first.split_whitespace().nth(1).unwrap_or("").to_string())];
+                    loop {
+                        let mut h = String::new();
+                        r.read_line(&mut h).unwrap();
+                        if h.trim().is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = h.split_once(':') {
+                            headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+                        }
+                    }
+                    let len: usize = headers.iter().find(|(k, _)| k == "content-length").and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
+                    let mut b = vec![0u8; len];
+                    r.read_exact(&mut b).unwrap();
+                    let body = String::from_utf8_lossy(&b).to_string();
+                    log.lock().unwrap().push((headers, body.clone()));
+                    let step = body.matches("\"type\":\"tool_result\"").count();
+                    let (ctype, payload) = if !body.contains("\"stream\":true") {
+                        ("application/json", r#"{"id":"msg_x","type":"message","role":"assistant","model":"claude-fake","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":2}}"#.to_string())
+                    } else if body.contains("RUN-THE-TOOL") && step < script.len() {
+                        let (name, input) = &script[step];
+                        ("text/event-stream", tool_use_named(&format!("toolu_{step}"), name, input))
+                    } else if body.contains("RUN-THE-TOOL") {
+                        ("text/event-stream", text("DONE-FROM-FAKE-API"))
+                    } else {
+                        ("text/event-stream", text("ok"))
+                    };
+                    let mut s = s;
+                    let _ = write!(s, "HTTP/1.1 200 OK\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}", payload.len());
+                });
+            }
+        });
+        (url, seen)
+    }
+
     /// A fake Messages API: asks for one Bash call when it sees the marker prompt, then finishes.
     fn fake_anthropic(command: &'static str) -> (String, Bodies) {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1920,6 +1976,79 @@ mod claude_in_container {
         let log = runner.audit.entries().unwrap();
         assert!(log[0].outcome == "submitted" && log[0].tokens > 50, "{log:?}");
         assert!(!bodies.iter().any(|(_, b)| b.contains("REAL-SECRET")), "the credential never appears in anything the agent sent");
+    }
+
+    /// Omnigent inside the container (preinstalled in the image, with the Claude CLI from the
+    /// `claude-agent-sdk` wheel), behind the credential proxy. Needs the image built from the
+    /// Dockerfile in the ADR 12 notes: `toto-omnigent-test`.
+    #[test]
+    fn omnigent_inside_the_container_works_behind_the_proxy() {
+        let bridge = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/toto-mcp-exec");
+        if !bridge.exists() || !docker_has("toto-omnigent-test") {
+            eprintln!("skipping: needs docker, the musl bridge and the toto-omnigent-test image");
+            return;
+        }
+        let f = fixture("omni-in-c");
+        let (url, seen) = fake_scripted(vec![
+            ("ToolSearch", serde_json::json!({"query": "select:mcp__omnigent__sys_os_shell", "max_results": 1})),
+            ("mcp__omnigent__sys_os_shell", serde_json::json!({"command": "echo hello-from-omnigent-tool > /workspace/x.txt; id -u; echo secret-check=${ANTHROPIC_AUTH_TOKEN:-unset}"})),
+        ]);
+        let dir = f.dir.join("sock");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let proxy = AuthProxy::start(&dir.join("p.sock"), &url, Auth::Bearer { token: "REAL-SECRET-TOKEN".into(), oauth: true }).unwrap();
+        let t = task("oic1", "a", 1, &f.key_a);
+        let mut sb = DockerSandbox::new("toto-omnigent-test");
+        sb.bridge = Some(bridge);
+        sb.proxy_socket = Some(proxy.socket().to_path_buf());
+        let ws = sb.create(&t, &t.sandbox_profile).unwrap();
+        let (name, head) = ws.exec_prefix.split_last().unwrap();
+        let mk = |envs: &[(&str, String)]| {
+            let mut prefix: Vec<String> = head.to_vec();
+            for (k, v) in envs {
+                prefix.extend(["-e".into(), format!("{k}={v}")]);
+            }
+            prefix.extend(["-w".into(), "/workspace".into(), name.clone()]);
+            Workspace { task_id: ws.task_id.clone(), path: ws.path.clone(), exec_prefix: prefix, bridge: true }
+        };
+        let envs = [("ANTHROPIC_BASE_URL", format!("http://{PROXY_ADDR}")), ("ANTHROPIC_AUTH_TOKEN", "not-a-credential".to_string()), ("HOME", "/tmp/home".to_string()), ("TERM", "dumb".to_string()), ("DISABLE_AUTOUPDATER", "1".to_string())];
+        let agent_ws = mk(&envs);
+        let cfg = r#"{"spec_version":1,"name":"toto-task","executor":{"type":"omnigent","config":{"harness":"claude-sdk"}},"prompt":"Complete the task.","skills":"none","os_env":{"type":"caller_process","cwd":".","sandbox":{"type":"none"}}}"#;
+        exec_io(&agent_ws, &["sh", "-c", "mkdir -p /tmp/agent && cat > /tmp/agent/config.yaml"], Some(cfg.as_bytes()), Duration::from_secs(10), 1024).unwrap();
+
+        let started = std::time::Instant::now();
+        let out = exec_io(&agent_ws, &["omnigent", "run", "/tmp/agent", "-p", "RUN-THE-TOOL please"], None, Duration::from_secs(150), 8 << 20).unwrap();
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout).to_string(), String::from_utf8_lossy(&out.stderr).to_string());
+        eprintln!("FACT omnigent run took {:?}; exit {:?}; stdout: {:?}", started.elapsed(), out.status.code(), stdout.chars().take(200).collect::<String>());
+        assert!(out.status.success() && stdout.contains("DONE-FROM-FAKE-API"), "omnigent run failed.\nstdout: {stdout}\nstderr tail: {}", stderr.lines().rev().take(8).collect::<Vec<_>>().join("\n"));
+
+        {
+            let all: Vec<serde_json::Value> = seen.lock().unwrap().iter().filter_map(|(_, b)| serde_json::from_str(b).ok()).collect();
+            let best = all.iter().max_by_key(|v| v["tools"].as_array().map_or(0, Vec::len)).cloned().unwrap_or_default();
+            let names: Vec<&str> = best["tools"].as_array().into_iter().flatten().filter_map(|t| t["name"].as_str()).collect();
+            eprintln!("FACT {} requests; tools offered to the model: {names:?}", all.len());
+            let deferred: Vec<String> = best["messages"].as_array().into_iter().flatten().filter_map(|m| m["content"].as_str()).flat_map(|c| c.lines().filter(|l| l.starts_with("mcp__omnigent__")).map(String::from).collect::<Vec<_>>()).collect();
+            eprintln!("FACT {} deferred omnigent tools: {}", deferred.len(), deferred.join(" "));
+        }
+        let check = exec_io(&mk(&[]), &["cat", "/workspace/x.txt"], None, Duration::from_secs(10), 1024).unwrap();
+        let first_result = seen.lock().unwrap().iter().map(|(_, b)| b.clone()).find(|b| b.contains("tool_result")).unwrap_or_default();
+        let at = first_result.find("tool_result").unwrap_or(0);
+        assert_eq!(String::from_utf8_lossy(&check.stdout), "hello-from-omnigent-tool\n", "the tool ran in the container. tool_result was: {}", first_result[at.saturating_sub(100)..(at + 700).min(first_result.len())].to_string());
+        let bodies = seen.lock().unwrap().clone();
+        // the last request carries the whole conversation, including the shell tool's output
+        let last = bodies.iter().map(|(_, b)| b.as_str()).filter(|b| b.contains("tool_result")).max_by_key(|b| b.matches("tool_result").count()).expect("tool results reached the model");
+        assert!(last.contains("65534") && last.contains("secret-check="), "the shell ran as nobody inside the container");
+        assert!(!last.contains("REAL-SECRET"));
+        let model_calls: Vec<_> = bodies.iter().filter(|(h, _)| h.iter().any(|(k, v)| k == "path" && v.starts_with("/v1/messages"))).collect();
+        assert!(!model_calls.is_empty());
+        for (h, _) in &model_calls {
+            let auth: Vec<&str> = h.iter().filter(|(k, _)| k == "authorization").map(|(_, v)| v.as_str()).collect();
+            assert_eq!(auth, ["Bearer REAL-SECRET-TOKEN"], "the proxy's credential, never the dummy: {h:?}");
+        }
+        assert!(proxy.tokens() > 50, "the proxy metered it: {}", proxy.tokens());
+        let hay = exec_io(&mk(&[]), &["sh", "-c", "env; cat /proc/mounts; find / -xdev -type f -newer /etc/hostname -size -256k 2>/dev/null | head -3000 | xargs grep -l REAL-SECRET 2>/dev/null; echo done"], None, Duration::from_secs(30), 1 << 20).unwrap();
+        assert!(!String::from_utf8_lossy(&hay.stdout).contains("REAL-SECRET"));
+        sb.destroy(ws).unwrap();
     }
 
     #[test]

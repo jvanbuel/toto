@@ -36,3 +36,15 @@ Offer a second placement, `placement: container`:
 - Any process inside the container can use the proxy while the task runs, including a project's own MCP servers, so a malicious tool could spend the contributor's quota. The per-task usage cap applies (the harness kills the run when the proxy's count exceeds the cap, and the container is destroyed afterwards), but within the cap the spend is real.
 - WebFetch/WebSearch and other built-ins are not enabled; the container has no network anyway.
 - Project images need `tar` (inputs) and a glibc userland (the agent binary); in return the project gets its environment with native tools and no custom bridge.
+
+## Variant tested: Omnigent preinstalled in the project image (2026-10-04)
+
+The agent loop can also be Omnigent, installed in the image together with the project's tools and MCP servers (`docs/examples/omnigent-image/Dockerfile`: `python:3.12-slim` + `omnigent` + `claude-agent-sdk`, which bundles the Claude Code binary). Run as `docker exec ... omnigent run <agent> -p <prompt>` in the same hardened container behind the same proxy, with `os_env.sandbox.type: none` (the container is the sandbox).
+
+Measured with the fake API (no real credential):
+
+- Omnigent's server, runner and harness start and run under the full hardening (read-only root, all capabilities dropped, unprivileged user, no network, loopback only); the Claude CLI reached the proxy through the relay and finished the conversation. Omnigent's `sys_os_shell` tool ran a command as an unprivileged user inside the container; every model call carried the proxy's credential; the credential was not in the container; the proxy metered the traffic.
+- Costs: the image is 943 MB; a cold `omnigent run` took about 19 s per task (the bare CLI starts in about 1.5 s).
+- In this mode Omnigent disables the CLI's native tools and offers its own: 29 deferred tools including browser, policy, scheduling and agent-management tools, discovered through `ToolSearch`. The container is still the boundary, but the surface is far larger than a task needs. `tools.builtins` in the agent spec does not narrow it (it adds to the defaults); narrowing would need an Omnigent policy.
+- The CLI inside the image is whatever the image bundles, not the contributor's own official install. For subscription use that weakens the "official client" assurance behind ADR 11's terms position.
+- Each provider still needs its own proxy rules (allowed endpoints, auth injection, usage parser). Anthropic's are done; Codex's API-key mode looks the same (`POST /v1/responses`, bearer key, base URL overridable) and its ChatGPT mode has a configurable `chatgpt_base_url` and an account-id header, both untested.
