@@ -6,12 +6,20 @@ use crate::sandbox::Workspace;
 use crate::Result;
 
 pub trait Harness: Send {
+    /// Checks at daemon start that the harness is installed and usable.
+    fn probe(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Runs the task against the workspace, reporting every usage increment to `meter`
     /// and aborting with its error when a limit is hit. Returns the raw output.
     fn run(&self, task: &TaskManifest, ws: &Workspace, meter: &mut UsageMeter) -> Result<String>;
 }
 
 impl<T: Harness + ?Sized> Harness for Box<T> {
+    fn probe(&self) -> Result<()> {
+        (**self).probe()
+    }
     fn run(&self, task: &TaskManifest, ws: &Workspace, meter: &mut UsageMeter) -> Result<String> {
         (**self).run(task, ws, meter)
     }
@@ -29,5 +37,4 @@ impl Harness for EchoHarness {
     }
 }
 
-// TODO(milestone 1): `OmnigentHarness` — start/supervise `omnigent server --background` and
-// drive it over its local API, routing command execution into the sandbox (ADR 4, ADR 5).
+// The Omnigent implementation lives in `omnigent.rs`.

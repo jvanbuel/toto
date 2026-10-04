@@ -14,3 +14,4 @@ serde_json = "1.0.151"
 sha2 = "0.11.0"
 thiserror = "2.0.21"
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+ureq = { version = "3.4.2", default-features = false }

@@ -10,6 +10,7 @@ pub mod daemon;
 pub mod harness;
 pub mod manifest;
 pub mod meter;
+pub mod omnigent;
 pub mod policy;
 pub mod queue;
 pub mod result;

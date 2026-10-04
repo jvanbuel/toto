@@ -3,6 +3,7 @@
 use crate::audit::AuditLog;
 use crate::harness::{EchoHarness, Harness};
 use crate::manifest::{generate_key, TrustedProjects};
+use crate::omnigent::OmnigentHarness;
 use crate::policy::Policy;
 use crate::queue::{DirQueue, QueueClient};
 use crate::runner::{Reviewer, Runner};
@@ -40,6 +41,25 @@ fn docker_bin() -> String {
 pub enum HarnessConfig {
     /// Placeholder until the Omnigent harness lands.
     Echo { tokens_per_run: u64 },
+    /// Omnigent in no-network mode (see `omnigent.rs`); needs sandbox `dir` or `bwrap`.
+    Omnigent {
+        #[serde(default = "omnigent_bin")]
+        bin: String,
+        #[serde(default = "omnigent_url")]
+        server_url: String,
+        #[serde(default = "omnigent_harness")]
+        harness: String,
+    },
+}
+
+fn omnigent_bin() -> String {
+    "omnigent".into()
+}
+fn omnigent_url() -> String {
+    "http://127.0.0.1:6767".into()
+}
+fn omnigent_harness() -> String {
+    "claude-sdk".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,14 +166,26 @@ impl Config {
             let bytes: [u8; 32] = hex::decode(k).ok().and_then(|b| b.try_into().ok()).ok_or_else(|| Error::Verify(format!("bad key for project `{id}`")))?;
             trusted.insert(id, VerifyingKey::from_bytes(&bytes).map_err(|_| Error::Verify(format!("bad key for project `{id}`")))?);
         }
-        let HarnessConfig::Echo { tokens_per_run } = self.harness;
+        let harness: Box<dyn Harness> = match &self.harness {
+            HarnessConfig::Echo { tokens_per_run } => Box::new(EchoHarness { tokens_per_run: *tokens_per_run }),
+            HarnessConfig::Omnigent { bin, server_url, harness } => {
+                if matches!(self.sandbox, SandboxConfig::Docker { .. }) {
+                    return Err(Error::Policy("the omnigent harness isolates tasks with Omnigent's own sandbox and needs a host workspace; use sandbox `dir` or `bwrap`".into()));
+                }
+                let mut h = OmnigentHarness::new(&self.state_dir)?;
+                h.bin = bin.clone();
+                h.server_url = server_url.clone();
+                h.harness = harness.clone();
+                Box::new(h)
+            }
+        };
         let queue: Arc<dyn QueueClient> = Arc::new(DirQueue::new(&self.queue_dir)?);
         Ok(Runner::new(
             self.policy.clone(),
             trusted,
             self.load_or_create_key()?,
             queue,
-            Box::new(EchoHarness { tokens_per_run }),
+            harness,
             self.build_sandbox(),
             Box::new(NoReview),
             AuditLog::new(self.state_dir.join("audit.jsonl")),

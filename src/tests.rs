@@ -360,3 +360,113 @@ mod daemon {
         let _ = (generate_key(), DirSandbox { root: f.dir.clone() });
     }
 }
+
+mod omnigent_harness {
+    use super::{fixture, task};
+    use crate::harness::Harness;
+    use crate::meter::UsageMeter;
+    use crate::omnigent::{parse_session_id, OmnigentHarness};
+    use crate::sandbox::Workspace;
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    /// Serves `body` as JSON to every request, forever (until the test process exits).
+    fn mock_server(body: String) -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut s in l.incoming().flatten() {
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        url
+    }
+
+    fn usage(input: u64, output: u64, cache: u64) -> String {
+        format!(r#"{{"usage_by_model":{{"m":{{"input_tokens":{input},"output_tokens":{output},"cache_creation_input_tokens":{cache},"cache_read_input_tokens":999999}}}}}}"#)
+    }
+
+    fn harness(f: &super::Fixture, script: &str, tokens: String) -> (OmnigentHarness, Workspace) {
+        let bin = f.dir.join("fake-omnigent");
+        std::fs::write(&bin, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut h = OmnigentHarness::new(&f.dir).unwrap();
+        h.bin = bin.to_string_lossy().into();
+        h.server_url = mock_server(tokens);
+        h.poll = Duration::from_millis(100);
+        let ws = Workspace { task_id: "t".into(), path: f.dir.clone(), exec_prefix: vec![] };
+        (h, ws)
+    }
+
+    const OK: &str = r#"[ "$1" = "--version" ] && { echo "omnigent 0.16.2 (built x)"; exit 0; }
+echo "omnigent: Starting up…" >&2
+echo "Omnigent session: http://127.0.0.1:1/c/abc123" >&2
+sleep 0.4
+echo "the answer""#;
+
+    #[test]
+    fn success_returns_stdout_and_meters_tokens() {
+        let f = fixture("omni-ok");
+        let (h, ws) = harness(&f, OK, usage(10, 20, 70));
+        let t = task("t", "a", 1000, &f.key_a);
+        let mut m = UsageMeter::new(1000, 25);
+        assert_eq!(h.run(&t, &ws, &mut m).unwrap(), "the answer");
+        assert_eq!(m.used(), 100, "input+output+cache creation, not cache reads");
+        h.check_version().unwrap();
+    }
+
+    #[test]
+    fn overrun_kills_the_process() {
+        let f = fixture("omni-over");
+        let script = "echo \"Omnigent session: http://x/c/abc123\" >&2\nsleep 30";
+        let (h, ws) = harness(&f, script, usage(5000, 5000, 0));
+        let t = task("t", "a", 100, &f.key_a);
+        let mut m = UsageMeter::new(100, 25);
+        let started = std::time::Instant::now();
+        assert!(matches!(h.run(&t, &ws, &mut m), Err(crate::Error::Meter { .. })));
+        assert!(started.elapsed() < Duration::from_secs(10), "child must be killed, not awaited");
+    }
+
+    #[test]
+    fn failure_reports_stderr_tail() {
+        let f = fixture("omni-fail");
+        let (h, ws) = harness(&f, "echo 'Error: harness_spawn_failed' >&2\nexit 1", usage(0, 0, 0));
+        let t = task("t", "a", 100, &f.key_a);
+        let e = h.run(&t, &ws, &mut UsageMeter::new(100, 25)).unwrap_err().to_string();
+        assert!(e.contains("harness_spawn_failed"), "{e}");
+    }
+
+    #[test]
+    fn timeout_kills() {
+        let f = fixture("omni-timeout");
+        let (h, ws) = harness(&f, "sleep 30", usage(0, 0, 0));
+        let mut t = task("t", "a", 100, &f.key_a);
+        t.sandbox_profile.timeout_secs = 1;
+        let e = h.run(&t, &ws, &mut UsageMeter::new(100, 25)).unwrap_err().to_string();
+        assert!(e.contains("timed out"), "{e}");
+    }
+
+    #[test]
+    fn version_is_pinned_and_session_id_parsed() {
+        let f = fixture("omni-ver");
+        let (mut h, _) = harness(&f, "echo 'omnigent 0.17.0 (built x)'", usage(0, 0, 0));
+        assert!(h.check_version().is_err());
+        h.version_prefix = "0.17.".into();
+        assert!(h.check_version().is_ok());
+        assert_eq!(parse_session_id("Omnigent session: http://127.0.0.1:35575/c/633f0d1ee800479083ffbdb007daf2f5").as_deref(), Some("633f0d1ee800479083ffbdb007daf2f5"));
+        assert_eq!(parse_session_id("omnigent: Starting up…"), None);
+    }
+
+    #[test]
+    fn config_refuses_docker_with_omnigent() {
+        let f = fixture("omni-cfg");
+        let mut c = crate::config::Config::starter(&f.dir);
+        c.harness = crate::config::HarnessConfig::Omnigent { bin: "omnigent".into(), server_url: "http://x".into(), harness: "claude-sdk".into() };
+        assert!(c.build().is_err(), "docker sandbox + omnigent harness must be refused");
+        c.sandbox = crate::config::SandboxConfig::Bwrap;
+        assert!(c.build().is_ok());
+    }
+}

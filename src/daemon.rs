@@ -52,6 +52,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 pub async fn run(cfg: Config, shutdown: impl Future<Output = ()>) -> Result<()> {
     let runner = cfg.build()?;
     runner.sandbox.probe()?;
+    runner.harness.probe()?;
     run_runner(runner, cfg, shutdown).await
 }
 

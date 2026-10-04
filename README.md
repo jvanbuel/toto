@@ -39,3 +39,7 @@ togra status                # reads <state_dir>/status.json
 Pick the sandbox in `config.json`: `{"kind":"docker","image":"alpine"}` (add `"runtime":"runsc"` for gVisor, `"bin":"podman"` for Podman), `{"kind":"bwrap"}` (Linux, no daemon or image), or `{"kind":"dir"}` (no isolation; development only). The daemon probes the sandbox at startup and refuses to run if it does not work. It also refuses `review_before_submit`, which needs the TUI.
 
 Until the HTTP coordinator exists, the queue is a spool directory (`queue_dir`: `tasks/`, `leases/`, `results/`), and the harness is an echo placeholder until Omnigent is wired in.
+
+## Omnigent harness
+
+`{"harness":{"kind":"omnigent"}}` runs tasks through a local [Omnigent](https://github.com/omnigent-ai/omnigent) install (`pip install omnigent`, Python 3.12+, version pinned to 0.16.x). The daemon generates an agent with `allow_network: false`, which makes Omnigent keep the AI login with the unwrapped CLI and run all file and shell access in its own sandbox helpers (see ADR 5). It needs sandbox `dir` or `bwrap`, because Omnigent, not the `togra` sandbox, isolates the task. Token usage is read from the Omnigent server per session and enforced by the usage meter, which kills the run on overrun. Only tested with a stub CLI and a mock server so far: a real-login run is still to do.
