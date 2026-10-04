@@ -270,7 +270,7 @@ mod daemon {
     #[test]
     fn exec_times_out_and_captures_output() {
         let f = fixture("exec");
-        let ws = Workspace { task_id: "x".into(), path: f.dir.clone(), exec_prefix: vec![] };
+        let ws = Workspace { task_id: "x".into(), path: f.dir.clone(), exec_prefix: vec![], bridge: false };
         let ok = exec(&ws, &["sh", "-c", "echo hi"], Duration::from_secs(5)).unwrap();
         assert_eq!(String::from_utf8_lossy(&ok.stdout).trim(), "hi");
         let started = std::time::Instant::now();
@@ -398,7 +398,7 @@ mod omnigent_harness {
         h.bin = bin.to_string_lossy().into();
         h.server_url = mock_server(tokens);
         h.poll = Duration::from_millis(100);
-        let ws = Workspace { task_id: "t".into(), path: f.dir.clone(), exec_prefix: vec![] };
+        let ws = Workspace { task_id: "t".into(), path: f.dir.clone(), exec_prefix: vec![], bridge: false };
         (h, ws)
     }
 
@@ -466,9 +466,11 @@ echo "the answer""#;
         let f = fixture("omni-cfg");
         let mut c = crate::config::Config::starter(&f.dir);
         c.harness = crate::config::HarnessConfig::Omnigent { bin: "omnigent".into(), server_url: "http://x".into(), harness: "claude-sdk".into() };
-        assert!(c.build().is_err(), "docker sandbox + omnigent harness must be refused");
+        assert!(c.build().is_err(), "docker sandbox without the bridge must be refused");
         c.sandbox = crate::config::SandboxConfig::Bwrap;
         assert!(c.build().is_ok());
+        c.sandbox = crate::config::SandboxConfig::Docker { bin: "docker".into(), image: "alpine".into(), runtime: None, bridge: Some("/x/togra-mcp-exec".into()) };
+        assert!(c.build().is_ok(), "docker + bridge is the container route");
     }
 }
 
@@ -503,6 +505,8 @@ mod context {
         for url in ["http://x.org", "https://user@x.org", "https://x.org/${ANTHROPIC_API_KEY}", "https://", "https://x.org/a b", "ftp://x.org", "https://x.org\\@evil"] {
             assert!(TaskContext { mcp_servers: vec![mcp(url)], ..Default::default() }.validate().is_err(), "url {url:?}");
         }
+        let reserved = TaskContext { mcp_servers: vec![McpServer { name: "sandbox".into(), url: "https://x.org".into() }], ..Default::default() };
+        assert!(reserved.validate().is_err(), "`sandbox` is reserved for the runner's bridge");
         let dup = TaskContext { skills: vec![skill("a"), skill("a")], ..Default::default() };
         assert!(dup.validate().is_err());
     }
@@ -590,7 +594,7 @@ mod omnigent_context {
             skills: vec![Skill { name: "triage".into(), description: nasty.clone(), content: "body".into(), files: [("ref/notes.md".to_string(), "n".to_string())].into() }],
             mcp_servers: vec![McpServer { name: "tracker".into(), url: "https://mcp.example.org/sse".into() }],
         };
-        let ws = Workspace { task_id: "t1".into(), path: f.dir.clone(), exec_prefix: vec![] };
+        let ws = Workspace { task_id: "t1".into(), path: f.dir.clone(), exec_prefix: vec![], bridge: false };
         assert!(h.supports_context());
         assert_eq!(h.run(&t, &ws, &mut UsageMeter::new(100, 25)).unwrap(), "done");
 
@@ -610,13 +614,157 @@ mod omnigent_context {
         let h = OmnigentHarness::new(&f.dir).unwrap();
         let mut t = task("t1", "a", 100, &f.key_a);
         t.context = TaskContext { skills: vec![Skill { name: "ok".into(), description: "d".into(), content: "c".into(), files: [("../../escape".to_string(), "x".to_string())].into() }], ..Default::default() };
-        let ws = Workspace { task_id: "t1".into(), path: f.dir.clone(), exec_prefix: vec![] };
+        let ws = Workspace { task_id: "t1".into(), path: f.dir.clone(), exec_prefix: vec![], bridge: false };
         assert!(h.run(&t, &ws, &mut UsageMeter::new(100, 25)).is_err());
         assert!(!f.dir.join("escape").exists());
     }
 
     #[test]
     fn no_mcp_means_no_tools_block() {
-        assert!(!agent_config(&TaskContext::default()).contains("\"tools\""));
+        assert!(!agent_config(&TaskContext::default(), None).contains("\"tools\""));
+    }
+}
+
+mod bridge {
+    use super::{fixture, task};
+    use crate::sandbox::{DockerSandbox, Sandbox};
+    use serde_json::{json, Value};
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+
+    fn bridge_binary() -> Option<std::path::PathBuf> {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/togra-mcp-exec");
+        p.exists().then_some(p)
+    }
+
+    /// Talks MCP (newline-delimited JSON-RPC) to a child process.
+    struct Mcp {
+        child: std::process::Child,
+        out: BufReader<std::process::ChildStdout>,
+        next: u64,
+    }
+
+    impl Mcp {
+        fn start(argv: &[String]) -> Mcp {
+            let mut child = Command::new(&argv[0]).args(&argv[1..]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+            let out = BufReader::new(child.stdout.take().unwrap());
+            Mcp { child, out, next: 1 }
+        }
+
+        fn send(&mut self, v: Value) {
+            let stdin = self.child.stdin.as_mut().unwrap();
+            writeln!(stdin, "{v}").unwrap();
+            stdin.flush().unwrap();
+        }
+
+        fn request(&mut self, method: &str, params: Value) -> Value {
+            let id = self.next;
+            self.next += 1;
+            self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+            let mut line = String::new();
+            self.out.read_line(&mut line).unwrap();
+            let v: Value = serde_json::from_str(&line).unwrap_or_else(|e| panic!("bad reply {line:?}: {e}"));
+            assert_eq!(v["id"], id);
+            v
+        }
+
+        fn tool(&mut self, name: &str, args: Value) -> String {
+            let r = self.request("tools/call", json!({"name": name, "arguments": args}));
+            r["result"]["content"][0]["text"].as_str().unwrap_or_else(|| panic!("no text in {r}")).to_string()
+        }
+    }
+
+    #[test]
+    fn mcp_bridge_runs_tools_inside_the_container() {
+        let docker_ok = Command::new("docker").args(["image", "inspect", "alpine"]).output().is_ok_and(|o| o.status.success());
+        let Some(bin) = bridge_binary().filter(|_| docker_ok) else {
+            eprintln!("skipping: needs docker, the alpine image and the musl bridge build");
+            return;
+        };
+        let f = fixture("bridge");
+        let t = task("bridge1", "a", 1, &f.key_a);
+        let mut sb = DockerSandbox::new("alpine");
+        sb.bridge = Some(bin);
+        let ws = sb.create(&t, &t.sandbox_profile).unwrap();
+        let mut mcp = Mcp::start(&ws.bridge_argv().expect("bridge argv"));
+
+        let init = mcp.request("initialize", json!({"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}));
+        assert_eq!(init["result"]["serverInfo"]["name"], "togra-exec");
+        mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+        let tools = mcp.request("tools/list", json!({}));
+        let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["run_command", "read_file", "write_file", "list_dir"]);
+
+        assert!(mcp.tool("write_file", json!({"path": "/workspace/a/b.txt", "content": "hello"})).contains("wrote 5 bytes"));
+        assert_eq!(mcp.tool("read_file", json!({"path": "/workspace/a/b.txt"})), "hello");
+        assert!(mcp.tool("list_dir", json!({"path": "/workspace"})).contains("a/"));
+        let id = mcp.tool("run_command", json!({"command": "id -u; cat /workspace/a/b.txt"}));
+        assert!(id.contains("exit: 0") && id.contains("65534") && id.contains("hello"), "runs as nobody: {id}");
+
+        // Same boundaries as any command in the sandbox.
+        assert!(mcp.tool("run_command", json!({"command": "touch /etc/x"})).contains("exit: 1"), "rootfs read-only");
+        assert!(!mcp.tool("run_command", json!({"command": "wget -T 2 -q -O- http://1.1.1.1"})).contains("exit: 0"), "no network");
+        assert!(!mcp.tool("run_command", json!({"command": "ls /home/user"})).contains("exit: 0"), "no host fs");
+        assert!(mcp.tool("run_command", json!({"command": "sleep 30", "timeout_secs": 1})).contains("timed out"));
+        let bad = mcp.request("tools/call", json!({"name": "nope", "arguments": {}}));
+        assert_eq!(bad["result"]["isError"], true);
+        assert_eq!(mcp.request("bogus/method", json!({}))["error"]["code"], -32601);
+
+        // The bridge binary itself is read-only inside the container.
+        assert!(!mcp.tool("run_command", json!({"command": "echo x >> /togra/mcp-exec"})).contains("exit: 0"));
+        drop(mcp.child.stdin.take());
+        let _ = mcp.child.wait();
+        sb.destroy(ws).unwrap();
+    }
+}
+
+mod omnigent_bridge {
+    use super::{fixture, task};
+    use crate::harness::Harness;
+    use crate::manifest::*;
+    use crate::meter::UsageMeter;
+    use crate::omnigent::{agent_config, OmnigentHarness};
+    use crate::sandbox::Workspace;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn argv() -> Vec<String> {
+        ["docker", "exec", "-i", "togra-t1", "/togra/mcp-exec"].map(String::from).into()
+    }
+
+    #[test]
+    fn container_route_has_no_host_tools_and_only_the_bridge() {
+        let cfg: serde_json::Value = serde_json::from_str(&agent_config(&TaskContext::default(), Some(&argv()))).unwrap();
+        assert!(cfg.get("os_env").is_none(), "no os_env: no host shell/file helpers, CLI native tools stay off");
+        assert_eq!(cfg["skills"], "none");
+        assert_eq!(cfg["tools"]["sandbox"], serde_json::json!({"type": "mcp", "command": "docker", "args": ["exec", "-i", "togra-t1", "/togra/mcp-exec"]}));
+        assert_eq!(cfg["tools"].as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn project_mcp_urls_are_added_next_to_the_bridge_and_cannot_shadow_it() {
+        let ctx = TaskContext { mcp_servers: vec![McpServer { name: "sandbox".into(), url: "https://mcp.example.org/sse".into() }, McpServer { name: "tracker".into(), url: "https://mcp.example.org/t".into() }], ..Default::default() };
+        let cfg: serde_json::Value = serde_json::from_str(&agent_config(&ctx, Some(&argv()))).unwrap();
+        assert_eq!(cfg["tools"]["sandbox"]["command"], "docker", "bridge must win over a project server with the same name");
+        assert_eq!(cfg["tools"]["tracker"]["url"], "https://mcp.example.org/t");
+    }
+
+    #[test]
+    fn harness_uses_the_workspace_bridge_argv() {
+        let f = fixture("omni-bridge");
+        let keep = f.dir.join("kept");
+        let bin = f.dir.join("fake-omnigent");
+        std::fs::write(&bin, format!("#!/bin/sh\ncp -r \"$2\" {}\necho ok", keep.display())).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut h = OmnigentHarness::new(&f.dir).unwrap();
+        h.bin = bin.to_string_lossy().into();
+        h.server_url = "http://127.0.0.1:1".into();
+        let t = task("t1", "a", 100, &f.key_a);
+        let ws = Workspace { task_id: "t1".into(), path: std::path::PathBuf::new(), exec_prefix: argv()[..4].to_vec(), bridge: true };
+        assert_eq!(h.run(&t, &ws, &mut UsageMeter::new(100, 25)).unwrap(), "ok");
+        let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(keep.join("config.yaml")).unwrap()).unwrap();
+        assert_eq!(cfg["tools"]["sandbox"]["args"][2], "togra-t1");
+        // Without a bridge and without a host workspace there is nowhere to run: refuse.
+        let none = Workspace { task_id: "t1".into(), path: std::path::PathBuf::new(), exec_prefix: argv()[..4].to_vec(), bridge: false };
+        assert!(h.run(&t, &none, &mut UsageMeter::new(100, 25)).is_err());
     }
 }

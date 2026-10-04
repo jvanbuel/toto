@@ -6,6 +6,9 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+/// Where the MCP exec bridge appears inside a container sandbox.
+pub const BRIDGE_PATH: &str = "/togra/mcp-exec";
+
 /// An isolated workspace for one task. Dropping it must destroy the environment.
 pub trait Sandbox: Send {
     /// Checks at daemon start that this backend works here (binary present, image pulled...).
@@ -29,6 +32,18 @@ impl<T: Sandbox + ?Sized> Sandbox for Box<T> {
     }
 }
 
+impl Workspace {
+    /// Command that starts the MCP exec bridge inside this sandbox (container sandboxes with a
+    /// bridge only). The runner generates it; projects can never influence it.
+    pub fn bridge_argv(&self) -> Option<Vec<String>> {
+        let mut v = self.exec_prefix.clone();
+        (self.bridge && !v.is_empty()).then(|| {
+            v.push(BRIDGE_PATH.into());
+            v
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct Workspace {
     pub task_id: String,
@@ -38,6 +53,8 @@ pub struct Workspace {
     /// Command prefix the harness uses to run a command *inside* the sandbox (ADR 5), e.g.
     /// `docker exec -i <container> <cmd>`. Empty for `DirSandbox`.
     pub exec_prefix: Vec<String>,
+    /// True when the bridge binary is mounted at `BRIDGE_PATH`.
+    pub bridge: bool,
 }
 
 /// **Not isolating.** A plain temp directory for the spike and tests; it enforces none of the
@@ -50,7 +67,7 @@ impl Sandbox for DirSandbox {
     fn create(&self, task: &TaskManifest, _profile: &SandboxProfile) -> Result<Workspace> {
         let path = self.root.join(&task.id);
         std::fs::create_dir_all(&path)?;
-        Ok(Workspace { task_id: task.id.clone(), path, exec_prefix: vec![] })
+        Ok(Workspace { task_id: task.id.clone(), path, exec_prefix: vec![], bridge: false })
     }
 
     fn destroy(&self, ws: Workspace) -> Result<()> {
@@ -75,11 +92,14 @@ pub struct DockerSandbox {
     pub image: String,
     pub runtime: Option<String>,
     pub workspace_mb: u32,
+    /// Static `togra-mcp-exec` binary to mount read-only at `BRIDGE_PATH`: the only host path a
+    /// task container can see.
+    pub bridge: Option<PathBuf>,
 }
 
 impl DockerSandbox {
     pub fn new(image: impl Into<String>) -> Self {
-        Self { bin: "docker".into(), image: image.into(), runtime: None, workspace_mb: 512 }
+        Self { bin: "docker".into(), image: image.into(), runtime: None, workspace_mb: 512, bridge: None }
     }
 
     pub fn container_name(task_id: &str) -> String {
@@ -106,6 +126,9 @@ impl DockerSandbox {
             "--tmpfs".into(), format!("/workspace:rw,noexec,nosuid,mode=1777,size={}m", self.workspace_mb),
             "--tmpfs".into(), "/tmp:rw,noexec,nosuid,mode=1777,size=64m".into(),
         ]);
+        if let Some(b) = &self.bridge {
+            a.extend(["--mount".into(), format!("type=bind,src={},dst={BRIDGE_PATH},readonly", b.display())]);
+        }
         if let Some(rt) = &self.runtime {
             a.extend(["--runtime".into(), rt.clone()]);
         }
@@ -137,7 +160,7 @@ impl Sandbox for DockerSandbox {
         self.docker(&args)?;
         let name = Self::container_name(&task.id);
         let exec_prefix = vec![self.bin.clone(), "exec".into(), "-i".into(), name];
-        Ok(Workspace { task_id: task.id.clone(), path: PathBuf::new(), exec_prefix })
+        Ok(Workspace { task_id: task.id.clone(), path: PathBuf::new(), exec_prefix, bridge: self.bridge.is_some() })
     }
 
     fn destroy(&self, ws: Workspace) -> Result<()> {
@@ -233,7 +256,7 @@ impl Sandbox for BwrapSandbox {
     fn probe(&self) -> Result<()> {
         let dir = self.root.join(".probe");
         std::fs::create_dir_all(&dir)?;
-        let ws = Workspace { task_id: "probe".into(), path: dir.clone(), exec_prefix: self.prefix(&dir, &SandboxProfile::default())? };
+        let ws = Workspace { task_id: "probe".into(), path: dir.clone(), exec_prefix: self.prefix(&dir, &SandboxProfile::default())?, bridge: false };
         let out = exec(&ws, &["true"], Duration::from_secs(10)).map_err(|e| Error::Sandbox(format!("bwrap unusable: {e}")))?;
         let _ = std::fs::remove_dir_all(dir);
         if out.status.success() {
@@ -247,7 +270,7 @@ impl Sandbox for BwrapSandbox {
         let path = self.root.join(DockerSandbox::container_name(&task.id));
         std::fs::create_dir_all(&path)?;
         let exec_prefix = self.prefix(&path, profile)?;
-        Ok(Workspace { task_id: task.id.clone(), path, exec_prefix })
+        Ok(Workspace { task_id: task.id.clone(), path, exec_prefix, bridge: false })
     }
 
     fn destroy(&self, ws: Workspace) -> Result<()> {

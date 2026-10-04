@@ -29,6 +29,9 @@ pub struct OutputSchema {
     pub max_bytes: usize,
 }
 
+/// MCP server name the runner reserves for its own exec bridge; projects cannot use it.
+pub const BRIDGE_SERVER_NAME: &str = "sandbox";
+
 /// A project-supplied skill: instructions plus optional reference files (ADR 9).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Skill {
@@ -112,7 +115,7 @@ impl TaskContext {
             }
         }
         for m in &self.mcp_servers {
-            if !ident(&m.name, &['_']) || !seen.insert(format!("m:{}", m.name)) {
+            if m.name == BRIDGE_SERVER_NAME || !ident(&m.name, &['_']) || !seen.insert(format!("m:{}", m.name)) {
                 return bad(format!("invalid or duplicate mcp server name `{}`", m.name));
             }
             m.host()?;

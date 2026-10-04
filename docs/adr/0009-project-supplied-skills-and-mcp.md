@@ -7,7 +7,7 @@
 
 Projects get better results when a task carries more than a prompt: skills (instructions and reference files) and MCP servers (tools such as a project's issue tracker or dataset search). Both are also channels for attack. A skill is more untrusted prompt text plus files; an MCP server can be arbitrary code (stdio) or a stranger's service that steers the agent through tool results (remote).
 
-Omnigent's agent spec (checked in v0.16.0) makes several unsafe things easy: inline MCP entries accept `command`/`args` (code run by the trusted runner, outside the sandbox), `headers` and `env` values with `${VAR}` expansion from the runner's environment (a project could ask for the contributor's API key), and `skills: all` (the default) exposes the contributor's own `~/.claude/skills` to the task agent. It has no per-tool filter for MCP servers.
+Omnigent's agent spec (checked in v0.16.0) makes several unsafe things easy: inline MCP entries accept `command`/`args` (code run by the trusted runner, outside the sandbox), `headers` and `env` values with `${VAR}` expansion from the runner's environment (a project could ask for the contributor's API key), and `skills: all` (the default) exposes the contributor's own `~/.claude/skills` to the task agent. Its MCP server config does have a per-server `tools:` allow-list.
 
 ## Decision
 
@@ -22,7 +22,8 @@ Contributor policy decides what is accepted, with deny by default: `allow_skills
 
 - **Allow stdio MCP servers inside the sandbox.** Needs a harness that runs MCP processes in the task sandbox; Omnigent runs them beside the CLI. Revisit if that changes.
 - **Content-addressed bundles fetched separately.** Better for large skills; inline is enough for v1 and keeps signature coverage trivial.
-- **Per-tool MCP allowlists in the manifest.** Not enforceable with Omnigent today, so not offered.
+- **Per-tool MCP allowlists in the manifest.** Omnigent supports a per-server `tools:` filter, so this is possible; not offered yet. (An earlier version of this ADR wrongly said it was not.)
+- **Stdio MCP and project images.** Superseded in part by ADR 10, which runs them inside the task container.
 
 ## Consequences
 

@@ -11,5 +11,6 @@
 | 7 | [Curate project intake](0007-curated-project-intake.md) | Proposed |
 | 8 | [Thin central coordinator, designed for federation](0008-thin-central-coordinator.md) | Proposed |
 | 9 | [Projects may supply skills and remote MCP servers](0009-project-supplied-skills-and-mcp.md) | Proposed |
+| 10 | [Project-defined environment, reached through an MCP exec bridge](0010-project-environment-with-exec-bridge.md) | Proposed |
 
 ADRs 2 and 5 are load-bearing: together they guarantee credentials never leave the contributor's machine. Several ADRs list a simpler v1 option worth considering before building the full design.

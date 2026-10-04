@@ -27,6 +27,9 @@ pub enum SandboxConfig {
         image: String,
         #[serde(default)]
         runtime: Option<String>,
+        /// Path to the static `togra-mcp-exec` binary, mounted read-only into the container.
+        #[serde(default)]
+        bridge: Option<PathBuf>,
     },
     /// bubblewrap (Linux), no daemon or image.
     Bwrap,
@@ -111,7 +114,7 @@ impl Config {
             state_dir: dir.join("state"),
             queue_dir: dir.join("queue"),
             poll_secs: default_poll(),
-            sandbox: SandboxConfig::Docker { bin: docker_bin(), image: "alpine".into(), runtime: None },
+            sandbox: SandboxConfig::Docker { bin: docker_bin(), image: "alpine".into(), runtime: None, bridge: None },
             harness: HarnessConfig::Echo { tokens_per_run: 100 },
             policy: Policy {
                 daily_token_cap: 100_000,
@@ -150,10 +153,11 @@ impl Config {
         match &self.sandbox {
             SandboxConfig::Dir => Box::new(DirSandbox { root: work }),
             SandboxConfig::Bwrap => Box::new(BwrapSandbox::new(work)),
-            SandboxConfig::Docker { bin, image, runtime } => {
+            SandboxConfig::Docker { bin, image, runtime, bridge } => {
                 let mut s = DockerSandbox::new(image);
                 s.bin = bin.clone();
                 s.runtime = runtime.clone();
+                s.bridge = bridge.clone();
                 Box::new(s)
             }
         }
@@ -172,8 +176,8 @@ impl Config {
         let harness: Box<dyn Harness> = match &self.harness {
             HarnessConfig::Echo { tokens_per_run } => Box::new(EchoHarness { tokens_per_run: *tokens_per_run }),
             HarnessConfig::Omnigent { bin, server_url, harness } => {
-                if matches!(self.sandbox, SandboxConfig::Docker { .. }) {
-                    return Err(Error::Policy("the omnigent harness isolates tasks with Omnigent's own sandbox and needs a host workspace; use sandbox `dir` or `bwrap`".into()));
+                if matches!(self.sandbox, SandboxConfig::Docker { bridge: None, .. }) {
+                    return Err(Error::Policy("the omnigent harness with a container sandbox needs the exec bridge: set `bridge` to the static togra-mcp-exec binary (or use sandbox `dir` or `bwrap`)".into()));
                 }
                 let mut h = OmnigentHarness::new(&self.state_dir)?;
                 h.bin = bin.clone();
