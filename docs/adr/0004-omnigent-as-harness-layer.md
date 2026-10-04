@@ -29,4 +29,4 @@ Contributors use different AI tools: Claude Code, Codex, Cursor, raw API keys an
 - `togra` starts and supervises a local `omnigent server --background` and talks to it over its local API.
 - The `Harness` trait stays the seam: a direct-CLI implementation remains possible as a fallback if Omnigent's direction or stability changes.
 - Omnigent's own policies (spending caps, approval gates, tool restrictions) complement, but never replace, `togra`'s policy engine, which remains the source of truth for contributor consent.
-- Verify that Omnigent's command execution can be routed into the `togra` sandbox (ADR 5) before relying on it.
+- Verified 2026-10-04: Omnigent cannot route command execution into an external sandbox; its default mode puts the Claude login inside its own. See the findings in ADR 5.
