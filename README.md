@@ -10,7 +10,7 @@ The local runner for **Tokens of Gratitude**: donate unused capacity from your o
 
 Early design plus a runner spike. See [docs/design.md](docs/design.md) for the full design doc.
 
-Implemented so far (milestone 1, offline): manifest signing/verification, policy engine (caps, shares, quiet hours, sandbox limits), usage meter, result packaging and signing, audit log, and the task lifecycle against an in-memory queue. Docker/microVM sandbox, the Omnigent harness, the HTTP queue client and the TUI are stubbed behind traits.
+Implemented so far (milestone 1, offline): manifest signing/verification, a hardened Docker/Podman sandbox (gVisor via `runtime`), policy engine (caps, shares, quiet hours, sandbox limits), usage meter, result packaging and signing, audit log, and the task lifecycle against an in-memory queue. microVM sandbox, the Omnigent harness, the HTTP queue client and the TUI are stubbed behind traits.
 
 ```
 cargo test

@@ -156,3 +156,50 @@ fn leases_are_exclusive() {
     assert!(q.heartbeat("t", "r1", d).is_ok());
     assert!(q.heartbeat("t", "r2", d).is_err());
 }
+
+mod docker {
+    use crate::sandbox::{DockerSandbox, Sandbox};
+    use crate::manifest::SandboxProfile;
+
+    #[test]
+    fn run_args_are_hardened() {
+        let mut sb = DockerSandbox::new("alpine");
+        sb.runtime = Some("runsc".into());
+        let a = sb.run_args("t1", &SandboxProfile::default()).unwrap().join(" ");
+        for want in ["--network none", "--read-only", "--cap-drop ALL", "no-new-privileges", "--user 65534:65534",
+            "--pids-limit 256", "--cpus 1.00", "--memory 1024m", "--runtime runsc", "alpine sleep 600"] {
+            assert!(a.contains(want), "missing `{want}` in {a}");
+        }
+        assert!(!a.contains(" -v ") && !a.contains("--mount"), "no host mounts");
+    }
+
+    #[test]
+    fn network_allowlist_fails_closed() {
+        let p = SandboxProfile { network_allowlist: vec!["pypi.org".into()], ..Default::default() };
+        assert!(DockerSandbox::new("alpine").run_args("t1", &p).is_err());
+    }
+
+    #[test]
+    fn container_names_are_sanitised() {
+        assert_eq!(DockerSandbox::container_name("a/b;rm -rf"), "togra-abrm-rf");
+    }
+
+    /// Needs a Docker daemon and the alpine image; skipped otherwise.
+    #[test]
+    fn live_container_is_isolated() {
+        if std::process::Command::new("docker").args(["image", "inspect", "alpine"]).output().map_or(true, |o| !o.status.success()) {
+            eprintln!("skipping: no docker daemon or alpine image");
+            return;
+        }
+        let f = super::fixture("docker");
+        let t = super::task("live1", "a", 1, &f.key_a);
+        let sb = DockerSandbox::new("alpine");
+        let ws = sb.create(&t, &t.sandbox_profile).unwrap();
+        let run = |cmd: &str| std::process::Command::new(&ws.exec_prefix[0]).args(&ws.exec_prefix[1..]).args(["sh", "-c", cmd]).output().unwrap();
+        assert!(run("echo hi > /workspace/x && cat /workspace/x").status.success());
+        assert!(!run("touch /etc/x").status.success(), "rootfs read-only");
+        assert!(!run("wget -T 2 -q -O- http://1.1.1.1").status.success(), "no network");
+        assert!(!run("ls /home/user /root").status.success(), "no host fs");
+        sb.destroy(ws).unwrap();
+    }
+}
