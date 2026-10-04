@@ -3,12 +3,30 @@
 use crate::manifest::{SandboxProfile, TaskManifest};
 use crate::{Error, Result};
 use std::path::PathBuf;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 /// An isolated workspace for one task. Dropping it must destroy the environment.
-pub trait Sandbox {
+pub trait Sandbox: Send {
+    /// Checks at daemon start that this backend works here (binary present, image pulled...).
+    fn probe(&self) -> Result<()> {
+        Ok(())
+    }
     /// Creates an environment honouring `profile` and returns the host-visible workspace path.
     fn create(&self, task: &TaskManifest, profile: &SandboxProfile) -> Result<Workspace>;
     fn destroy(&self, ws: Workspace) -> Result<()>;
+}
+
+impl<T: Sandbox + ?Sized> Sandbox for Box<T> {
+    fn probe(&self) -> Result<()> {
+        (**self).probe()
+    }
+    fn create(&self, task: &TaskManifest, profile: &SandboxProfile) -> Result<Workspace> {
+        (**self).create(task, profile)
+    }
+    fn destroy(&self, ws: Workspace) -> Result<()> {
+        (**self).destroy(ws)
+    }
 }
 
 #[derive(Debug)]
@@ -106,6 +124,14 @@ impl DockerSandbox {
 }
 
 impl Sandbox for DockerSandbox {
+    fn probe(&self) -> Result<()> {
+        self.docker(&["version".into(), "--format".into(), "{{.Server.Version}}".into()])
+            .map_err(|e| Error::Sandbox(format!("{} daemon unreachable: {e}", self.bin)))?;
+        self.docker(&["image".into(), "inspect".into(), self.image.clone()])
+            .map_err(|_| Error::Sandbox(format!("image `{}` not present; run `{} pull {}`", self.image, self.bin, self.image)))?;
+        Ok(())
+    }
+
     fn create(&self, task: &TaskManifest, profile: &SandboxProfile) -> Result<Workspace> {
         let args = self.run_args(&task.id, profile)?;
         self.docker(&args)?;
@@ -117,6 +143,115 @@ impl Sandbox for DockerSandbox {
     fn destroy(&self, ws: Workspace) -> Result<()> {
         // `--rm` removes it once stopped; `-t 0` kills immediately. Ignore "already gone".
         let _ = self.docker(&["stop".into(), "-t".into(), "0".into(), Self::container_name(&ws.task_id)]);
+        Ok(())
+    }
+}
+
+/// Runs `argv` inside the sandbox (prefixed by `ws.exec_prefix`) and kills it at `timeout`.
+/// Harnesses use this so a hung tool can never stall the runner past its deadline.
+pub fn exec(ws: &Workspace, argv: &[&str], timeout: Duration) -> Result<Output> {
+    use std::io::Read;
+    let (prog, args): (&str, Vec<&str>) = match ws.exec_prefix.split_first() {
+        Some((p, rest)) => (p, rest.iter().map(String::as_str).chain(argv.iter().copied()).collect()),
+        None => (argv[0], argv[1..].to_vec()),
+    };
+    let mut cmd = Command::new(prog);
+    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if ws.exec_prefix.is_empty() {
+        cmd.current_dir(&ws.path);
+    }
+    let mut child = cmd.spawn()?;
+    let drain = |mut r: Box<dyn Read + Send>| std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = r.read_to_end(&mut b);
+        b
+    });
+    let (out, err) = (drain(Box::new(child.stdout.take().unwrap())), drain(Box::new(child.stderr.take().unwrap())));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(s) = child.try_wait()? {
+            break s;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::Sandbox(format!("command timed out after {timeout:?}")));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    Ok(Output { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() })
+}
+
+/// bubblewrap sandbox (Linux): no daemon or image needed. Each exec is a fresh `bwrap` with
+/// an empty root (read-only `/usr`, `/bin`, `/lib*`), no network, a fresh pid/ipc/uts/user
+/// namespace, a cleared environment and a single writable scratch directory at `/workspace`.
+///
+/// Limits are weaker than a container: `prlimit` bounds processes, CPU seconds and data
+/// segment size (an approximation of the memory limit); there is no pids/cgroup accounting.
+pub struct BwrapSandbox {
+    pub bin: String,
+    /// Host directory holding per-task scratch dirs; the only host path a task can touch.
+    pub root: PathBuf,
+}
+
+impl BwrapSandbox {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { bin: "bwrap".into(), root: root.into() }
+    }
+
+    /// Everything up to the user command; pure apart from reading the host's `/bin` layout.
+    pub fn prefix(&self, host_dir: &std::path::Path, p: &SandboxProfile) -> Result<Vec<String>> {
+        if !p.network_allowlist.is_empty() {
+            return Err(Error::Sandbox("network allowlists are not supported yet; refusing to run".into()));
+        }
+        let mut a: Vec<String> = [
+            &self.bin[..], "--unshare-all", "--die-with-parent", "--new-session", "--clearenv", "--cap-drop", "ALL",
+            "--uid", "65534", "--gid", "65534", "--ro-bind", "/usr", "/usr",
+        ]
+        .map(String::from)
+        .into();
+        for d in ["bin", "sbin", "lib", "lib64"] {
+            let host = PathBuf::from("/").join(d);
+            match std::fs::read_link(&host) {
+                Ok(target) => a.extend(["--symlink".into(), target.to_string_lossy().into(), format!("/{d}")]),
+                Err(_) if host.is_dir() => a.extend(["--ro-bind".into(), format!("/{d}"), format!("/{d}")]),
+                Err(_) => {}
+            }
+        }
+        a.extend(["--ro-bind-try", "/etc/ld.so.cache", "/etc/ld.so.cache", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"].map(String::from));
+        a.extend(["--bind".into(), host_dir.to_string_lossy().into(), "/workspace".into(), "--chdir".into(), "/workspace".into()]);
+        a.extend(["--setenv", "HOME", "/workspace", "--setenv", "PATH", "/usr/bin:/bin"].map(String::from));
+        a.extend([
+            "prlimit".into(), "--nproc=256".into(), format!("--cpu={}", p.timeout_secs),
+            format!("--data={}", p.memory_mb as u64 * 1024 * 1024),
+        ]);
+        Ok(a)
+    }
+}
+
+impl Sandbox for BwrapSandbox {
+    fn probe(&self) -> Result<()> {
+        let dir = self.root.join(".probe");
+        std::fs::create_dir_all(&dir)?;
+        let ws = Workspace { task_id: "probe".into(), path: dir.clone(), exec_prefix: self.prefix(&dir, &SandboxProfile::default())? };
+        let out = exec(&ws, &["true"], Duration::from_secs(10)).map_err(|e| Error::Sandbox(format!("bwrap unusable: {e}")))?;
+        let _ = std::fs::remove_dir_all(dir);
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(Error::Sandbox(format!("bwrap probe failed: {}", String::from_utf8_lossy(&out.stderr).trim())))
+        }
+    }
+
+    fn create(&self, task: &TaskManifest, profile: &SandboxProfile) -> Result<Workspace> {
+        let path = self.root.join(DockerSandbox::container_name(&task.id));
+        std::fs::create_dir_all(&path)?;
+        let exec_prefix = self.prefix(&path, profile)?;
+        Ok(Workspace { task_id: task.id.clone(), path, exec_prefix })
+    }
+
+    fn destroy(&self, ws: Workspace) -> Result<()> {
+        let _ = std::fs::remove_dir_all(ws.path);
         Ok(())
     }
 }

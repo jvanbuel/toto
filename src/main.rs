@@ -22,12 +22,83 @@ enum Cmd {
     Keygen { out: PathBuf },
     /// Show the audit log.
     Audit { log: PathBuf },
+    /// Create a config directory with a runner key and a strict starter config.
+    Init {
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// Run the daemon in the foreground (what the service unit invokes).
+    Run {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Show daemon status from the state directory.
+    Status {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Write a systemd (Linux) or launchd (macOS) user unit for the daemon.
+    InstallService {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Run one signed task end to end against an in-memory queue and an echo harness.
     Demo,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn home() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").expect("HOME is not set"))
+}
+
+fn default_dir() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME").map_or_else(|| home().join(".config"), PathBuf::from).join("togra")
+}
+
+fn config_path(c: Option<PathBuf>) -> PathBuf {
+    c.unwrap_or_else(|| default_dir().join("config.json"))
+}
+
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Cli::parse().cmd {
+        Cmd::Init { dir } => {
+            let dir = dir.unwrap_or_else(default_dir);
+            fs::create_dir_all(&dir)?;
+            let path = dir.join("config.json");
+            if path.exists() {
+                return Err(format!("{} already exists", path.display()).into());
+            }
+            let cfg = togra::config::Config::starter(&dir);
+            let id = hex::encode(cfg.load_or_create_key()?.verifying_key().to_bytes());
+            fs::write(&path, serde_json::to_string_pretty(&cfg)?)?;
+            println!("wrote {}\nrunner id: {id}\nNothing will run until you add a trusted project, allowed kinds and a share to the config.", path.display());
+        }
+        Cmd::Run { config } => {
+            let cfg = togra::config::Config::load(&config_path(config))?;
+            togra::daemon::run(cfg, shutdown_signal()).await?;
+        }
+        Cmd::Status { config } => {
+            let cfg = togra::config::Config::load(&config_path(config))?;
+            match togra::daemon::Status::read(&cfg.state_dir) {
+                Some(s) => println!("{}", serde_json::to_string_pretty(&s)?),
+                None => println!("no status yet (daemon has not run)"),
+            }
+        }
+        Cmd::InstallService { config } => {
+            let cfg = config_path(config);
+            let cfg = fs::canonicalize(&cfg).map_err(|e| format!("{}: {e}", cfg.display()))?;
+            let (path, enable) = togra::service::install(&home(), &std::env::current_exe()?, &cfg)?;
+            println!("wrote {}\nenable it with: {enable}", path.display());
+        }
         Cmd::Keygen { out } => {
             let key = togra::manifest::generate_key();
             fs::write(&out, hex::encode(key.to_bytes()))?;

@@ -230,3 +230,133 @@ mod docker {
         live("podman", Some("runsc"), "live-podman-gvisor");
     }
 }
+
+mod daemon {
+    use super::{fixture, task, policy};
+    use crate::config::*;
+    use crate::manifest::generate_key;
+    use crate::queue::{DirQueue, QueueClient};
+    use crate::sandbox::{exec, BwrapSandbox, DirSandbox, Sandbox, Workspace};
+    use std::time::Duration;
+
+    fn config(dir: &std::path::Path, project_key: &ed25519_dalek::SigningKey, sandbox: SandboxConfig) -> Config {
+        let mut c = Config::starter(dir);
+        c.poll_secs = 1;
+        c.sandbox = sandbox;
+        c.policy = policy();
+        c.projects.insert("a".into(), hex::encode(project_key.verifying_key().to_bytes()));
+        c
+    }
+
+    #[test]
+    fn dirqueue_leases_and_results() {
+        let f = fixture("dirq");
+        let q = DirQueue::new(f.dir.join("q")).unwrap();
+        q.post(&task("t1", "a", 10, &f.key_a)).unwrap();
+        assert_eq!(q.available().unwrap().len(), 1);
+        let d = Duration::from_secs(60);
+        q.claim("t1", "r1", d).unwrap();
+        assert!(q.claim("t1", "r2", d).is_err());
+        assert!(q.heartbeat("t1", "r2", d).is_err());
+        assert!(q.available().unwrap().is_empty());
+        q.release("t1", "r1").unwrap();
+        assert_eq!(q.available().unwrap().len(), 1);
+        q.claim("t1", "r2", Duration::ZERO).unwrap(); // instantly expired
+        q.claim("t1", "r1", d).unwrap(); // expired lease can be taken over
+        assert!(q.post(&crate::manifest::TaskManifest { id: "../evil".into(), ..task("x", "a", 1, &f.key_a) }).is_err());
+    }
+
+    #[test]
+    fn exec_times_out_and_captures_output() {
+        let f = fixture("exec");
+        let ws = Workspace { task_id: "x".into(), path: f.dir.clone(), exec_prefix: vec![] };
+        let ok = exec(&ws, &["sh", "-c", "echo hi"], Duration::from_secs(5)).unwrap();
+        assert_eq!(String::from_utf8_lossy(&ok.stdout).trim(), "hi");
+        let started = std::time::Instant::now();
+        assert!(exec(&ws, &["sleep", "30"], Duration::from_millis(200)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn config_roundtrip_and_review_refused() {
+        let f = fixture("cfg");
+        let mut c = config(&f.dir, &f.key_a, SandboxConfig::Bwrap);
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(serde_json::from_str::<Config>(&json).is_ok());
+        c.policy.review_before_submit = true;
+        assert!(c.build().is_err());
+    }
+
+    #[test]
+    fn service_unit_mentions_config() {
+        let u = crate::service::unit_contents(std::path::Path::new("/usr/bin/togra"), std::path::Path::new("/h/config.json"));
+        assert!(u.contains("/usr/bin/togra") && u.contains("run") && u.contains("/h/config.json"));
+        assert!(crate::service::install(std::path::Path::new("/tmp"), std::path::Path::new("x"), std::path::Path::new("rel")).is_err());
+    }
+
+    #[test]
+    fn bwrap_prefix_is_hardened() {
+        let sb = BwrapSandbox::new("/tmp/x");
+        let a = sb.prefix(std::path::Path::new("/tmp/x/t"), &Default::default()).unwrap().join(" ");
+        for want in ["--unshare-all", "--clearenv", "--cap-drop ALL", "--uid 65534", "--bind /tmp/x/t /workspace", "--ro-bind /usr /usr", "prlimit --nproc=256"] {
+            assert!(a.contains(want), "missing `{want}` in {a}");
+        }
+        assert!(!a.contains("--share-net"), "network must stay unshared");
+        let p = crate::manifest::SandboxProfile { network_allowlist: vec!["x".into()], ..Default::default() };
+        assert!(sb.prefix(std::path::Path::new("/t"), &p).is_err());
+    }
+
+    #[test]
+    fn live_bwrap_is_isolated() {
+        let f = fixture("bwrap");
+        let sb = BwrapSandbox::new(f.dir.join("work"));
+        if sb.probe().is_err() {
+            eprintln!("skipping bwrap: unusable here");
+            return;
+        }
+        let t = task("bw1", "a", 1, &f.key_a);
+        let ws = sb.create(&t, &t.sandbox_profile).unwrap();
+        let run = |c: &str| exec(&ws, &["sh", "-c", c], Duration::from_secs(10)).unwrap().status.success();
+        let checks = [
+            (run("echo hi > /workspace/x && cat /workspace/x"), "workspace writable"),
+            (!run("touch /usr/x"), "usr read-only"),
+            (!run("ls /home /root"), "no host home"),
+            (!run("cat /proc/net/dev | grep -v -e lo: -e Inter -e face | grep ."), "no network interfaces"),
+            (run("test -z \"$SSH_AUTH_SOCK$HOME_SECRET$ANTHROPIC_API_KEY\""), "env cleared"),
+        ];
+        sb.destroy(ws).unwrap();
+        for (ok, what) in checks {
+            assert!(ok, "bwrap: {what}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_processes_queue_and_stops_cleanly() {
+        let f = fixture("daemon");
+        let cfg = config(&f.dir, &f.key_a, SandboxConfig::Dir);
+        let q = DirQueue::new(&cfg.queue_dir).unwrap();
+        q.post(&task("d1", "a", 1000, &f.key_a)).unwrap();
+        let mut bad = task("d2", "a", 1000, &f.key_a);
+        bad.prompt = "tampered".into(); // signature no longer matches
+        q.post(&bad).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let state = cfg.state_dir.clone();
+        let handle = tokio::spawn(crate::daemon::run(cfg, async { let _ = rx.await; }));
+        for _ in 0..100 {
+            if q.results().unwrap().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tx.send(()).unwrap();
+        handle.await.unwrap().unwrap();
+        let res = q.results().unwrap();
+        assert_eq!(res.len(), 1);
+        res[0].verify().unwrap();
+        let status = crate::daemon::Status::read(&state).unwrap();
+        assert_eq!((status.state.as_str(), status.submitted), ("stopped", 1));
+        let log = crate::audit::AuditLog::new(state.join("audit.jsonl")).entries().unwrap();
+        assert_eq!(log.iter().filter(|e| e.outcome == "rejected").count(), 1);
+        let _ = (generate_key(), DirSandbox { root: f.dir.clone() });
+    }
+}

@@ -5,10 +5,16 @@ use crate::meter::UsageMeter;
 use crate::sandbox::Workspace;
 use crate::Result;
 
-pub trait Harness {
+pub trait Harness: Send {
     /// Runs the task against the workspace, reporting every usage increment to `meter`
     /// and aborting with its error when a limit is hit. Returns the raw output.
     fn run(&self, task: &TaskManifest, ws: &Workspace, meter: &mut UsageMeter) -> Result<String>;
+}
+
+impl<T: Harness + ?Sized> Harness for Box<T> {
+    fn run(&self, task: &TaskManifest, ws: &Workspace, meter: &mut UsageMeter) -> Result<String> {
+        (**self).run(task, ws, meter)
+    }
 }
 
 /// Deterministic stand-in that echoes the prompt; used by the demo and tests.

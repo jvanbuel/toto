@@ -12,14 +12,15 @@ use crate::{Error, Result};
 use chrono::{DateTime, Local};
 use ed25519_dalek::SigningKey;
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Review-before-submit hook; the TUI implements it, tests use closures.
-pub trait Reviewer {
+pub trait Reviewer: Send {
     fn approve(&self, task: &TaskManifest, result: &TaskResult) -> bool;
 }
 
-impl<F: Fn(&TaskManifest, &TaskResult) -> bool> Reviewer for F {
+impl<F: Fn(&TaskManifest, &TaskResult) -> bool + Send> Reviewer for F {
     fn approve(&self, task: &TaskManifest, result: &TaskResult) -> bool {
         self(task, result)
     }
@@ -46,12 +47,14 @@ pub struct Runner<Q, H, S, R> {
     pub lease: Duration,
     /// Task ids already refused, so a bad task is logged once rather than every tick.
     refused: HashSet<String>,
+    /// Id of the task currently leased, shared with the daemon's heartbeat task.
+    pub current_lease: Arc<Mutex<Option<String>>>,
 }
 
 #[allow(clippy::too_many_arguments)]
 impl<Q: QueueClient, H: Harness, S: Sandbox, R: Reviewer> Runner<Q, H, S, R> {
     pub fn new(policy: Policy, trusted: TrustedProjects, key: SigningKey, queue: Q, harness: H, sandbox: S, reviewer: R, audit: AuditLog) -> Self {
-        Self { policy, trusted, key, queue, harness, sandbox, reviewer, audit, lease: Duration::from_secs(900), refused: HashSet::new() }
+        Self { policy, trusted, key, queue, harness, sandbox, reviewer, audit, lease: Duration::from_secs(900), refused: HashSet::new(), current_lease: Arc::default() }
     }
 
     pub fn runner_id(&self) -> String {
@@ -90,6 +93,18 @@ impl<Q: QueueClient, H: Harness, S: Sandbox, R: Reviewer> Runner<Q, H, S, R> {
             return Ok(Tick::Idle); // lost the race; try again next tick
         }
 
+        *self.current_lease.lock().unwrap() = Some(task.id.clone());
+        let out = self.run_claimed(task, &id, now);
+        *self.current_lease.lock().unwrap() = None;
+        if let Ok(Tick::Dropped(t)) = &out {
+            // Never retry a task this runner already aborted or failed: it would burn tokens in a loop.
+            self.refused.insert(t.clone());
+        }
+        out
+    }
+
+    fn run_claimed(&mut self, task: TaskManifest, id: &str, now: DateTime<Local>) -> Result<Tick> {
+        let id = id.to_string();
         // 4-7. Sandboxed run under the usage meter, then package.
         let mut meter = UsageMeter::new(task.cost_estimate, self.policy.abort_margin_pct);
         let ws = self.sandbox.create(&task, &task.sandbox_profile)?;

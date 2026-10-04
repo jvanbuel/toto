@@ -5,6 +5,8 @@
 //! lifecycle runs and is tested offline.
 
 pub mod audit;
+pub mod config;
+pub mod daemon;
 pub mod harness;
 pub mod manifest;
 pub mod meter;
@@ -13,6 +15,7 @@ pub mod queue;
 pub mod result;
 pub mod runner;
 pub mod sandbox;
+pub mod service;
 
 use thiserror::Error;
 

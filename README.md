@@ -26,3 +26,16 @@ gVisor needs a runtime registered that disables its own networking, because the 
 - Docker, `/etc/docker/daemon.json`: `{"runtimes":{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--network=none"]}}}`
 - Podman 4.x ignores runtime arguments in `containers.conf`; register a wrapper script that runs `runsc --network=none "$@"` instead.
 - Nested VMs (such as cloud dev containers) have no KVM and gVisor's default `systrap` platform hung there; add `--platform=ptrace` (slower, but works). On bare metal keep the default.
+
+## Running the daemon
+
+```
+togra init                  # creates ~/.config/togra with a runner key and a strict starter config
+$EDITOR ~/.config/togra/config.json   # add trusted projects, allowed kinds, shares, pick a sandbox
+togra install-service       # writes a systemd/launchd user unit; prints the command to enable it
+togra status                # reads <state_dir>/status.json
+```
+
+Pick the sandbox in `config.json`: `{"kind":"docker","image":"alpine"}` (add `"runtime":"runsc"` for gVisor, `"bin":"podman"` for Podman), `{"kind":"bwrap"}` (Linux, no daemon or image), or `{"kind":"dir"}` (no isolation; development only). The daemon probes the sandbox at startup and refuses to run if it does not work. It also refuses `review_before_submit`, which needs the TUI.
+
+Until the HTTP coordinator exists, the queue is a spool directory (`queue_dir`: `tasks/`, `leases/`, `results/`), and the harness is an echo placeholder until Omnigent is wired in.
