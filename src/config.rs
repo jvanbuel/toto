@@ -143,6 +143,7 @@ impl Config {
                 allow_skills: false,
                 allowed_mcp_hosts: vec![],
                 max_context_bytes: 64 * 1024,
+                max_input_bytes: 64 * 1024 * 1024,
             },
             projects: BTreeMap::new(),
         }

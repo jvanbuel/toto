@@ -14,6 +14,8 @@ pub trait QueueClient: Send + Sync {
     fn heartbeat(&self, task_id: &str, runner_id: &str, lease: Duration) -> Result<()>;
     /// Idempotent per (task, runner): resubmitting the same result is not an error.
     fn submit(&self, result: &TaskResult) -> Result<()>;
+    /// The input bundle with this SHA-256 (hex), if the queue has it.
+    fn bundle(&self, hash: &str) -> Result<Option<Vec<u8>>>;
     /// Gives a lease back without a result (rejected or aborted tasks).
     fn release(&self, task_id: &str, runner_id: &str) -> Result<()>;
 }
@@ -34,6 +36,9 @@ impl<T: QueueClient + ?Sized> QueueClient for std::sync::Arc<T> {
     fn release(&self, task_id: &str, runner_id: &str) -> Result<()> {
         (**self).release(task_id, runner_id)
     }
+    fn bundle(&self, hash: &str) -> Result<Option<Vec<u8>>> {
+        (**self).bundle(hash)
+    }
 }
 
 /// In-process queue for the demo and tests; mirrors the lease semantics of the real server.
@@ -47,11 +52,19 @@ struct State {
     tasks: Vec<TaskManifest>,
     leases: HashMap<String, (String, Instant)>,
     results: HashMap<(String, String), TaskResult>,
+    bundles: HashMap<String, Vec<u8>>,
 }
 
 impl InMemoryQueue {
     pub fn post(&self, t: TaskManifest) {
         self.state.lock().unwrap().tasks.push(t);
+    }
+
+    /// Stores an input bundle and returns its hash for the manifest's `inputs`.
+    pub fn post_bundle(&self, bytes: Vec<u8>) -> String {
+        let h = crate::archive::sha256_hex(&bytes);
+        self.state.lock().unwrap().bundles.insert(h.clone(), bytes);
+        h
     }
 
     pub fn results(&self) -> Vec<TaskResult> {
@@ -106,6 +119,10 @@ impl QueueClient for InMemoryQueue {
         }
         Ok(())
     }
+
+    fn bundle(&self, hash: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.state.lock().unwrap().bundles.get(hash).cloned())
+    }
 }
 
 /// File-spool queue: a directory the daemon polls. Lets the daemon run end to end before the
@@ -133,7 +150,7 @@ fn valid_id(id: &str) -> Result<()> {
 impl DirQueue {
     pub fn new(root: impl Into<std::path::PathBuf>) -> Result<Self> {
         let root = root.into();
-        for d in ["tasks", "leases", "results"] {
+        for d in ["tasks", "leases", "results", "bundles"] {
             std::fs::create_dir_all(root.join(d))?;
         }
         Ok(Self { root })
@@ -142,6 +159,13 @@ impl DirQueue {
     pub fn post(&self, t: &TaskManifest) -> Result<()> {
         valid_id(&t.id)?;
         write_atomic(&self.root.join("tasks").join(format!("{}.json", t.id)), &serde_json::to_vec_pretty(t)?)
+    }
+
+    /// Stores an input bundle as `bundles/<sha256>` and returns the hash.
+    pub fn post_bundle(&self, bytes: &[u8]) -> Result<String> {
+        let h = crate::archive::sha256_hex(bytes);
+        write_atomic(&self.root.join("bundles").join(&h), bytes)?;
+        Ok(h)
     }
 
     pub fn results(&self) -> Result<Vec<TaskResult>> {
@@ -243,5 +267,16 @@ impl QueueClient for DirQueue {
             let _ = std::fs::remove_file(self.lease_path(task_id));
         }
         Ok(())
+    }
+
+    fn bundle(&self, hash: &str) -> Result<Option<Vec<u8>>> {
+        if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(Error::Queue(format!("invalid bundle hash `{hash}`")));
+        }
+        match std::fs::read(self.root.join("bundles").join(hash)) {
+            Ok(b) => Ok(Some(b)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 }

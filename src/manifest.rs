@@ -27,6 +27,13 @@ pub struct OutputSchema {
     /// `text` or `json`.
     pub format: String,
     pub max_bytes: usize,
+    /// Most bytes of changed files the task may return as artifacts; 0 means none are collected.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_artifact_bytes: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// MCP server name the runner reserves for its own exec bridge; projects cannot use it.

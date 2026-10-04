@@ -43,7 +43,17 @@ enum Cmd {
         key: PathBuf,
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Directory to pack as the task's input bundle (sets `inputs` to its hash).
+        #[arg(long)]
+        bundle: Option<PathBuf>,
         task: PathBuf,
+    },
+    /// Write a result's artifacts (changed files) into a new directory and list deletions.
+    ExtractResult {
+        /// A result file from `<queue_dir>/results/`.
+        result: PathBuf,
+        /// Directory to create.
+        out: PathBuf,
     },
     /// Sign in the daemon's Claude subscription: runs `claude setup-token`, then stores the token.
     Login {
@@ -124,12 +134,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             fs::set_permissions(&out, fs::Permissions::from_mode(0o600))?;
             println!("public key: {}", hex::encode(key.verifying_key().to_bytes()));
         }
-        Cmd::PostTask { key, config, task } => {
+        Cmd::ExtractResult { result, out } => {
+            let r: togra::result::TaskResult = serde_json::from_slice(&fs::read(&result)?)?;
+            r.verify()?;
+            let records = r.artifact_records(1 << 30)?;
+            if records.is_empty() {
+                println!("no artifacts in this result (signature ok)");
+            }
+            togra::archive::unpack_to(&out, &records)?;
+            for rec in &records {
+                match rec {
+                    togra::archive::Record::File { path, data, .. } => println!("file    {path} ({} bytes)", data.len()),
+                    togra::archive::Record::Deleted { path } => println!("deleted {path}"),
+                }
+            }
+        }
+        Cmd::PostTask { key, config, bundle, task } => {
             let cfg = togra::config::Config::load(&config_path(config))?;
             let seed: [u8; 32] = hex::decode(fs::read_to_string(&key)?.trim()).ok().and_then(|b| b.try_into().ok()).ok_or("project key must be a 32-byte hex seed")?;
-            let manifest: TaskManifest = serde_json::from_slice(&fs::read(&task)?)?;
+            let mut manifest: TaskManifest = serde_json::from_slice(&fs::read(&task)?)?;
+            let queue = togra::queue::DirQueue::new(&cfg.queue_dir)?;
+            if let Some(dir) = bundle {
+                let records = togra::archive::pack_dir(&dir, togra::archive::Limits::new(cfg.policy.max_input_bytes))?;
+                manifest.inputs = queue.post_bundle(&togra::archive::to_bytes(&records)?)?;
+                println!("bundled {} files from {} as {}", records.len(), dir.display(), manifest.inputs);
+            }
             let signed = manifest.sign(&ed25519_dalek::SigningKey::from_bytes(&seed))?;
-            togra::queue::DirQueue::new(&cfg.queue_dir)?.post(&signed)?;
+            queue.post(&signed)?;
             println!("posted {} to {}", signed.id, cfg.queue_dir.display());
         }
         Cmd::Login { config } => {
@@ -196,6 +227,7 @@ fn demo() -> Result<(), Box<dyn std::error::Error>> {
         allow_skills: false,
         allowed_mcp_hosts: vec![],
         max_context_bytes: 64 * 1024,
+                max_input_bytes: 64 * 1024 * 1024,
     };
     let queue = InMemoryQueue::default();
     queue.post(
@@ -208,7 +240,7 @@ fn demo() -> Result<(), Box<dyn std::error::Error>> {
             tool_requirements: vec!["echo".into()],
             sandbox_profile: SandboxProfile::default(),
             cost_estimate: 500,
-            output_schema: OutputSchema { format: "text".into(), max_bytes: 4096 },
+            output_schema: OutputSchema { format: "text".into(), max_bytes: 4096, max_artifact_bytes: 0 },
             redundancy: 1,
             context: Default::default(),
             signature: None,

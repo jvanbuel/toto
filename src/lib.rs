@@ -4,6 +4,7 @@
 //! external systems (queue server, Docker, Omnigent) sit behind traits so the full task
 //! lifecycle runs and is tested offline.
 
+pub mod archive;
 pub mod audit;
 pub mod claude_cli;
 pub mod config;

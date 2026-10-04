@@ -60,3 +60,12 @@ Contributors opt in per kind of context, deny by default, in the policy: `"allow
 ## Claude subscription harness
 
 `{"harness":{"kind":"claude"}}` (with a Docker/Podman sandbox and `bridge` set) runs each task with the official `claude` CLI on your own Claude subscription (ADR 11). Run `togra login` once: it runs `claude setup-token` and stores the token (mode 600) next to the daemon's state. The CLI gets a cleared environment, a dedicated config directory and no built-in tools; its only tools run inside the sandbox container. Not yet run against a real login. Anthropic's terms restrict third-party products from offering claude.ai login; see ADR 11 before relying on this.
+
+## Task inputs and outputs
+
+A task's `inputs` is the SHA-256 of an input bundle in the queue (`bundles/<hash>`); all zeros means no inputs. The bundle is a togra archive (regular files and deletions only, validated paths, size limits; see `src/archive.rs`). The runner checks the hash against the signed manifest, enforces `max_input_bytes` from policy, and unpacks it into the sandbox workspace (inside the container via the bridge's `unpack` command, so the image needs no `tar`). If the task's `output_schema.max_artifact_bytes` is greater than zero, files the agent changed, added or deleted come back in the signed result as artifacts, capped at that size.
+
+```
+togra post-task --key pilot.key --bundle ./repo task.json     # pack ./repo as the inputs
+togra extract-result <queue>/results/<id>.<runner>.json ./out  # verify and write the changed files
+```

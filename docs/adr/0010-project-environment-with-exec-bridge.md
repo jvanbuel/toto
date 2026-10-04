@@ -27,10 +27,12 @@ What stays fixed whatever a project declares: no credentials in the container, n
 - Omnigent's own `RunnerMcpManager` launched `docker exec -i ... /togra/mcp-exec` from a parsed agent spec, listed its four tools and executed a call inside the container; nothing was written on the host.
 - A spec without `os_env` leaves the CLI in no-native-tools mode.
 
+- Task inputs and outputs (2026-10-04): the bridge also has `unpack` and `collect` commands. An input archive is hash-checked on the host, then unpacked by the bridge as the unprivileged user into `/workspace`; after the run, `collect` returns files changed, added or deleted against a baseline taken at unpack time. Verified in a live container, including that symlinks are never collected, caps are enforced inside the container, and malformed archives are refused.
+
 ## Not yet verified
 
 - A real model using the tools through Claude Code (needs a login).
-- Project-declared images, in-container stdio MCP servers and skills placed in the container; task input bundles reaching `/workspace`.
+- Project-declared images, in-container stdio MCP servers and skills placed in the container.
 - Windows: relies on Docker Desktop's VM.
 
 ## Consequences

@@ -733,6 +733,7 @@ dependencies = [
 name = "togra"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
  "clap",
  "ed25519-dalek",

@@ -18,6 +18,40 @@ pub trait Sandbox: Send {
     /// Creates an environment honouring `profile` and returns the host-visible workspace path.
     fn create(&self, task: &TaskManifest, profile: &SandboxProfile) -> Result<Workspace>;
     fn destroy(&self, ws: Workspace) -> Result<()>;
+
+    /// Unpacks a verified input archive into the task workspace and records a baseline so the
+    /// task's changes can be collected afterwards. Default: host-path workspaces.
+    fn put_inputs(&self, ws: &Workspace, bundle: &[u8], max_bytes: u64) -> Result<()> {
+        host_put_inputs(ws, bundle, max_bytes)
+    }
+
+    /// Archive (togra format) of files changed, added or deleted since `put_inputs`, at most
+    /// `max_bytes` of content.
+    fn collect_outputs(&self, ws: &Workspace, max_bytes: u64) -> Result<Vec<u8>> {
+        host_collect_outputs(ws, max_bytes)
+    }
+}
+
+fn baseline_path(ws: &Workspace) -> Result<PathBuf> {
+    let name = ws.path.file_name().ok_or_else(|| Error::Sandbox("this sandbox has no host workspace to carry inputs".into()))?;
+    Ok(ws.path.with_file_name(format!("{}.baseline.json", name.to_string_lossy())))
+}
+
+fn host_put_inputs(ws: &Workspace, bundle: &[u8], max_bytes: u64) -> Result<()> {
+    let records = crate::archive::from_bytes(bundle, crate::archive::Limits::new(max_bytes)).map_err(Error::Sandbox)?;
+    crate::archive::unpack_to(&ws.path, &records).map_err(Error::Sandbox)?;
+    let base = crate::archive::baseline(&ws.path, 100_000).map_err(Error::Sandbox)?;
+    std::fs::write(baseline_path(ws)?, serde_json::to_vec(&base)?)?;
+    Ok(())
+}
+
+fn host_collect_outputs(ws: &Workspace, max_bytes: u64) -> Result<Vec<u8>> {
+    let base = match std::fs::read(baseline_path(ws)?) {
+        Ok(b) => serde_json::from_slice(&b)?,
+        Err(_) => Default::default(),
+    };
+    let changes = crate::archive::changes_since(&ws.path, &base, crate::archive::Limits::new(max_bytes)).map_err(Error::Sandbox)?;
+    crate::archive::to_bytes(&changes).map_err(Error::Sandbox)
 }
 
 impl<T: Sandbox + ?Sized> Sandbox for Box<T> {
@@ -29,6 +63,12 @@ impl<T: Sandbox + ?Sized> Sandbox for Box<T> {
     }
     fn destroy(&self, ws: Workspace) -> Result<()> {
         (**self).destroy(ws)
+    }
+    fn put_inputs(&self, ws: &Workspace, bundle: &[u8], max_bytes: u64) -> Result<()> {
+        (**self).put_inputs(ws, bundle, max_bytes)
+    }
+    fn collect_outputs(&self, ws: &Workspace, max_bytes: u64) -> Result<Vec<u8>> {
+        (**self).collect_outputs(ws, max_bytes)
     }
 }
 
@@ -71,6 +111,9 @@ impl Sandbox for DirSandbox {
     }
 
     fn destroy(&self, ws: Workspace) -> Result<()> {
+        if let Ok(b) = baseline_path(&ws) {
+            let _ = std::fs::remove_file(b);
+        }
         std::fs::remove_dir_all(ws.path)?;
         Ok(())
     }
@@ -163,6 +206,31 @@ impl Sandbox for DockerSandbox {
         Ok(Workspace { task_id: task.id.clone(), path: PathBuf::new(), exec_prefix, bridge: self.bridge.is_some() })
     }
 
+    fn put_inputs(&self, ws: &Workspace, bundle: &[u8], _max_bytes: u64) -> Result<()> {
+        let mut argv = ws.bridge_argv().ok_or_else(|| Error::Sandbox("inputs need the exec bridge in a container sandbox".into()))?;
+        argv.push("unpack".into());
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let out = exec_io(&Workspace { exec_prefix: vec![], ..clone_ws(ws) }, &refs, Some(bundle), Duration::from_secs(300), 64 * 1024)?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(Error::Sandbox(format!("unpacking inputs failed: {}", String::from_utf8_lossy(&out.stderr).trim())))
+        }
+    }
+
+    fn collect_outputs(&self, ws: &Workspace, max_bytes: u64) -> Result<Vec<u8>> {
+        let mut argv = ws.bridge_argv().ok_or_else(|| Error::Sandbox("outputs need the exec bridge in a container sandbox".into()))?;
+        argv.extend(["collect".into(), max_bytes.to_string()]);
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let cap = (max_bytes as usize).saturating_mul(2).saturating_add(64 * 1024);
+        let out = exec_io(&Workspace { exec_prefix: vec![], ..clone_ws(ws) }, &refs, None, Duration::from_secs(300), cap)?;
+        if out.status.success() {
+            Ok(out.stdout)
+        } else {
+            Err(Error::Sandbox(format!("collecting outputs failed: {}", String::from_utf8_lossy(&out.stderr).trim())))
+        }
+    }
+
     fn destroy(&self, ws: Workspace) -> Result<()> {
         // `--rm` removes it once stopped; `-t 0` kills immediately. Ignore "already gone".
         let _ = self.docker(&["stop".into(), "-t".into(), "0".into(), Self::container_name(&ws.task_id)]);
@@ -170,26 +238,43 @@ impl Sandbox for DockerSandbox {
     }
 }
 
+fn clone_ws(ws: &Workspace) -> Workspace {
+    Workspace { task_id: ws.task_id.clone(), path: ws.path.clone(), exec_prefix: ws.exec_prefix.clone(), bridge: ws.bridge }
+}
+
 /// Runs `argv` inside the sandbox (prefixed by `ws.exec_prefix`) and kills it at `timeout`.
 /// Harnesses use this so a hung tool can never stall the runner past its deadline.
 pub fn exec(ws: &Workspace, argv: &[&str], timeout: Duration) -> Result<Output> {
-    use std::io::Read;
+    exec_io(ws, argv, None, timeout, usize::MAX)
+}
+
+/// Like `exec`, feeding `input` to stdin and keeping at most `max_out` bytes of stdout.
+pub fn exec_io(ws: &Workspace, argv: &[&str], input: Option<&[u8]>, timeout: Duration, max_out: usize) -> Result<Output> {
+    use std::io::{Read, Write};
     let (prog, args): (&str, Vec<&str>) = match ws.exec_prefix.split_first() {
         Some((p, rest)) => (p, rest.iter().map(String::as_str).chain(argv.iter().copied()).collect()),
         None => (argv[0], argv[1..].to_vec()),
     };
     let mut cmd = Command::new(prog);
-    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    if ws.exec_prefix.is_empty() {
+    cmd.args(args).stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if ws.exec_prefix.is_empty() && !ws.path.as_os_str().is_empty() {
         cmd.current_dir(&ws.path);
     }
     let mut child = cmd.spawn()?;
-    let drain = |mut r: Box<dyn Read + Send>| std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = r.read_to_end(&mut b);
-        b
+    let writer = input.map(|data| {
+        let (mut stdin, data) = (child.stdin.take().unwrap(), data.to_vec());
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&data); // closing stdin (drop) signals end of input
+        })
     });
-    let (out, err) = (drain(Box::new(child.stdout.take().unwrap())), drain(Box::new(child.stderr.take().unwrap())));
+    let drain = |r: Box<dyn Read + Send>, cap: usize| {
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = r.take((cap as u64).saturating_add(1)).read_to_end(&mut b);
+            b
+        })
+    };
+    let (out, err) = (drain(Box::new(child.stdout.take().unwrap()), max_out), drain(Box::new(child.stderr.take().unwrap()), 1 << 20));
     let deadline = Instant::now() + timeout;
     let status = loop {
         if let Some(s) = child.try_wait()? {
@@ -202,7 +287,14 @@ pub fn exec(ws: &Workspace, argv: &[&str], timeout: Duration) -> Result<Output> 
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    Ok(Output { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() })
+    if let Some(w) = writer {
+        let _ = w.join();
+    }
+    let stdout = out.join().unwrap_or_default();
+    if stdout.len() > max_out {
+        return Err(Error::Sandbox(format!("output exceeds {max_out} bytes")));
+    }
+    Ok(Output { status, stdout, stderr: err.join().unwrap_or_default() })
 }
 
 /// bubblewrap sandbox (Linux): no daemon or image needed. Each exec is a fresh `bwrap` with
@@ -274,6 +366,9 @@ impl Sandbox for BwrapSandbox {
     }
 
     fn destroy(&self, ws: Workspace) -> Result<()> {
+        if let Ok(b) = baseline_path(&ws) {
+            let _ = std::fs::remove_file(b);
+        }
         let _ = std::fs::remove_dir_all(ws.path);
         Ok(())
     }

@@ -4,9 +4,19 @@
   "kind": "summarise",
   "inputs": "0000000000000000000000000000000000000000000000000000000000000000",
   "prompt": "Using your tools, write a file /workspace/hello.txt containing the single line 'hello from the sandbox'. Then read it back, run `id -u` and `ls /home`, and tell me exactly what each command printed.",
-  "tool_requirements": ["claude"],
-  "sandbox_profile": {"cpu_millis": 1000, "memory_mb": 1024, "timeout_secs": 300},
+  "tool_requirements": [
+    "claude"
+  ],
+  "sandbox_profile": {
+    "cpu_millis": 1000,
+    "memory_mb": 1024,
+    "timeout_secs": 300
+  },
   "cost_estimate": 20000,
-  "output_schema": {"format": "text", "max_bytes": 8192},
+  "output_schema": {
+    "format": "text",
+    "max_bytes": 8192,
+    "max_artifact_bytes": 65536
+  },
   "redundancy": 1
 }

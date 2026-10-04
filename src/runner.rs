@@ -104,14 +104,45 @@ impl<Q: QueueClient, H: Harness, S: Sandbox, R: Reviewer> Runner<Q, H, S, R> {
         out
     }
 
+    /// Fetches the task's input bundle, checks it against the signed hash and unpacks it into the
+    /// workspace. An all-zero hash means the task has no inputs.
+    fn prepare_inputs(&self, task: &TaskManifest, ws: &crate::sandbox::Workspace) -> Result<()> {
+        if task.inputs.len() != 64 || !task.inputs.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(Error::Verify("inputs must be a 64-character hex SHA-256".into()));
+        }
+        if task.inputs.chars().all(|c| c == '0') {
+            return Ok(());
+        }
+        let bundle = self.queue.bundle(&task.inputs)?.ok_or_else(|| Error::Queue("input bundle not available".into()))?;
+        if bundle.len() as u64 > self.policy.max_input_bytes {
+            return Err(Error::Policy(format!("input bundle is {} bytes, limit {}", bundle.len(), self.policy.max_input_bytes)));
+        }
+        if crate::archive::sha256_hex(&bundle) != task.inputs {
+            return Err(Error::Verify("input bundle does not match the signed hash".into()));
+        }
+        self.sandbox.put_inputs(ws, &bundle, self.policy.max_input_bytes)
+    }
+
+    /// Changed files as an archive, only when the task's schema allows artifacts and there are any.
+    fn collect_artifacts(&self, task: &TaskManifest, ws: &crate::sandbox::Workspace) -> Result<Option<Vec<u8>>> {
+        let max = task.output_schema.max_artifact_bytes;
+        if max == 0 {
+            return Ok(None);
+        }
+        let bytes = self.sandbox.collect_outputs(ws, max)?;
+        let any = !crate::archive::from_bytes(&bytes, crate::archive::Limits::new(max)).map_err(Error::Sandbox)?.is_empty();
+        Ok(any.then_some(bytes))
+    }
+
     fn run_claimed(&mut self, task: TaskManifest, id: &str, now: DateTime<Local>) -> Result<Tick> {
         let id = id.to_string();
         // 4-7. Sandboxed run under the usage meter, then package.
         let mut meter = UsageMeter::new(task.cost_estimate, self.policy.abort_margin_pct);
         let ws = self.sandbox.create(&task, &task.sandbox_profile)?;
-        let run = self.harness.run(&task, &ws, &mut meter);
+        let run = self.prepare_inputs(&task, &ws).and_then(|_| self.harness.run(&task, &ws, &mut meter));
+        let artifacts = if run.is_ok() { self.collect_artifacts(&task, &ws) } else { Ok(None) };
         self.sandbox.destroy(ws)?;
-        let packaged = run.and_then(|out| TaskResult::package(&task.id, out, meter.used(), &task.output_schema, &self.key));
+        let packaged = run.and_then(|out| TaskResult::package(&task.id, out, meter.used(), &task.output_schema, &self.key, artifacts?));
         let result = match packaged {
             Ok(r) => r,
             Err(e) => {

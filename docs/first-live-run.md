@@ -54,9 +54,21 @@ togra audit ~/.config/togra/state/audit.jsonl
 
 `run --once` first probes the sandbox (Docker reachable, image present) and the harness (token file, `claude --version`), then processes the queue and exits.
 
+## Optional: a task with inputs
+
+`--bundle` packs a directory into the task's input bundle (unpacked into `/workspace` inside the container, hash-checked first):
+
+```
+mkdir -p /tmp/proj && printf 'def add(a, b):\n    return a - b\n' > /tmp/proj/calc.py
+# edit docs/examples/hello-task.json: id "live-2", prompt "Fix the bug in /workspace/calc.py", then:
+togra post-task --key ./pilot.key --bundle /tmp/proj docs/examples/hello-task.json
+togra run --once
+togra extract-result ~/.config/togra/queue/results/live-2.*.json ./fixed   # ./fixed/calc.py is the fixed file
+```
+
 ## What to look for
 
-Success: `Submitted("live-1")`; the audit line shows `submitted` and a plausible `tokens=` figure; the result in `~/.config/togra/queue/results/` has an `output` that reports `hello from the sandbox`, `65534` for `id -u`, and an error or empty listing for `ls /home`.
+Success: `Submitted("live-1")`; `togra extract-result ~/.config/togra/queue/results/live-1.*.json ./out` lists `file    hello.txt (...)` and `out/hello.txt` contains the line (the task's changed files come back as signed artifacts); the audit line shows `submitted` and a plausible `tokens=` figure; the result in `~/.config/togra/queue/results/` has an `output` that reports `hello from the sandbox`, `65534` for `id -u`, and an error or empty listing for `ls /home`.
 
 Things this run is meant to settle (note what you see):
 

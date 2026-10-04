@@ -6,6 +6,9 @@
 //! Build static for any Linux image: `cargo build --release --target x86_64-unknown-linux-musl
 //! --bin togra-mcp-exec`.
 
+#[path = "../archive.rs"]
+mod archive;
+
 use serde_json::{json, Value};
 use std::io::{BufRead, Read, Write};
 use std::process::{Command, Stdio};
@@ -107,6 +110,13 @@ fn call(name: &str, a: &Value) -> Result<String, String> {
     }
 }
 
+fn exit_with(r: Result<(), String>) {
+    if let Err(e) = r {
+        eprintln!("togra-mcp-exec: {e}");
+        std::process::exit(1);
+    }
+}
+
 fn handle(req: &Value) -> Option<Value> {
     let id = req.get("id")?.clone(); // notifications have no id and get no reply
     let reply = |r: Result<Value, (i64, String)>| match r {
@@ -134,7 +144,36 @@ fn handle(req: &Value) -> Option<Value> {
     }))
 }
 
+const WORKSPACE: &str = "/workspace";
+const BASELINE: &str = "/tmp/.togra-baseline.json";
+const MAX_INPUT: u64 = 1 << 30; // the tmpfs size is the real limit; this only bounds memory
+
+/// `unpack`: read an archive from stdin into /workspace and remember a content baseline so
+/// `collect` can report what the agent changed.
+fn unpack_cmd() -> Result<(), String> {
+    let records = archive::read_records(&mut std::io::BufReader::new(std::io::stdin().lock()), archive::Limits::new(MAX_INPUT))?;
+    archive::unpack_to(std::path::Path::new(WORKSPACE), &records)?;
+    let base = archive::baseline(std::path::Path::new(WORKSPACE), 100_000)?;
+    std::fs::write(BASELINE, serde_json::to_vec(&base).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
+/// `collect <max_bytes>`: write an archive of files changed, added or deleted since `unpack`.
+fn collect_cmd(max_bytes: u64) -> Result<(), String> {
+    let base: std::collections::BTreeMap<String, String> = match std::fs::read(BASELINE) {
+        Ok(b) => serde_json::from_slice(&b).map_err(|e| e.to_string())?,
+        Err(_) => Default::default(), // nothing was unpacked: everything in /workspace is new
+    };
+    let changes = archive::changes_since(std::path::Path::new(WORKSPACE), &base, archive::Limits::new(max_bytes))?;
+    archive::write_records(&mut std::io::stdout().lock(), &changes)
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("unpack") => return exit_with(unpack_cmd()),
+        Some("collect") => return exit_with(collect_cmd(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0))),
+        _ => {}
+    }
     let (stdin, mut stdout) = (std::io::stdin(), std::io::stdout());
     for line in stdin.lock().lines().map_while(Result::ok) {
         if line.trim().is_empty() {

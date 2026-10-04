@@ -13,7 +13,7 @@ fn task(id: &str, project: &str, cost: u64, key: &SigningKey) -> TaskManifest {
     TaskManifest {
         id: id.into(), project_id: project.into(), kind: "summarise".into(), inputs: "0".repeat(64),
         prompt: "hi".into(), tool_requirements: vec!["echo".into()], sandbox_profile: SandboxProfile::default(),
-        cost_estimate: cost, output_schema: OutputSchema { format: "text".into(), max_bytes: 100 }, redundancy: 1, context: Default::default(), signature: None,
+        cost_estimate: cost, output_schema: OutputSchema { format: "text".into(), max_bytes: 100, max_artifact_bytes: 0 }, redundancy: 1, context: Default::default(), signature: None,
     }
     .sign(key)
     .unwrap()
@@ -24,7 +24,7 @@ fn policy() -> Policy {
         daily_token_cap: 1000, project_shares: BTreeMap::from([("a".into(), 1), ("b".into(), 1)]),
         allowed_kinds: vec!["summarise".into()], quiet_hours: None, review_before_submit: false,
         max_profile: SandboxProfile::default(), abort_margin_pct: 25, available_tools: vec!["echo".into()],
-        allow_skills: false, allowed_mcp_hosts: vec![], max_context_bytes: 64 * 1024,
+        allow_skills: false, allowed_mcp_hosts: vec![], max_context_bytes: 64 * 1024, max_input_bytes: 64 * 1024 * 1024,
     }
 }
 
@@ -920,5 +920,270 @@ mod claude_cli {
         assert!(c.build().is_err(), "bwrap has no bridge");
         c.sandbox = crate::config::SandboxConfig::Docker { bin: "docker".into(), image: "alpine".into(), runtime: None, bridge: Some("/x".into()) };
         assert!(c.build().is_ok());
+    }
+}
+
+mod io_artifacts {
+    use super::{fixture, policy, task};
+    use crate::archive::{self, Limits, Record};
+    use crate::audit::AuditLog;
+    use crate::harness::Harness;
+    use crate::manifest::*;
+    use crate::meter::UsageMeter;
+    use crate::queue::{DirQueue, InMemoryQueue, QueueClient};
+    use crate::runner::{Runner, Tick};
+    use crate::sandbox::{DirSandbox, DockerSandbox, Sandbox, Workspace};
+    use chrono::Local;
+    use ed25519_dalek::SigningKey;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    fn path_of(r: &Record) -> String {
+        match r {
+            Record::File { path, .. } | Record::Deleted { path } => path.clone(),
+        }
+    }
+
+    fn file(path: &str, data: &str) -> Record {
+        Record::File { path: path.into(), mode: 0o644, data: data.as_bytes().to_vec() }
+    }
+
+    fn bundle(records: &[Record]) -> Vec<u8> {
+        archive::to_bytes(records).unwrap()
+    }
+
+    #[test]
+    fn archive_roundtrip_and_modes() {
+        let f = fixture("arch-rt");
+        let src = f.dir.join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), "A").unwrap();
+        std::fs::write(src.join("sub/run.sh"), "#!/bin/sh").unwrap();
+        std::fs::set_permissions(src.join("sub/run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", src.join("link")).unwrap(); // must be ignored
+        let recs = archive::pack_dir(&src, Limits::new(1 << 20)).unwrap();
+        assert_eq!(recs.len(), 2, "symlink ignored: {recs:?}");
+        let again = archive::from_bytes(&bundle(&recs), Limits::new(1 << 20)).unwrap();
+        assert_eq!(recs, again);
+        let dst = f.dir.join("dst");
+        archive::unpack_to(&dst, &again).unwrap();
+        assert_eq!(archive::baseline(&src, 100).unwrap(), archive::baseline(&dst, 100).unwrap());
+        assert!(std::fs::metadata(dst.join("sub/run.sh")).unwrap().permissions().mode() & 0o111 != 0, "exec bit kept");
+    }
+
+    #[test]
+    fn archive_rejects_hostile_input() {
+        let lim = Limits::new(1000);
+        for p in ["../x", "/abs", "a/../b", "a//b", "", "a/./b", "a\\b"] {
+            assert!(!archive::valid_path(p), "{p:?}");
+        }
+        assert!(archive::from_bytes(&bundle(&[file("../escape", "x")]), lim).is_err());
+        assert!(archive::from_bytes(b"{\"t\":\"file\",\"path\":\"a\",\"size\":5}\nabc", lim).is_err(), "truncated data");
+        assert!(archive::from_bytes(b"{\"t\":\"file\",\"path\":\"a\",\"size\":1}\nx", lim).is_err(), "missing end marker");
+        assert!(archive::from_bytes(b"{\"t\":\"symlink\",\"path\":\"a\"}\n{\"t\":\"end\"}\n", lim).is_err(), "unknown record type");
+        let huge = b"{\"t\":\"file\",\"path\":\"a\",\"size\":999999999999999}\n";
+        assert!(archive::from_bytes(huge, lim).is_err(), "size claim is checked before allocating");
+        assert!(archive::from_bytes(&bundle(&[file("a", &"x".repeat(600)), file("b", &"x".repeat(600))]), lim).is_err(), "total limit");
+    }
+
+    #[test]
+    fn unpack_will_not_write_through_a_symlink() {
+        let f = fixture("arch-link");
+        let (root, outside) = (f.dir.join("root"), f.dir.join("outside"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        assert!(archive::unpack_to(&root, &[file("link/pwned.txt", "x")]).is_err());
+        assert!(!outside.join("pwned.txt").exists());
+    }
+
+    #[test]
+    fn changes_report_modified_new_and_deleted_only() {
+        let f = fixture("arch-chg");
+        let root = f.dir.join("w");
+        archive::unpack_to(&root, &[file("keep.txt", "k"), file("mod.txt", "1"), file("gone.txt", "g")]).unwrap();
+        let base = archive::baseline(&root, 100).unwrap();
+        std::fs::write(root.join("mod.txt"), "2").unwrap();
+        std::fs::write(root.join("new.txt"), "n").unwrap();
+        std::fs::remove_file(root.join("gone.txt")).unwrap();
+        let mut ch = archive::changes_since(&root, &base, Limits::new(100)).unwrap();
+        ch.sort_by_key(path_of);
+        assert_eq!(ch, vec![Record::Deleted { path: "gone.txt".into() }, file("mod.txt", "2"), file("new.txt", "n")]);
+        assert!(archive::changes_since(&root, &base, Limits::new(1)).is_err(), "artifact cap enforced");
+    }
+
+    /// Reads and edits the workspace like an agent would.
+    struct EditHarness;
+    impl Harness for EditHarness {
+        fn run(&self, _t: &TaskManifest, ws: &Workspace, meter: &mut UsageMeter) -> crate::Result<String> {
+            meter.record(1)?;
+            let a = std::fs::read_to_string(ws.path.join("src/a.txt")).map_err(|e| crate::Error::Harness(e.to_string()))?;
+            std::fs::write(ws.path.join("src/a.txt"), format!("{a}+edited"))?;
+            std::fs::remove_file(ws.path.join("old.txt"))?;
+            std::fs::write(ws.path.join("new.txt"), "created")?;
+            Ok(format!("saw {a}"))
+        }
+    }
+
+    type R = Runner<std::sync::Arc<dyn QueueClient>, EditHarness, DirSandbox, fn(&TaskManifest, &crate::result::TaskResult) -> bool>;
+
+    fn runner(f: &super::Fixture, queue: std::sync::Arc<dyn QueueClient>, policy: crate::policy::Policy) -> R {
+        let mut trusted = TrustedProjects::default();
+        trusted.insert("a", f.key_a.verifying_key());
+        Runner::new(policy, trusted, crate::manifest::generate_key(), queue, EditHarness, DirSandbox { root: f.dir.join("work") }, |_, _| true, AuditLog::new(f.dir.join("audit.jsonl")))
+    }
+
+    fn job(f: &super::Fixture, inputs: &str, max_artifacts: u64) -> TaskManifest {
+        let mut t = task("t1", "a", 100, &f.key_a);
+        t.inputs = inputs.into();
+        t.output_schema.max_artifact_bytes = max_artifacts;
+        t.sign(&f.key_a).unwrap()
+    }
+
+    fn input_bundle() -> Vec<u8> {
+        bundle(&[file("src/a.txt", "A"), file("old.txt", "o")])
+    }
+
+    #[test]
+    fn inputs_in_artifacts_out_signed() {
+        let f = fixture("io-e2e");
+        let q = std::sync::Arc::new(InMemoryQueue::default());
+        let hash = q.post_bundle(input_bundle());
+        q.post(job(&f, &hash, 1 << 20));
+        let mut r = runner(&f, q.clone(), policy());
+        assert_eq!(r.tick(Local::now()).unwrap(), Tick::Submitted("t1".into()));
+        let res = q.results().remove(0);
+        assert_eq!(res.output, "saw A");
+        res.verify().unwrap();
+        let mut recs = res.artifact_records(1 << 20).unwrap();
+        recs.sort_by_key(path_of);
+        assert_eq!(recs, vec![file("new.txt", "created"), Record::Deleted { path: "old.txt".into() }, file("src/a.txt", "A+edited")]);
+        // Tampering with the artifacts or their hash breaks verification.
+        let mut t = res.clone();
+        t.artifacts = Some(base64_of(&bundle(&[file("evil.sh", "x")])));
+        assert!(t.verify().is_err());
+        let mut t = res.clone();
+        t.artifacts_hash = Some("0".repeat(64));
+        assert!(t.verify().is_err());
+        assert!(!f.dir.join("work/t1").exists() && !f.dir.join("work/t1.baseline.json").exists(), "workspace and baseline cleaned up");
+    }
+
+    fn base64_of(b: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(b)
+    }
+
+    #[test]
+    fn no_artifacts_unless_the_schema_allows_them() {
+        let f = fixture("io-noart");
+        let q = std::sync::Arc::new(InMemoryQueue::default());
+        let hash = q.post_bundle(input_bundle());
+        q.post(job(&f, &hash, 0));
+        let mut r = runner(&f, q.clone(), policy());
+        assert_eq!(r.tick(Local::now()).unwrap(), Tick::Submitted("t1".into()));
+        let res = q.results().remove(0);
+        assert!(res.artifacts.is_none() && res.artifacts_hash.is_none());
+        res.verify().unwrap();
+    }
+
+    #[test]
+    fn bad_inputs_fail_the_task_without_running_it() {
+        let f = fixture("io-bad");
+        let q = DirQueue::new(f.dir.join("q")).unwrap();
+        // 1. bundle stored under a hash it does not match
+        let genuine = input_bundle();
+        let hash = archive::sha256_hex(&genuine);
+        std::fs::write(f.dir.join("q/bundles").join(&hash), b"tampered").unwrap();
+        q.post(&job(&f, &hash, 1000)).unwrap();
+        let q: std::sync::Arc<dyn QueueClient> = std::sync::Arc::new(q);
+        let mut r = runner(&f, q.clone(), policy());
+        assert_eq!(r.tick(Local::now()).unwrap(), Tick::Dropped("t1".into()));
+        assert!(r.audit.entries().unwrap()[0].detail.contains("does not match"));
+
+        // 2. bundle missing
+        let f2 = fixture("io-missing");
+        let q2 = std::sync::Arc::new(InMemoryQueue::default());
+        q2.post(job(&f2, &"ab".repeat(32), 1000));
+        let mut r2 = runner(&f2, q2, policy());
+        assert_eq!(r2.tick(Local::now()).unwrap(), Tick::Dropped("t1".into()));
+        assert!(r2.audit.entries().unwrap()[0].detail.contains("not available"));
+
+        // 3. bigger than this runner's limit
+        let f3 = fixture("io-big");
+        let q3 = std::sync::Arc::new(InMemoryQueue::default());
+        let h3 = q3.post_bundle(input_bundle());
+        q3.post(job(&f3, &h3, 1000));
+        let mut p = policy();
+        p.max_input_bytes = 10;
+        let mut r3 = runner(&f3, q3, p);
+        assert_eq!(r3.tick(Local::now()).unwrap(), Tick::Dropped("t1".into()));
+        assert!(r3.audit.entries().unwrap()[0].detail.contains("limit"));
+
+        // 4. malformed hash in the manifest
+        let f4 = fixture("io-hash");
+        let q4 = std::sync::Arc::new(InMemoryQueue::default());
+        q4.post(job(&f4, "not-a-hash", 1000));
+        let mut r4 = runner(&f4, q4, policy());
+        assert_eq!(r4.tick(Local::now()).unwrap(), Tick::Dropped("t1".into()));
+
+        // 5. unsafe path inside a correctly hashed bundle: nothing is written outside the workspace
+        let f5 = fixture("io-evil");
+        let q5 = std::sync::Arc::new(InMemoryQueue::default());
+        let evil = b"{\"t\":\"file\",\"path\":\"../../escaped.txt\",\"size\":1,\"mode\":420}\nx{\"t\":\"end\"}\n".to_vec();
+        let h5 = q5.post_bundle(evil);
+        q5.post(job(&f5, &h5, 1000));
+        let mut r5 = runner(&f5, q5, policy());
+        assert_eq!(r5.tick(Local::now()).unwrap(), Tick::Dropped("t1".into()));
+        assert!(!f5.dir.join("escaped.txt").exists() && !f5.dir.parent().unwrap().join("escaped.txt").exists());
+    }
+
+    #[test]
+    fn artifacts_over_the_cap_fail_the_task() {
+        let f = fixture("io-cap");
+        let q = std::sync::Arc::new(InMemoryQueue::default());
+        let hash = q.post_bundle(input_bundle());
+        q.post(job(&f, &hash, 3)); // "created" alone is 7 bytes
+        let mut r = runner(&f, q.clone(), policy());
+        assert_eq!(r.tick(Local::now()).unwrap(), Tick::Dropped("t1".into()));
+        assert!(q.results().is_empty());
+        let _: Option<SigningKey> = None;
+    }
+
+    #[test]
+    fn dirqueue_stores_bundles_by_hash() {
+        let f = fixture("io-dirq");
+        let q = DirQueue::new(f.dir.join("q")).unwrap();
+        let h = q.post_bundle(b"data").unwrap();
+        assert_eq!(h, archive::sha256_hex(b"data"));
+        assert_eq!(q.bundle(&h).unwrap().unwrap(), b"data");
+        assert_eq!(q.bundle(&"f".repeat(64)).unwrap(), None);
+        assert!(q.bundle("../../etc/passwd").is_err(), "hash must be hex");
+    }
+
+    #[test]
+    fn container_roundtrip_through_the_bridge() {
+        let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/togra-mcp-exec");
+        let docker_ok = std::process::Command::new("docker").args(["image", "inspect", "alpine"]).output().is_ok_and(|o| o.status.success());
+        if !bin.exists() || !docker_ok {
+            eprintln!("skipping: needs docker, alpine and the musl bridge build");
+            return;
+        }
+        let f = fixture("io-docker");
+        let t = task("io1", "a", 1, &f.key_a);
+        let mut sb = DockerSandbox::new("alpine");
+        sb.bridge = Some(bin);
+        let ws = sb.create(&t, &t.sandbox_profile).unwrap();
+        sb.put_inputs(&ws, &input_bundle(), 1 << 20).unwrap();
+        let sh = |c: &str| crate::sandbox::exec(&ws, &["sh", "-c", c], std::time::Duration::from_secs(20)).unwrap();
+        assert_eq!(String::from_utf8_lossy(&sh("cat /workspace/src/a.txt").stdout), "A", "inputs unpacked as the unprivileged user");
+        assert!(sh("echo edited >> /workspace/src/a.txt; rm /workspace/old.txt; echo n > /workspace/new.txt; ln -s /etc/passwd /workspace/sneaky").status.success());
+        let out = sb.collect_outputs(&ws, 1 << 20).unwrap();
+        let mut recs = archive::from_bytes(&out, Limits::new(1 << 20)).unwrap();
+        recs.sort_by_key(path_of);
+        assert_eq!(recs, vec![file("new.txt", "n\n"), Record::Deleted { path: "old.txt".into() }, file("src/a.txt", "Aedited\n")], "symlink not collected");
+        assert!(sb.collect_outputs(&ws, 2).is_err(), "cap enforced inside the container");
+        let e = sb.put_inputs(&ws, b"garbage", 1 << 20);
+        assert!(e.is_err(), "malformed bundles are refused inside the container too");
+        sb.destroy(ws).unwrap();
     }
 }

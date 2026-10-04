@@ -35,6 +35,13 @@ pub struct Policy {
     pub allowed_mcp_hosts: Vec<String>,
     #[serde(default = "default_context_bytes")]
     pub max_context_bytes: u64,
+    /// Largest input bundle this runner will unpack into a task workspace.
+    #[serde(default = "default_input_bytes")]
+    pub max_input_bytes: u64,
+}
+
+fn default_input_bytes() -> u64 {
+    64 * 1024 * 1024
 }
 
 fn default_context_bytes() -> u64 {
