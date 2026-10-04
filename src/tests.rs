@@ -768,3 +768,157 @@ mod omnigent_bridge {
         assert!(h.run(&t, &none, &mut UsageMeter::new(100, 25)).is_err());
     }
 }
+
+mod claude_cli {
+    use super::{fixture, task};
+    use crate::claude_cli::{mcp_config, save_token, ClaudeCliHarness};
+    use crate::harness::Harness;
+    use crate::manifest::*;
+    use crate::meter::UsageMeter;
+    use crate::sandbox::Workspace;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn ws() -> Workspace {
+        Workspace { task_id: "t1".into(), path: std::path::PathBuf::new(), exec_prefix: ["docker", "exec", "-i", "togra-t1"].map(String::from).into(), bridge: true }
+    }
+
+    /// A fake `claude`: snapshots its run dir, args, env and stdin, then prints `events`.
+    fn harness(f: &super::Fixture, events: &str, tail: &str) -> ClaudeCliHarness {
+        let keep = f.dir.join("kept");
+        let bin = f.dir.join("fake-claude");
+        let script = format!(
+            "#!/bin/sh\nmkdir -p {k}\ncat > {k}/stdin.txt\nprintf '%s\\n' \"$@\" > {k}/args.txt\nenv > {k}/env.txt\ncp -r . {k}/rundir\ncat > {k}/mcp.json < \"$(printf '%s\\n' \"$@\" | grep -A1 -- --mcp-config | tail -1)\"\ncat <<'EOF'\n{events}\nEOF\n{tail}\n",
+            k = keep.display()
+        );
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let token = f.dir.join("claude.token");
+        save_token(&token, "sk-ant-oat-SECRET").unwrap();
+        let mut h = ClaudeCliHarness::new(&f.dir, token).unwrap();
+        h.bin = bin.to_string_lossy().into();
+        h
+    }
+
+    const INIT: &str = r#"{"type":"system","subtype":"init","tools":["mcp__sandbox__run_command","mcp__sandbox__read_file"],"mcp_servers":[{"name":"sandbox","status":"connected"}]}"#;
+    const A1: &str = r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":10,"output_tokens":1,"cache_creation_input_tokens":50,"cache_read_input_tokens":9999}}}"#;
+    const A1B: &str = r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":10,"output_tokens":20,"cache_creation_input_tokens":50,"cache_read_input_tokens":9999}}}"#;
+    const A2: &str = r#"{"type":"assistant","message":{"id":"m2","usage":{"input_tokens":5,"output_tokens":15,"cache_creation_input_tokens":0}}}"#;
+    const OK: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"  all done \n","usage":{"input_tokens":15,"output_tokens":35,"cache_creation_input_tokens":50},"total_cost_usd":0.01}"#;
+
+    #[test]
+    fn success_meters_deduped_usage_and_isolates_the_cli() {
+        let f = fixture("claude-ok");
+        let h = harness(&f, &[INIT, A1, A1B, A2, OK].join("\n"), "");
+        let mut t = task("t1", "a", 1000, &f.key_a);
+        t.prompt = "Summarise the repo --please".into();
+        t.context = TaskContext {
+            skills: vec![Skill { name: "triage".into(), description: "d \"q\"".into(), content: "body".into(), files: [("ref/n.md".to_string(), "n".to_string())].into() }],
+            mcp_servers: vec![McpServer { name: "tracker".into(), url: "https://mcp.example.org/sse".into() }],
+        };
+        let mut m = UsageMeter::new(1000, 25);
+        assert_eq!(h.run(&t, &ws(), &mut m).unwrap(), "all done");
+        assert_eq!(m.used(), 10 + 20 + 50 + 5 + 15, "one figure per message id; cache reads excluded");
+
+        let keep = f.dir.join("kept");
+        assert_eq!(std::fs::read_to_string(keep.join("stdin.txt")).unwrap(), "Summarise the repo --please", "prompt arrives on stdin");
+        let args = std::fs::read_to_string(keep.join("args.txt")).unwrap();
+        for want in ["-p", "--output-format\nstream-json", "--verbose", "--no-session-persistence", "--tools\n\n", "--strict-mcp-config", "--setting-sources\nproject", "--permission-mode\ndontAsk", "--permission-prompts\nnone", "--allowedTools=mcp__tracker,mcp__sandbox"] {
+            assert!(args.contains(want), "missing {want:?} in {args}");
+        }
+        assert!(!args.contains("--bare") && !args.contains("Summarise"), "no --bare (ignores subscriptions); prompt not in argv");
+
+        let env = std::fs::read_to_string(keep.join("env.txt")).unwrap();
+        assert!(env.contains("CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-SECRET"));
+        assert!(env.contains(&format!("HOME={}", h.home_dir.display())) && env.contains("CLAUDE_CONFIG_DIR="));
+        assert!(!env.contains("CARGO_PKG_NAME") && !env.contains("ANTHROPIC_API_KEY"), "environment is cleared: {env}");
+
+        let mcp: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(keep.join("mcp.json")).unwrap()).unwrap();
+        assert_eq!(mcp["mcpServers"]["sandbox"]["command"], "docker");
+        assert_eq!(mcp["mcpServers"]["sandbox"]["args"][3], "/togra/mcp-exec");
+        assert_eq!(mcp["mcpServers"]["tracker"], serde_json::json!({"type": "sse", "url": "https://mcp.example.org/sse"}));
+        let skill = std::fs::read_to_string(keep.join("rundir/.claude/skills/triage/SKILL.md")).unwrap();
+        assert!(skill.starts_with("---\nname: triage\ndescription: \"d \\\"q\\\"\"\n---\nbody"), "{skill}");
+        assert!(keep.join("rundir/.claude/skills/triage/ref/n.md").exists());
+        assert!(!h.runs_dir.join("togra-t1").exists(), "scratch dir removed");
+    }
+
+    #[test]
+    fn builtin_tool_in_init_aborts_the_run() {
+        let f = fixture("claude-builtin");
+        let bad = r#"{"type":"system","subtype":"init","tools":["Bash","mcp__sandbox__run_command"],"mcp_servers":[{"name":"sandbox","status":"connected"}]}"#;
+        let h = harness(&f, bad, "sleep 30");
+        let t = task("t1", "a", 100, &f.key_a);
+        let started = std::time::Instant::now();
+        let e = h.run(&t, &ws(), &mut UsageMeter::new(100, 25)).unwrap_err().to_string();
+        assert!(e.contains("built-in tool `Bash`"), "{e}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "killed, not awaited");
+    }
+
+    #[test]
+    fn bridge_not_connected_aborts() {
+        let f = fixture("claude-nobridge");
+        let bad = r#"{"type":"system","subtype":"init","tools":[],"mcp_servers":[{"name":"sandbox","status":"failed"}]}"#;
+        let h = harness(&f, bad, "sleep 30");
+        let e = h.run(&task("t1", "a", 100, &f.key_a), &ws(), &mut UsageMeter::new(100, 25)).unwrap_err().to_string();
+        assert!(e.contains("did not connect"), "{e}");
+    }
+
+    #[test]
+    fn overrun_kills_mid_stream() {
+        let f = fixture("claude-over");
+        let big = r#"{"type":"assistant","message":{"id":"m9","usage":{"input_tokens":5000,"output_tokens":5000}}}"#;
+        let h = harness(&f, &[INIT, big].join("\n"), "sleep 30");
+        let started = std::time::Instant::now();
+        let r = h.run(&task("t1", "a", 100, &f.key_a), &ws(), &mut UsageMeter::new(100, 25));
+        assert!(matches!(r, Err(crate::Error::Meter { .. })), "{r:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn account_problems_are_named_in_the_error() {
+        let f = fixture("claude-acct");
+        let retry = r#"{"type":"system","subtype":"api_retry","error":"rate_limit","attempt":3}"#;
+        let res = r#"{"type":"result","subtype":"error","is_error":true,"result":"usage limit reached"}"#;
+        let h = harness(&f, &[INIT, retry, res].join("\n"), "exit 1");
+        let e = h.run(&task("t1", "a", 100, &f.key_a), &ws(), &mut UsageMeter::new(100, 25)).unwrap_err().to_string();
+        assert!(e.contains("[rate_limit]") && e.contains("usage limit reached"), "{e}");
+    }
+
+    #[test]
+    fn needs_the_container_bridge_and_a_private_token() {
+        let f = fixture("claude-guard");
+        let h = harness(&f, OK, "");
+        let t = task("t1", "a", 100, &f.key_a);
+        let no_bridge = Workspace { bridge: false, ..ws() };
+        assert!(h.run(&t, &no_bridge, &mut UsageMeter::new(100, 25)).is_err());
+        let mode = |m| std::fs::set_permissions(&h.token_file, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(0o644);
+        assert!(h.read_token().unwrap_err().to_string().contains("readable by others"));
+        assert!(h.run(&t, &ws(), &mut UsageMeter::new(100, 25)).is_err());
+        mode(0o600);
+        assert_eq!(h.read_token().unwrap(), "sk-ant-oat-SECRET");
+        let fresh = f.dir.join("new.token");
+        save_token(&fresh, " tok \n").unwrap();
+        assert_eq!((std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777, std::fs::read_to_string(&fresh).unwrap()), (0o600, "tok".to_string()));
+    }
+
+    #[test]
+    fn project_servers_cannot_replace_the_bridge() {
+        let ctx = TaskContext { mcp_servers: vec![McpServer { name: "sandbox".into(), url: "https://evil.example/mcp".into() }, McpServer { name: "docs".into(), url: "https://x.org/mcp".into() }], ..Default::default() };
+        let cfg = mcp_config(&ctx, &["docker".into(), "exec".into(), "-i".into(), "c".into(), "/togra/mcp-exec".into()]);
+        assert_eq!(cfg["mcpServers"]["sandbox"]["command"], "docker");
+        assert_eq!(cfg["mcpServers"]["docs"]["type"], "http");
+    }
+
+    #[test]
+    fn config_requires_a_container_with_the_bridge() {
+        let f = fixture("claude-cfg");
+        let mut c = crate::config::Config::starter(&f.dir);
+        c.harness = crate::config::HarnessConfig::Claude { bin: "claude".into(), token_file: None, model: None };
+        assert!(c.build().is_err(), "docker without bridge");
+        c.sandbox = crate::config::SandboxConfig::Bwrap;
+        assert!(c.build().is_err(), "bwrap has no bridge");
+        c.sandbox = crate::config::SandboxConfig::Docker { bin: "docker".into(), image: "alpine".into(), runtime: None, bridge: Some("/x".into()) };
+        assert!(c.build().is_ok());
+    }
+}

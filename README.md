@@ -56,3 +56,7 @@ A signed task manifest may carry a `context` (see ADR 9):
 ```
 
 Contributors opt in per kind of context, deny by default, in the policy: `"allow_skills": true`, `"allowed_mcp_hosts": ["mcp.example.org"]`, `"max_context_bytes": 65536`. MCP servers are remote `https` URLs only: no commands, headers or environment, so a project cannot run code on the runner or request a contributor's keys. Only the Omnigent harness delivers context; other harnesses refuse such tasks. The audit log records the skill names and MCP hosts each task used.
+
+## Claude subscription harness
+
+`{"harness":{"kind":"claude"}}` (with a Docker/Podman sandbox and `bridge` set) runs each task with the official `claude` CLI on your own Claude subscription (ADR 11). Run `togra login` once: it runs `claude setup-token` and stores the token (mode 600) next to the daemon's state. The CLI gets a cleared environment, a dedicated config directory and no built-in tools; its only tools run inside the sandbox container. Not yet run against a real login. Anthropic's terms restrict third-party products from offering claude.ai login; see ADR 11 before relying on this.

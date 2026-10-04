@@ -32,6 +32,11 @@ enum Cmd {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Sign in the daemon's Claude subscription: runs `claude setup-token`, then stores the token.
+    Login {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Show daemon status from the state directory.
     Status {
         #[arg(long)]
@@ -85,6 +90,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Run { config } => {
             let cfg = togra::config::Config::load(&config_path(config))?;
             togra::daemon::run(cfg, shutdown_signal()).await?;
+        }
+        Cmd::Login { config } => {
+            let cfg = togra::config::Config::load(&config_path(config))?;
+            let token_file = match &cfg.harness {
+                togra::config::HarnessConfig::Claude { token_file, .. } => token_file.clone().unwrap_or_else(|| cfg.token_path()),
+                _ => return Err("config.harness.kind is not `claude`".into()),
+            };
+            fs::create_dir_all(&cfg.state_dir)?;
+            println!("Running `claude setup-token`. Complete the browser sign-in, then paste the token it prints.");
+            std::process::Command::new("claude").arg("setup-token").status()?;
+            let token = rpassword::prompt_password("Paste token (input hidden): ")?;
+            if token.trim().is_empty() {
+                return Err("no token entered".into());
+            }
+            togra::claude_cli::save_token(&token_file, &token)?;
+            println!("saved to {} (mode 600). It never leaves this machine.", token_file.display());
         }
         Cmd::Status { config } => {
             let cfg = togra::config::Config::load(&config_path(config))?;

@@ -3,6 +3,7 @@
 use crate::audit::AuditLog;
 use crate::harness::{EchoHarness, Harness};
 use crate::manifest::{generate_key, TrustedProjects};
+use crate::claude_cli::ClaudeCliHarness;
 use crate::omnigent::OmnigentHarness;
 use crate::policy::Policy;
 use crate::queue::{DirQueue, QueueClient};
@@ -44,6 +45,17 @@ fn docker_bin() -> String {
 pub enum HarnessConfig {
     /// Placeholder until the Omnigent harness lands.
     Echo { tokens_per_run: u64 },
+    /// The official `claude` CLI with the contributor's subscription token (ADR 11). Needs a
+    /// container sandbox with the exec bridge.
+    Claude {
+        #[serde(default = "claude_bin")]
+        bin: String,
+        /// Token from `claude setup-token`, stored by `togra login` (default: <state_dir>/claude.token).
+        #[serde(default)]
+        token_file: Option<PathBuf>,
+        #[serde(default)]
+        model: Option<String>,
+    },
     /// Omnigent in no-network mode (see `omnigent.rs`); needs sandbox `dir` or `bwrap`.
     Omnigent {
         #[serde(default = "omnigent_bin")]
@@ -55,6 +67,9 @@ pub enum HarnessConfig {
     },
 }
 
+fn claude_bin() -> String {
+    "claude".into()
+}
 fn omnigent_bin() -> String {
     "omnigent".into()
 }
@@ -148,6 +163,11 @@ impl Config {
         Ok(SigningKey::from_bytes(&seed))
     }
 
+    /// Default location of the subscription token.
+    pub fn token_path(&self) -> PathBuf {
+        self.state_dir.join("claude.token")
+    }
+
     pub fn build_sandbox(&self) -> Box<dyn Sandbox> {
         let work = self.state_dir.join("work");
         match &self.sandbox {
@@ -175,6 +195,15 @@ impl Config {
         }
         let harness: Box<dyn Harness> = match &self.harness {
             HarnessConfig::Echo { tokens_per_run } => Box::new(EchoHarness { tokens_per_run: *tokens_per_run }),
+            HarnessConfig::Claude { bin, token_file, model } => {
+                if !matches!(self.sandbox, SandboxConfig::Docker { bridge: Some(_), .. }) {
+                    return Err(Error::Policy("the claude harness needs a Docker/Podman sandbox with `bridge` set to the static togra-mcp-exec binary".into()));
+                }
+                let mut h = ClaudeCliHarness::new(&self.state_dir, token_file.clone().unwrap_or_else(|| self.token_path()))?;
+                h.bin = bin.clone();
+                h.model = model.clone();
+                Box::new(h)
+            }
             HarnessConfig::Omnigent { bin, server_url, harness } => {
                 if matches!(self.sandbox, SandboxConfig::Docker { bridge: None, .. }) {
                     return Err(Error::Policy("the omnigent harness with a container sandbox needs the exec bridge: set `bridge` to the static togra-mcp-exec binary (or use sandbox `dir` or `bwrap`)".into()));

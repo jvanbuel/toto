@@ -5,6 +5,7 @@
 //! lifecycle runs and is tested offline.
 
 pub mod audit;
+pub mod claude_cli;
 pub mod config;
 pub mod daemon;
 pub mod harness;
