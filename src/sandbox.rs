@@ -18,7 +18,7 @@ pub struct Workspace {
     /// no host filesystem).
     pub path: PathBuf,
     /// Command prefix the harness uses to run a command *inside* the sandbox (ADR 5), e.g.
-    /// `docker exec -i <container> -- <cmd>`. Empty for `DirSandbox`.
+    /// `docker exec -i <container> <cmd>`. Empty for `DirSandbox`.
     pub exec_prefix: Vec<String>,
 }
 
@@ -85,8 +85,8 @@ impl DockerSandbox {
         a.extend([
             "--cpus".into(), format!("{:.2}", p.cpu_millis as f64 / 1000.0),
             "--memory".into(), format!("{}m", p.memory_mb),
-            "--tmpfs".into(), format!("/workspace:rw,noexec,nosuid,size={}m", self.workspace_mb),
-            "--tmpfs".into(), "/tmp:rw,noexec,nosuid,size=64m".into(),
+            "--tmpfs".into(), format!("/workspace:rw,noexec,nosuid,uid=65534,gid=65534,mode=0700,size={}m", self.workspace_mb),
+            "--tmpfs".into(), "/tmp:rw,noexec,nosuid,uid=65534,gid=65534,mode=1777,size=64m".into(),
         ]);
         if let Some(rt) = &self.runtime {
             a.extend(["--runtime".into(), rt.clone()]);
@@ -110,7 +110,7 @@ impl Sandbox for DockerSandbox {
         let args = self.run_args(&task.id, profile)?;
         self.docker(&args)?;
         let name = Self::container_name(&task.id);
-        let exec_prefix = vec![self.bin.clone(), "exec".into(), "-i".into(), name, "--".into()];
+        let exec_prefix = vec![self.bin.clone(), "exec".into(), "-i".into(), name];
         Ok(Workspace { task_id: task.id.clone(), path: PathBuf::new(), exec_prefix })
     }
 
