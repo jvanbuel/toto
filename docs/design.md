@@ -98,7 +98,7 @@ A task is a self-contained, signed manifest plus an input bundle; runners need n
 | Policy engine | Holds the contributor's consent: caps per day/week, quiet hours, allowed projects and task kinds, review-before-submit toggle |
 | Queue client | Authenticates the runner (its own keypair, not the AI account), claims leases, renews heartbeats, submits results |
 | Manifest verifier | Checks project signature, schema and that the sandbox profile is within contributor policy |
-| Provider adapters | One per tool: Claude Code, Codex CLI, Gemini CLI, raw API key. Each invokes the tool non-interactively and reports usage |
+| Harness (Omnigent) | A `Harness` trait implemented on top of a local [Omnigent](https://github.com/omnigent-ai/omnigent) server, which drives Claude Code, Codex, Cursor, raw API keys and more non-interactively and reports usage (see ADR 4) |
 | Sandbox manager | Spins up an isolated container/microVM per task, mounts inputs read-only, applies network allowlist and limits |
 | Usage meter | Tracks tokens/minutes per task against caps; hard-stops a task that exceeds its estimate by a set margin |
 | Result packager | Validates output against `output_schema`, hashes it, signs it with the runner key, attaches run metadata |

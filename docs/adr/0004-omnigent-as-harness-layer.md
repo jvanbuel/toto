@@ -1,6 +1,6 @@
 # 4. Use Omnigent as the harness layer
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-10-04
 
 ## Context
@@ -23,6 +23,10 @@ Contributors use different AI tools: Claude Code, Codex, Cursor, raw API keys an
 - Omnigent is alpha; pin versions and keep it swappable behind the trait.
 - Licence: Apache 2.0 permits this use; ship its licence/NOTICE, mark modified files, and don't use its name as branding.
 
-## Simpler v1 option
+## Implementation notes
 
-Start with direct CLI adapters for one or two tools behind the same trait; adopt Omnigent when a third harness is needed.
+- Omnigent is the primary `Harness` implementation from v1, not a later addition.
+- `togra` starts and supervises a local `omnigent server --background` and talks to it over its local API.
+- The `Harness` trait stays the seam: a direct-CLI implementation remains possible as a fallback if Omnigent's direction or stability changes.
+- Omnigent's own policies (spending caps, approval gates, tool restrictions) complement, but never replace, `togra`'s policy engine, which remains the source of truth for contributor consent.
+- Verify that Omnigent's command execution can be routed into the `togra` sandbox (ADR 5) before relying on it.
