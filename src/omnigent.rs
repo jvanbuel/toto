@@ -15,13 +15,23 @@ use crate::harness::Harness;
 use crate::context::{McpEntry, ProjectContext};
 use crate::manifest::{TaskManifest, BRIDGE_SERVER_NAME};
 use crate::meter::UsageMeter;
-use crate::sandbox::Workspace;
+use crate::proxy::{AuthProxy, Provider};
+use crate::sandbox::{Workspace, AGENT_DIR, PROXY_ADDR};
 use crate::{Error, Result};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
+
+/// Where Omnigent runs.
+pub enum OmniPlacement {
+    /// On the host (ADR 4, 5, 10).
+    Host,
+    /// Inside the task container, installed in the image with the project's tools and MCP servers,
+    /// behind the credential proxy (ADR 12).
+    Container { proxy: Arc<AuthProxy>, provider: Provider },
+}
 
 pub struct OmnigentHarness {
     pub bin: String,
@@ -34,6 +44,10 @@ pub struct OmnigentHarness {
     /// Per-task agent directories are created under here and removed after each run.
     pub agents_dir: PathBuf,
     pub poll: Duration,
+    pub placement: OmniPlacement,
+    /// Model name for the agent's `executor.model`. Needed in container placement, where Omnigent
+    /// cannot discover models from the provider.
+    pub model: Option<String>,
 }
 
 /// Builds the agent config handed to Omnigent for one task. Everything comes from validated
@@ -79,6 +93,35 @@ pub fn agent_config(ctx: &ProjectContext, bridge: Option<&[String]>) -> String {
     serde_json::to_string_pretty(&cfg).expect("static json")
 }
 
+/// Agent config for Omnigent running inside the container: its own tools run in the container
+/// (`sandbox: none`, the container is the sandbox) and project command servers start there too.
+/// Project skills are found in `/workspace/.claude/skills`, where the runner unpacked them.
+pub fn container_agent_config(ctx: &ProjectContext, harness: &str, model: Option<&str>) -> String {
+    let mut cfg = serde_json::json!({
+        "spec_version": 1,
+        "name": "toto-task",
+        "description": "A task donated through toto",
+        "executor": {"type": "omnigent", "config": {"harness": harness}},
+        "prompt": "You are completing one self-contained task for a public-good project. Work in the current directory and reply with the final result only.",
+        "os_env": {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}},
+    });
+    if let Some(m) = model {
+        cfg["executor"]["model"] = m.into();
+    }
+    let tools: serde_json::Map<String, serde_json::Value> = ctx
+        .mcp
+        .iter()
+        .filter_map(|m| match m {
+            McpEntry::Stdio { name, command, args, env } => Some((name.clone(), serde_json::json!({"type": "mcp", "command": command, "args": args, "env": env}))),
+            McpEntry::Remote { .. } => None,
+        })
+        .collect();
+    if !tools.is_empty() {
+        cfg["tools"] = tools.into();
+    }
+    serde_json::to_string_pretty(&cfg).expect("static json")
+}
+
 /// Writes `dir/config.yaml` and `dir/skills/<name>/...` for a task (the context is already parsed
 /// and validated).
 pub fn write_agent_dir(dir: &Path, ctx: &ProjectContext, bridge: Option<&[String]>) -> Result<()> {
@@ -95,6 +138,12 @@ pub fn write_agent_dir(dir: &Path, ctx: &ProjectContext, bridge: Option<&[String
 }
 
 impl OmnigentHarness {
+    /// Runs Omnigent inside the container behind `proxy` instead of on the host.
+    pub fn in_container(mut self, proxy: Arc<AuthProxy>, provider: Provider) -> Self {
+        self.placement = OmniPlacement::Container { proxy, provider };
+        self
+    }
+
     pub fn new(state_dir: &Path) -> Result<Self> {
         let agents_dir = state_dir.join("agents");
         std::fs::create_dir_all(&agents_dir)?;
@@ -105,6 +154,8 @@ impl OmnigentHarness {
             version_prefix: "0.16.".into(),
             agents_dir,
             poll: Duration::from_secs(5),
+            placement: OmniPlacement::Host,
+            model: None,
         })
     }
 
@@ -146,7 +197,14 @@ impl Harness for OmnigentHarness {
         true
     }
 
+    fn context_in_workspace(&self) -> bool {
+        matches!(self.placement, OmniPlacement::Container { .. })
+    }
+
     fn run(&self, task: &TaskManifest, ctx: &ProjectContext, ws: &Workspace, meter: &mut UsageMeter) -> Result<String> {
+        if let OmniPlacement::Container { proxy, provider } = &self.placement {
+            return self.run_in_container(task, ctx, ws, meter, proxy, *provider);
+        }
         let bridge = ws.bridge_argv();
         if bridge.is_none() && ws.path.as_os_str().is_empty() {
             return Err(Error::Harness("the omnigent harness needs a host workspace (sandbox `dir` or `bwrap`) or a container sandbox with the exec bridge".into()));
@@ -233,6 +291,97 @@ impl Harness for OmnigentHarness {
         }
         Ok(stdout.trim().to_string())
     }
+}
+
+impl OmnigentHarness {
+    /// Runs `omnigent run` inside the container. The only credential there is a dummy; model calls
+    /// reach the API through the relay and the proxy, which also does the metering.
+    fn run_in_container(&self, task: &TaskManifest, ctx: &ProjectContext, ws: &Workspace, meter: &mut UsageMeter, proxy: &AuthProxy, provider: Provider) -> Result<String> {
+        use crate::sandbox::exec_io;
+        if ws.bridge_argv().is_none() {
+            return Err(Error::Harness("omnigent container placement needs a container sandbox with the relay bridge".into()));
+        }
+        if ctx.mcp.iter().any(|m| matches!(m, McpEntry::Remote { .. })) {
+            return Err(Error::Harness("remote MCP servers are unreachable from a container without network; use command servers".into()));
+        }
+        let (name, head) = ws.exec_prefix.split_last().expect("a container sandbox has an exec prefix");
+        let with_env = |envs: &[(String, String)]| -> Workspace {
+            let mut prefix: Vec<String> = head.to_vec();
+            for (k, v) in envs {
+                prefix.extend(["-e".into(), format!("{k}={v}")]);
+            }
+            prefix.extend(["-w".into(), "/workspace".into(), name.clone()]);
+            Workspace { task_id: ws.task_id.clone(), path: ws.path.clone(), exec_prefix: prefix, bridge: true }
+        };
+        let base_url = format!("http://{PROXY_ADDR}");
+        let mut envs: Vec<(String, String)> = vec![("HOME".into(), "/tmp/home".into()), ("TERM".into(), "dumb".into()), ("DISABLE_AUTOUPDATER".into(), "1".into()), ("PATH".into(), format!("{AGENT_DIR}:/usr/local/bin:/usr/bin:/bin"))];
+        match provider {
+            Provider::Anthropic => envs.extend([("ANTHROPIC_BASE_URL".into(), base_url), ("ANTHROPIC_AUTH_TOKEN".into(), "not-a-credential".into())]),
+            Provider::OpenAi => envs.extend([("OPENAI_BASE_URL".into(), format!("{base_url}/v1")), ("OPENAI_API_KEY".into(), "not-a-credential".into())]),
+        }
+        let sh = with_env(&envs);
+        // Agent config and prompt are written into the container; the prompt goes through a file so
+        // it never appears in a process list or hits argument-length limits.
+        let cfg = container_agent_config(ctx, &self.harness, self.model.as_deref());
+        let t = Duration::from_secs(30);
+        exec_io(&sh, &["sh", "-c", "mkdir -p /tmp/agent /tmp/home && cat > /tmp/agent/config.yaml"], Some(cfg.as_bytes()), t, 4096)?;
+        exec_io(&sh, &["sh", "-c", "cat > /tmp/prompt.txt"], Some(task.prompt.as_bytes()), t, 4096)?;
+
+        let start = proxy.tokens();
+        let mut argv = sh.exec_prefix.clone();
+        argv.extend(["sh".into(), "-c".into(), format!("exec omnigent run /tmp/agent --harness {} -p \"$(cat /tmp/prompt.txt)\"", shell_word(&self.harness))]);
+        let mut child = Command::new(&argv[0]).args(&argv[1..]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+        let (mut so, mut se) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+        let out = std::thread::spawn(move || {
+            let mut b = String::new();
+            let _ = so.read_to_string(&mut b);
+            b
+        });
+        let err = std::thread::spawn(move || {
+            let mut b = String::new();
+            let _ = se.read_to_string(&mut b);
+            b
+        });
+        let deadline = Instant::now() + Duration::from_secs(task.sandbox_profile.timeout_secs);
+        let mut charged = 0u64;
+        let status = loop {
+            if let Some(s) = child.try_wait()? {
+                break s;
+            }
+            let used = proxy.tokens().saturating_sub(start);
+            if used > charged {
+                let delta = used - charged;
+                charged = used;
+                if let Err(e) = meter.record(delta) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e);
+                }
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Harness(format!("timed out after {}s", task.sandbox_profile.timeout_secs)));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let (stdout, stderr) = (out.join().unwrap_or_default(), err.join().unwrap_or_default());
+        let used = proxy.tokens().saturating_sub(start);
+        if used > charged {
+            meter.record(used - charged)?;
+        }
+        if !status.success() {
+            let hint = if status.code() == Some(127) { " (is `omnigent` installed in the sandbox image?)" } else { "" };
+            let tail: Vec<&str> = stderr.lines().rev().take(3).collect();
+            return Err(Error::Harness(format!("omnigent exited with {status}{hint}: {}", tail.into_iter().rev().collect::<Vec<_>>().join(" | "))));
+        }
+        Ok(stdout.trim().to_string())
+    }
+}
+
+/// Harness names come from the contributor's config; refuse anything that is not a plain word.
+fn shell_word(s: &str) -> &str {
+    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') { s } else { "claude-sdk" }
 }
 
 struct RemoveOnDrop(PathBuf);

@@ -80,7 +80,55 @@ pub enum HarnessConfig {
         server_url: String,
         #[serde(default = "omnigent_harness")]
         harness: String,
+        /// `host` (default) or `container`: Omnigent and the agent inside the sandbox image,
+        /// behind the credential proxy (ADR 12). The image must contain `omnigent`.
+        #[serde(default)]
+        placement: PlacementConfig,
+        /// Which API the proxy fronts (container placement).
+        #[serde(default)]
+        provider: ProviderConfig,
+        /// API origin the proxy forwards to; default per provider.
+        #[serde(default)]
+        upstream: Option<String>,
+        /// Subscription token file (Anthropic) when no `api_key_file` is given.
+        #[serde(default)]
+        token_file: Option<PathBuf>,
+        /// API key file; required for the `openai` provider.
+        #[serde(default)]
+        api_key_file: Option<PathBuf>,
+        /// Agent CLI files mounted under /toto/agent and put on PATH (e.g. codex and its companion
+        /// `codex-code-mode-host`), for harnesses whose CLI is not in the image.
+        #[serde(default)]
+        agent_files: Vec<PathBuf>,
+        /// Model for the agent (`executor.model`); needed in container placement.
+        #[serde(default)]
+        model: Option<String>,
     },
+}
+
+/// Which model API the credential proxy fronts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderConfig {
+    #[default]
+    Anthropic,
+    Openai,
+}
+
+impl ProviderConfig {
+    fn provider(self) -> crate::proxy::Provider {
+        match self {
+            ProviderConfig::Anthropic => crate::proxy::Provider::Anthropic,
+            ProviderConfig::Openai => crate::proxy::Provider::OpenAi,
+        }
+    }
+
+    fn default_upstream(self) -> &'static str {
+        match self {
+            ProviderConfig::Anthropic => "https://api.anthropic.com",
+            ProviderConfig::Openai => "https://api.openai.com",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,6 +271,21 @@ impl Config {
         }
     }
 
+    /// Starts the credential proxy for container placements. The secret stays in this process.
+    fn start_proxy(&self, provider: ProviderConfig, upstream: &str, token_file: &Path, api_key_file: Option<&Path>) -> Result<std::sync::Arc<crate::proxy::AuthProxy>> {
+        use crate::proxy::Auth;
+        let auth = match (provider, api_key_file) {
+            (ProviderConfig::Anthropic, Some(f)) => Auth::ApiKey(crate::claude_cli::read_secret(f)?),
+            (ProviderConfig::Anthropic, None) => Auth::Bearer { token: crate::claude_cli::read_secret(token_file)?, oauth: true },
+            (ProviderConfig::Openai, Some(f)) => Auth::Bearer { token: crate::claude_cli::read_secret(f)?, oauth: false },
+            (ProviderConfig::Openai, None) => return Err(Error::Policy("the openai provider needs `api_key_file` (ChatGPT sign-in is not supported by the proxy yet)".into())),
+        };
+        let dir = self.state_dir.join("proxy");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+        Ok(std::sync::Arc::new(crate::proxy::AuthProxy::start(&dir.join("p.sock"), upstream, provider.provider(), auth)?))
+    }
+
     pub fn build(&self) -> Result<DaemonRunner> {
         if self.policy.review_before_submit {
             return Err(Error::Policy("review_before_submit needs the TUI; the daemon cannot ask a human".into()));
@@ -246,14 +309,7 @@ impl Config {
                 h.model = model.clone();
                 if *placement == PlacementConfig::Container {
                     // The credential stays with this process: the proxy adds it to model calls.
-                    let auth = match api_key_file {
-                        Some(f) => crate::proxy::Auth::ApiKey(crate::claude_cli::read_secret(f)?),
-                        None => crate::proxy::Auth::Bearer { token: crate::claude_cli::read_secret(&token_file)?, oauth: true },
-                    };
-                    let dir = self.state_dir.join("proxy");
-                    std::fs::create_dir_all(&dir)?;
-                    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
-                    let proxy = std::sync::Arc::new(crate::proxy::AuthProxy::start(&dir.join("p.sock"), upstream, crate::proxy::Provider::Anthropic, auth)?);
+                    let proxy = self.start_proxy(ProviderConfig::Anthropic, upstream, &token_file, api_key_file.as_deref())?;
                     proxy_socket = Some(proxy.socket().to_path_buf());
                     let exe = agent_binary.clone().or_else(which_claude).ok_or_else(|| Error::Policy("no `claude` binary found for the container; set `agent_binary`".into()))?;
                     h.agent_name = exe.file_name().unwrap_or_default().to_string_lossy().into_owned();
@@ -262,7 +318,7 @@ impl Config {
                 }
                 Box::new(h)
             }
-            HarnessConfig::Omnigent { bin, server_url, harness } => {
+            HarnessConfig::Omnigent { bin, server_url, harness, placement, provider, upstream, token_file, api_key_file, agent_files, model } => {
                 if matches!(self.sandbox, SandboxConfig::Docker { bridge: None, .. }) {
                     return Err(Error::Policy("the omnigent harness with a container sandbox needs the exec bridge: set `bridge` to the static toto-mcp-exec binary (or use sandbox `dir` or `bwrap`)".into()));
                 }
@@ -270,6 +326,17 @@ impl Config {
                 h.bin = bin.clone();
                 h.server_url = server_url.clone();
                 h.harness = harness.clone();
+                h.model = model.clone();
+                if *placement == PlacementConfig::Container {
+                    if !matches!(self.sandbox, SandboxConfig::Docker { .. }) {
+                        return Err(Error::Policy("omnigent container placement needs a Docker/Podman sandbox whose image contains `omnigent`".into()));
+                    }
+                    let token_file = token_file.clone().unwrap_or_else(|| self.token_path());
+                    let proxy = self.start_proxy(*provider, upstream.as_deref().unwrap_or(provider.default_upstream()), &token_file, api_key_file.as_deref())?;
+                    proxy_socket = Some(proxy.socket().to_path_buf());
+                    agent = (!agent_files.is_empty()).then(|| agent_files.clone());
+                    h = h.in_container(proxy, provider.provider());
+                }
                 Box::new(h)
             }
         };

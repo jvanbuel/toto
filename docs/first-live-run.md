@@ -89,6 +89,19 @@ The same task with the agent in the container and no credential in it (ADR 12). 
 
 `docker pull debian:bookworm-slim`, then run exactly as above (`toto run --once` also checks that your `claude` binary runs in the image). What this settles: **does Anthropic accept your subscription token through the proxy?** If it does not, you will see `authentication_failed` or 401-style errors; send the message back. To compare with an API key, put one in a 0600 file and add `"api_key_file": "/path"`. While a task runs, `docker exec toto-live-1 env` must not show any token.
 
+## Variant: Omnigent in the container (Claude or Codex)
+
+```
+docker build -t toto-omnigent docs/examples/omnigent-image
+```
+
+```json
+"sandbox": {"kind": "docker", "image": "toto-omnigent", "bridge": "/ABSOLUTE/PATH/TO/dist/release/toto-mcp-exec"},
+"harness": {"kind": "omnigent", "placement": "container", "harness": "claude-sdk", "provider": "anthropic", "model": "<a model name your account can use>"}
+```
+
+Same task, same commands. This runs the Claude CLI that Anthropic ships inside the `claude-agent-sdk` wheel, not your own install, and each task takes about 20 seconds longer. For Codex with an API key see the README (`provider: openai`, `api_key_file`, `agent_files`). What this settles beyond the other variants: whether your credential works through the proxy for a harness Omnigent drives.
+
 ## What to look for
 
 Success: `Submitted("live-1")`; `toto extract-result ~/.config/toto/queue/results/live-1.*.json ./out` lists `file    hello.txt (...)` and `out/hello.txt` contains the line (the task's changed files come back as signed artifacts); the audit line shows `submitted` and a plausible `tokens=` figure; the result in `~/.config/toto/queue/results/` has an `output` that reports `hello from the sandbox`, `65534` for `id -u`, and an error or empty listing for `ls /home`.

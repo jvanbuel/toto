@@ -84,3 +84,14 @@ toto extract-result <queue>/results/<id>.<runner>.json ./out  # verify and write
 ```
 
 The image must be glibc-based (the host's `claude` binary is mounted into it) and provide `tar`. Use `"api_key_file": "/path/to/key"` for an API key instead of the subscription token. Linux only so far; tested with a fake API, not yet with a real credential.
+
+### Omnigent in the container (any harness it supports)
+
+Install Omnigent in the project image (see `docs/examples/omnigent-image/Dockerfile`) next to the project's tools and MCP servers, and let toto run it behind the credential proxy:
+
+```json
+"sandbox": {"kind": "docker", "image": "my-project-image", "bridge": "/abs/path/toto-mcp-exec"},
+"harness": {"kind": "omnigent", "placement": "container", "harness": "claude-sdk", "provider": "anthropic", "model": "<model>"}
+```
+
+For Codex: `"harness": "codex"`, `"provider": "openai"`, `"api_key_file": "/path/to/key"`, `"model": "..."`, and `"agent_files": ["/path/to/codex", "/path/to/codex-code-mode-host"]` (static binaries from the `@openai/codex` package; they are mounted under `/toto/agent` and put on `PATH`). The proxy holds the credential; the container has none and no network. Tested against fake provider APIs only; costs: a larger image and about 20 s of startup per task.

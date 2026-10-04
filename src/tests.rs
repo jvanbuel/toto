@@ -476,7 +476,7 @@ echo "the answer""#;
     fn config_refuses_docker_with_omnigent() {
         let f = fixture("omni-cfg");
         let mut c = crate::config::Config::starter(&f.dir);
-        c.harness = crate::config::HarnessConfig::Omnigent { bin: "omnigent".into(), server_url: "http://x".into(), harness: "claude-sdk".into() };
+        c.harness = crate::config::HarnessConfig::Omnigent { bin: "omnigent".into(), server_url: "http://x".into(), harness: "claude-sdk".into(), placement: Default::default(), provider: Default::default(), upstream: None, token_file: None, api_key_file: None, agent_files: vec![], model: None };
         assert!(c.build().is_err(), "docker sandbox without the bridge must be refused");
         c.sandbox = crate::config::SandboxConfig::Bwrap;
         assert!(c.build().is_ok());
@@ -2098,6 +2098,64 @@ mod claude_in_container {
     }
 
     #[test]
+    fn omnigent_container_placement_drives_the_whole_pipeline() {
+        use crate::archive::{self, Record};
+        use crate::config::{Config, HarnessConfig, PlacementConfig, SandboxConfig};
+        use crate::queue::DirQueue;
+        use chrono::Local;
+        let bridge = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/toto-mcp-exec");
+        if !bridge.exists() || !docker_has("toto-omnigent-test") {
+            eprintln!("skipping: needs docker, the musl bridge and the toto-omnigent-test image");
+            return;
+        }
+        let f = fixture("omni-runner");
+        let (url, seen) = fake_scripted(vec![
+            ("ToolSearch", serde_json::json!({"query": "select:mcp__omnigent__sys_os_shell", "max_results": 1})),
+            ("mcp__omnigent__sys_os_shell", serde_json::json!({"command": "cat calc.txt; echo fixed > calc.txt; ls .claude/skills; cat AGENTS.md; id -u"})),
+        ]);
+        let mut cfg = Config::starter(&f.dir);
+        cfg.sandbox = SandboxConfig::Docker { bin: "docker".into(), image: "toto-omnigent-test".into(), runtime: None, bridge: Some(bridge) };
+        cfg.harness = HarnessConfig::Omnigent { bin: "omnigent".into(), server_url: "http://unused".into(), harness: "claude-sdk".into(), placement: PlacementConfig::Container, provider: Default::default(), upstream: Some(url), token_file: None, api_key_file: None, agent_files: vec![], model: None };
+        cfg.policy = super::policy();
+        cfg.policy.allow_context = true;
+        cfg.policy.daily_token_cap = 10_000_000;
+        cfg.projects.insert("a".into(), hex::encode(f.key_a.verifying_key().to_bytes()));
+        std::fs::create_dir_all(&cfg.state_dir).unwrap();
+        crate::claude_cli::save_token(&cfg.token_path(), "REAL-SECRET-TOKEN").unwrap();
+
+        let q = DirQueue::new(&cfg.queue_dir).unwrap();
+        let inputs = q.post_bundle(&archive::to_bytes(&[Record::File { path: "calc.txt".into(), mode: 0o644, data: b"bug\n".to_vec() }]).unwrap()).unwrap();
+        let context = q.post_bundle(&super::ctxkit::tar(&[(".claude/skills/triage/SKILL.md", super::ctxkit::SKILL_MD), ("AGENTS.md", "Be terse.")])).unwrap();
+        let mut t = task("o1", "a", 100000, &f.key_a);
+        t.prompt = "RUN-THE-TOOL".into();
+        t.inputs = inputs;
+        t.context = Some(context);
+        t.sandbox_profile.timeout_secs = 170;
+        t.output_schema.max_artifact_bytes = 1 << 20;
+        q.post(&t.sign(&f.key_a).unwrap()).unwrap();
+
+        let mut runner = cfg.build().unwrap();
+        let tick = runner.tick(Local::now()).unwrap();
+        assert_eq!(tick, crate::runner::Tick::Submitted("o1".into()), "audit: {:?}", runner.audit.entries().unwrap());
+        let results = q.results().unwrap();
+        let body = results[0].open().unwrap();
+        assert!(body.output.contains("DONE-FROM-FAKE-API"), "{}", body.output);
+        let recs = results[0].artifact_records(1 << 22).unwrap();
+        let paths: Vec<String> = recs.iter().map(|r| match r { Record::File { path, .. } | Record::Deleted { path } => path.clone() }).collect();
+        eprintln!("FACT artifacts returned: {paths:?}");
+        assert!(recs.contains(&Record::File { path: "calc.txt".into(), mode: 0o644, data: b"fixed\n".to_vec() }), "{paths:?}");
+        let bodies = seen.lock().unwrap().clone();
+        let last = bodies.iter().map(|(_, b)| b.as_str()).filter(|b| b.contains("tool_result")).max_by_key(|b| b.matches("tool_result").count()).unwrap();
+        for want in ["bug", "triage", "Be terse.", "65534"] {
+            assert!(last.contains(want), "the agent should have seen {want:?}");
+        }
+        assert!(bodies.iter().filter(|(h, _)| h.iter().any(|(k, v)| k == "path" && v.starts_with("/v1/messages"))).all(|(h, _)| h.iter().any(|(k, v)| k == "authorization" && v == "Bearer REAL-SECRET-TOKEN")));
+        let log = runner.audit.entries().unwrap();
+        assert!(log[0].outcome == "submitted" && log[0].tokens > 50, "{log:?}");
+        assert!(!bodies.iter().any(|(_, b)| b.contains("REAL-SECRET")));
+    }
+
+    #[test]
     fn the_real_cli_runs_a_tool_in_the_container_without_the_credential() {
         let bridge = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/toto-mcp-exec");
         let (Some(claude), true, true) = (claude_bin(), bridge.exists(), docker_has("debian:bookworm-slim")) else {
@@ -2254,6 +2312,59 @@ mod codex_in_container {
         let out = std::process::Command::new("which").arg("codex").output().ok()?;
         let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
         (!p.is_empty()).then(|| std::fs::canonicalize(p).ok()).flatten()
+    }
+
+    /// Omnigent's `codex` harness inside the container, behind the OpenAI profile.
+    #[test]
+    fn codex_through_omnigent_in_the_container() {
+        use crate::context::ProjectContext;
+        use crate::harness::Harness;
+        use crate::meter::UsageMeter;
+        use crate::omnigent::OmnigentHarness;
+        let bridge = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/toto-mcp-exec");
+        let (Some(codex), true) = (codex_bin(), bridge.exists() && docker_has("toto-omnigent-test")) else {
+            eprintln!("skipping: needs docker, the musl bridge, the toto-omnigent-test image and a static codex binary (CODEX_BIN)");
+            return;
+        };
+        let f = fixture("codex-omni");
+        let (url, seen) = fake_responses(r#"text(JSON.stringify(await tools.exec_command({cmd: "echo hello-via-omnigent-codex > /workspace/x.txt; id -u"})));"#.to_string());
+        let dir = f.dir.join("sock");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let proxy = Arc::new(AuthProxy::start(&dir.join("p.sock"), &url, Provider::OpenAi, Auth::Bearer { token: "sk-REAL-OPENAI".into(), oauth: false }).unwrap());
+        let t = task("cx2", "a", 1, &f.key_a);
+        let mut sb = DockerSandbox::new("toto-omnigent-test");
+        sb.bridge = Some(bridge);
+        sb.proxy_socket = Some(proxy.socket().to_path_buf());
+        let host = codex.with_file_name("codex-code-mode-host");
+        sb.agent_files = vec![codex, host];
+        let ws = sb.create(&t, &t.sandbox_profile).unwrap();
+
+        let mut h = OmnigentHarness::new(&f.dir).unwrap().in_container(proxy.clone(), Provider::OpenAi);
+        h.harness = "codex".into();
+        h.model = Some("gpt-5-codex".into());
+        let mut task_m = task("cx2", "a", 100000, &f.key_a);
+        task_m.prompt = "RUN-THE-TOOL please".into();
+        task_m.sandbox_profile.timeout_secs = 170;
+        let started = std::time::Instant::now();
+        let r = h.run(&task_m, &ProjectContext::default(), &ws, &mut UsageMeter::new(1_000_000, 25));
+        eprintln!("FACT omnigent+codex took {:?}: {:?}", started.elapsed(), r.as_ref().map(|s| s.chars().take(160).collect::<String>()).map_err(|e| e.to_string().chars().take(900).collect::<String>()));
+        let out = r.expect("omnigent with the codex harness should finish");
+        assert!(out.contains("DONE-FROM-FAKE-API"), "{out}");
+        let (name, head) = ws.exec_prefix.split_last().unwrap();
+        let mut prefix = head.to_vec();
+        prefix.push(name.clone());
+        let check = exec_io(&Workspace { task_id: "x".into(), path: ws.path.clone(), exec_prefix: prefix, bridge: true }, &["cat", "/workspace/x.txt"], None, Duration::from_secs(10), 1024).unwrap();
+        assert_eq!(String::from_utf8_lossy(&check.stdout), "hello-via-omnigent-codex\n", "the tool ran in the container");
+        let bodies = seen.lock().unwrap().clone();
+        let calls: Vec<_> = bodies.iter().filter(|(h, _)| h.iter().any(|(k, v)| k == "path" && v == "/v1/responses")).collect();
+        assert!(calls.len() >= 2);
+        for (h, _) in &calls {
+            let auth: Vec<&str> = h.iter().filter(|(k, _)| k == "authorization").map(|(_, v)| v.as_str()).collect();
+            assert_eq!(auth, ["Bearer sk-REAL-OPENAI"]);
+        }
+        assert!(proxy.tokens() > 0);
+        sb.destroy(ws).unwrap();
     }
 
     #[test]
