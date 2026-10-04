@@ -1,7 +1,8 @@
 //! Task manifests and the manifest verifier (ADR 3: projects sign, runners verify).
 
 use crate::{Error, Result};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use crate::dsse::Envelope;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -156,23 +157,22 @@ pub struct TaskManifest {
     /// manifests signed before this field existed still verify.
     #[serde(default, skip_serializing_if = "TaskContext::is_empty")]
     pub context: TaskContext,
-    /// Hex ed25519 signature by the project key over the manifest minus this field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signature: Option<String>,
 }
 
-impl TaskManifest {
-    fn signing_bytes(&self) -> Result<Vec<u8>> {
-        let mut unsigned = self.clone();
-        unsigned.signature = None;
-        Ok(serde_json::to_vec(&unsigned)?)
-    }
+/// DSSE payload type of a signed task manifest.
+pub const TASK_PAYLOAD_TYPE: &str = "application/vnd.togra.task+json";
 
-    pub fn sign(mut self, key: &SigningKey) -> Result<Self> {
-        let sig = key.sign(&self.signing_bytes()?);
-        self.signature = Some(hex::encode(sig.to_bytes()));
-        Ok(self)
+impl TaskManifest {
+    /// Signs the manifest as a DSSE envelope. The signed bytes are exactly the JSON payload.
+    pub fn sign(&self, key: &SigningKey) -> Result<Envelope> {
+        Ok(crate::dsse::sign(TASK_PAYLOAD_TYPE, &serde_json::to_vec(self)?, key))
     }
+}
+
+/// The manifest inside an envelope, **unverified** (to find the task id and project). Never act
+/// on the result without `TrustedProjects::verify`.
+pub fn peek_manifest(env: &Envelope) -> Result<TaskManifest> {
+    Ok(serde_json::from_slice(&env.payload_bytes()?)?)
 }
 
 /// Project public keys the contributor trusts, keyed by project id.
@@ -184,19 +184,14 @@ impl TrustedProjects {
         self.0.insert(project_id.into(), key);
     }
 
-    /// Rejects unsigned, tampered or unknown-project manifests.
-    pub fn verify(&self, m: &TaskManifest) -> Result<()> {
-        let key = self
-            .0
-            .get(&m.project_id)
-            .ok_or_else(|| Error::Verify(format!("unknown project `{}`", m.project_id)))?;
-        let sig_hex = m.signature.as_deref().ok_or_else(|| Error::Verify("unsigned".into()))?;
-        let bytes: [u8; 64] = hex::decode(sig_hex)
-            .map_err(|e| Error::Verify(e.to_string()))?
-            .try_into()
-            .map_err(|_| Error::Verify("bad signature length".into()))?;
-        key.verify(&m.signing_bytes()?, &Signature::from_bytes(&bytes))
-            .map_err(|_| Error::Verify("signature mismatch".into()))
+    /// Verifies an envelope against the key of the project it claims to be from, and returns
+    /// the manifest decoded from the *verified* bytes. Rejects unknown projects, tampered
+    /// payloads and wrong payload types.
+    pub fn verify(&self, env: &Envelope) -> Result<TaskManifest> {
+        let claimed = peek_manifest(env)?;
+        let key = self.0.get(&claimed.project_id).ok_or_else(|| Error::Verify(format!("unknown project `{}`", claimed.project_id)))?;
+        let payload = env.verify(TASK_PAYLOAD_TYPE, key)?;
+        Ok(serde_json::from_slice(&payload)?)
     }
 }
 

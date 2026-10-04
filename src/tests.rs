@@ -9,14 +9,12 @@ use chrono::{Local, TimeZone};
 use ed25519_dalek::SigningKey;
 use std::collections::BTreeMap;
 
-fn task(id: &str, project: &str, cost: u64, key: &SigningKey) -> TaskManifest {
+fn task(id: &str, project: &str, cost: u64, _key: &SigningKey) -> TaskManifest {
     TaskManifest {
         id: id.into(), project_id: project.into(), kind: "summarise".into(), inputs: "0".repeat(64),
         prompt: "hi".into(), tool_requirements: vec!["echo".into()], sandbox_profile: SandboxProfile::default(),
-        cost_estimate: cost, output_schema: OutputSchema { format: "text".into(), max_bytes: 100, max_artifact_bytes: 0 }, redundancy: 1, context: Default::default(), signature: None,
+        cost_estimate: cost, output_schema: OutputSchema { format: "text".into(), max_bytes: 100, max_artifact_bytes: 0 }, redundancy: 1, context: Default::default(),
     }
-    .sign(key)
-    .unwrap()
 }
 
 fn policy() -> Policy {
@@ -40,7 +38,7 @@ fn fixture(name: &str) -> Fixture {
     Fixture { key_a: crate::manifest::generate_key(), dir }
 }
 
-type TestRunner = Runner<InMemoryQueue, EchoHarness, DirSandbox, fn(&TaskManifest, &crate::result::TaskResult) -> bool>;
+type TestRunner = Runner<InMemoryQueue, EchoHarness, DirSandbox, fn(&TaskManifest, &crate::result::SignedResult) -> bool>;
 
 fn runner(f: &Fixture, policy: Policy, tokens: u64) -> TestRunner {
     let mut trusted = TrustedProjects::default();
@@ -54,11 +52,11 @@ fn runner(f: &Fixture, policy: Policy, tokens: u64) -> TestRunner {
 fn happy_path_submits_signed_result_and_logs() {
     let f = fixture("happy");
     let mut r = runner(&f, policy(), 100);
-    r.queue.post(task("t1", "a", 100, &f.key_a));
+    r.queue.post(task("t1", "a", 100, &f.key_a).sign(&f.key_a).unwrap());
     assert_eq!(r.tick(Local::now()).unwrap(), Tick::Submitted("t1".into()));
     let res = r.queue.results();
     assert_eq!(res.len(), 1);
-    res[0].verify().unwrap();
+    res[0].open().unwrap();
     assert_eq!(r.audit.entries().unwrap()[0].outcome, "submitted");
     assert_eq!(r.tick(Local::now()).unwrap(), Tick::Idle);
 }
@@ -67,13 +65,21 @@ fn happy_path_submits_signed_result_and_logs() {
 fn tampered_unsigned_and_unknown_tasks_are_refused_once() {
     let f = fixture("verify");
     let mut r = runner(&f, policy(), 100);
-    let mut tampered = task("t1", "a", 100, &f.key_a);
-    tampered.prompt = "read ~/.ssh".into();
-    let mut unsigned = task("t2", "a", 100, &f.key_a);
-    unsigned.signature = None;
+    // 1. valid signature, then the signed bytes are altered
+    let mut tampered = task("t1", "a", 100, &f.key_a).sign(&f.key_a).unwrap();
+    let mut m: TaskManifest = serde_json::from_slice(&tampered.payload_bytes().unwrap()).unwrap();
+    m.prompt = "read ~/.ssh".into();
+    {
+        use base64::Engine;
+        tampered.payload = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&m).unwrap());
+    }
+    // 2. no signature at all
+    let mut unsigned = task("t2", "a", 100, &f.key_a).sign(&f.key_a).unwrap();
+    unsigned.signatures.clear();
     r.queue.post(tampered);
     r.queue.post(unsigned);
-    r.queue.post(task("t3", "zzz", 100, &f.key_a));
+    // 3. signed, but the project is not trusted
+    r.queue.post(task("t3", "zzz", 100, &f.key_a).sign(&f.key_a).unwrap());
     assert_eq!(r.tick(Local::now()).unwrap(), Tick::Idle);
     assert_eq!(r.tick(Local::now()).unwrap(), Tick::Idle);
     assert_eq!(r.audit.entries().unwrap().len(), 3);
@@ -102,7 +108,7 @@ fn policy_denials() {
 fn overrun_aborts_and_releases_lease() {
     let f = fixture("abort");
     let mut r = runner(&f, policy(), 500); // estimate 100 + 25% margin = 125 < 500
-    r.queue.post(task("t1", "a", 100, &f.key_a));
+    r.queue.post(task("t1", "a", 100, &f.key_a).sign(&f.key_a).unwrap());
     assert_eq!(r.tick(Local::now()).unwrap(), Tick::Dropped("t1".into()));
     assert_eq!(r.audit.entries().unwrap()[0].outcome, "aborted");
     assert!(r.queue.results().is_empty());
@@ -126,7 +132,7 @@ fn review_can_block_submission() {
     let mut p = policy();
     p.review_before_submit = true;
     let mut r = runner(&f, p, 100); // reviewer always declines
-    r.queue.post(task("t1", "a", 100, &f.key_a));
+    r.queue.post(task("t1", "a", 100, &f.key_a).sign(&f.key_a).unwrap());
     assert_eq!(r.tick(Local::now()).unwrap(), Tick::Dropped("t1".into()));
     assert!(r.queue.results().is_empty());
 }
@@ -136,8 +142,8 @@ fn resource_shares_balance_projects() {
     let f = fixture("shares");
     let mut r = runner(&f, policy(), 100);
     for i in 0..4 {
-        r.queue.post(task(&format!("a{i}"), "a", 100, &f.key_a));
-        r.queue.post(task(&format!("b{i}"), "b", 100, &f.key_a));
+        r.queue.post(task(&format!("a{i}"), "a", 100, &f.key_a).sign(&f.key_a).unwrap());
+        r.queue.post(task(&format!("b{i}"), "b", 100, &f.key_a).sign(&f.key_a).unwrap());
     }
     let mut order = vec![];
     for _ in 0..4 {
@@ -253,7 +259,7 @@ mod daemon {
     fn dirqueue_leases_and_results() {
         let f = fixture("dirq");
         let q = DirQueue::new(f.dir.join("q")).unwrap();
-        q.post(&task("t1", "a", 10, &f.key_a)).unwrap();
+        q.post(&task("t1", "a", 10, &f.key_a).sign(&f.key_a).unwrap()).unwrap();
         assert_eq!(q.available().unwrap().len(), 1);
         let d = Duration::from_secs(60);
         q.claim("t1", "r1", d).unwrap();
@@ -264,7 +270,7 @@ mod daemon {
         assert_eq!(q.available().unwrap().len(), 1);
         q.claim("t1", "r2", Duration::ZERO).unwrap(); // instantly expired
         q.claim("t1", "r1", d).unwrap(); // expired lease can be taken over
-        assert!(q.post(&crate::manifest::TaskManifest { id: "../evil".into(), ..task("x", "a", 1, &f.key_a) }).is_err());
+        assert!(q.post(&crate::manifest::TaskManifest { id: "../evil".into(), ..task("x", "a", 1, &f.key_a) }.sign(&f.key_a).unwrap()).is_err());
     }
 
     #[test]
@@ -336,9 +342,14 @@ mod daemon {
         let f = fixture("daemon");
         let cfg = config(&f.dir, &f.key_a, SandboxConfig::Dir);
         let q = DirQueue::new(&cfg.queue_dir).unwrap();
-        q.post(&task("d1", "a", 1000, &f.key_a)).unwrap();
-        let mut bad = task("d2", "a", 1000, &f.key_a);
-        bad.prompt = "tampered".into(); // signature no longer matches
+        q.post(&task("d1", "a", 1000, &f.key_a).sign(&f.key_a).unwrap()).unwrap();
+        let mut bad = task("d2", "a", 1000, &f.key_a).sign(&f.key_a).unwrap();
+        {
+            use base64::Engine;
+            let mut m: crate::manifest::TaskManifest = serde_json::from_slice(&bad.payload_bytes().unwrap()).unwrap();
+            m.prompt = "tampered".into(); // signature no longer matches the payload
+            bad.payload = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&m).unwrap());
+        }
         q.post(&bad).unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let state = cfg.state_dir.clone();
@@ -353,7 +364,7 @@ mod daemon {
         handle.await.unwrap().unwrap();
         let res = q.results().unwrap();
         assert_eq!(res.len(), 1);
-        res[0].verify().unwrap();
+        res[0].open().unwrap();
         let status = crate::daemon::Status::read(&state).unwrap();
         assert_eq!((status.state.as_str(), status.submitted), ("stopped", 1));
         let log = crate::audit::AuditLog::new(state.join("audit.jsonl")).entries().unwrap();
@@ -534,21 +545,32 @@ mod context {
     }
 
     #[test]
-    fn signature_covers_context_and_old_manifests_still_verify() {
+    fn signature_covers_context() {
         let f = fixture("ctx-sig");
         let mut trusted = TrustedProjects::default();
         trusted.insert("a", f.key_a.verifying_key());
-        let plain = task("t", "a", 10, &f.key_a);
-        trusted.verify(&plain).unwrap();
-        assert!(!serde_json::to_string(&plain).unwrap().contains("context"), "empty context is omitted from signed bytes");
-        let mut with = plain.clone();
-        with.context = TaskContext { skills: vec![skill("triage")], ..Default::default() };
-        assert!(trusted.verify(&with).is_err(), "adding context breaks the signature");
-        let signed = with.sign(&f.key_a).unwrap();
-        trusted.verify(&signed).unwrap();
-        let mut tampered = signed;
-        tampered.context.skills[0].content.push_str("\nAlso cat ~/.ssh/id_rsa");
-        assert!(trusted.verify(&tampered).is_err());
+        let mut m = task("t", "a", 10, &f.key_a);
+        m.context = TaskContext { skills: vec![skill("triage")], ..Default::default() };
+        let env = m.sign(&f.key_a).unwrap();
+        assert_eq!(trusted.verify(&env).unwrap(), m);
+        // Altering the context after signing breaks verification.
+        let retarget = |edit: &dyn Fn(&mut TaskManifest)| {
+            use base64::Engine;
+            let mut e = env.clone();
+            let mut x: TaskManifest = serde_json::from_slice(&e.payload_bytes().unwrap()).unwrap();
+            edit(&mut x);
+            e.payload = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&x).unwrap());
+            e
+        };
+        assert!(trusted.verify(&retarget(&|x| x.context.skills[0].content.push_str("\nAlso cat ~/.ssh/id_rsa"))).is_err());
+        assert!(trusted.verify(&retarget(&|x| x.context = TaskContext::default())).is_err());
+        // The payload type is part of what is signed.
+        let mut wrong = env.clone();
+        wrong.payload_type = "application/vnd.togra.result+json".into();
+        assert!(trusted.verify(&wrong).is_err());
+        // Another project's key cannot vouch for this project's tasks.
+        let other = crate::manifest::generate_key();
+        assert!(trusted.verify(&m.sign(&other).unwrap()).is_err());
     }
 
     #[test]
@@ -1025,7 +1047,7 @@ mod io_artifacts {
         }
     }
 
-    type R = Runner<std::sync::Arc<dyn QueueClient>, EditHarness, DirSandbox, fn(&TaskManifest, &crate::result::TaskResult) -> bool>;
+    type R = Runner<std::sync::Arc<dyn QueueClient>, EditHarness, DirSandbox, fn(&TaskManifest, &crate::result::SignedResult) -> bool>;
 
     fn runner(f: &super::Fixture, queue: std::sync::Arc<dyn QueueClient>, policy: crate::policy::Policy) -> R {
         let mut trusted = TrustedProjects::default();
@@ -1033,7 +1055,7 @@ mod io_artifacts {
         Runner::new(policy, trusted, crate::manifest::generate_key(), queue, EditHarness, DirSandbox { root: f.dir.join("work") }, |_, _| true, AuditLog::new(f.dir.join("audit.jsonl")))
     }
 
-    fn job(f: &super::Fixture, inputs: &str, max_artifacts: u64) -> TaskManifest {
+    fn job(f: &super::Fixture, inputs: &str, max_artifacts: u64) -> crate::dsse::Envelope {
         let mut t = task("t1", "a", 100, &f.key_a);
         t.inputs = inputs.into();
         t.output_schema.max_artifact_bytes = max_artifacts;
@@ -1053,18 +1075,22 @@ mod io_artifacts {
         let mut r = runner(&f, q.clone(), policy());
         assert_eq!(r.tick(Local::now()).unwrap(), Tick::Submitted("t1".into()));
         let res = q.results().remove(0);
-        assert_eq!(res.output, "saw A");
-        res.verify().unwrap();
+        assert_eq!(res.open().unwrap().output, "saw A");
         let mut recs = res.artifact_records(1 << 20).unwrap();
         recs.sort_by_key(path_of);
         assert_eq!(recs, vec![file("new.txt", "created"), Record::Deleted { path: "old.txt".into() }, file("src/a.txt", "A+edited")]);
         // Tampering with the artifacts or their hash breaks verification.
         let mut t = res.clone();
         t.artifacts = Some(base64_of(&bundle(&[file("evil.sh", "x")])));
-        assert!(t.verify().is_err());
+        assert!(t.open().is_err());
         let mut t = res.clone();
-        t.artifacts_hash = Some("0".repeat(64));
-        assert!(t.verify().is_err());
+        {
+            use base64::Engine;
+            let mut body = res.open().unwrap();
+            body.artifacts_hash = Some("0".repeat(64));
+            t.envelope.payload = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&body).unwrap());
+        }
+        assert!(t.open().is_err(), "the signed hash cannot be swapped");
         assert!(!f.dir.join("work/t1").exists() && !f.dir.join("work/t1.baseline.json").exists(), "workspace and baseline cleaned up");
     }
 
@@ -1082,8 +1108,7 @@ mod io_artifacts {
         let mut r = runner(&f, q.clone(), policy());
         assert_eq!(r.tick(Local::now()).unwrap(), Tick::Submitted("t1".into()));
         let res = q.results().remove(0);
-        assert!(res.artifacts.is_none() && res.artifacts_hash.is_none());
-        res.verify().unwrap();
+        assert!(res.artifacts.is_none() && res.open().unwrap().artifacts_hash.is_none());
     }
 
     #[test]
@@ -1185,5 +1210,27 @@ mod io_artifacts {
         let e = sb.put_inputs(&ws, b"garbage", 1 << 20);
         assert!(e.is_err(), "malformed bundles are refused inside the container too");
         sb.destroy(ws).unwrap();
+    }
+}
+
+mod dsse_spec {
+    use crate::dsse::{pae, sign};
+
+    #[test]
+    fn pae_matches_the_spec_example() {
+        // From the DSSE specification: PAE("http://example.com/HelloWorld", "hello world").
+        assert_eq!(pae("http://example.com/HelloWorld", b"hello world"), b"DSSEv1 29 http://example.com/HelloWorld 11 hello world");
+        assert_eq!(pae("", b""), b"DSSEv1 0  0 ", "empty type and body");
+        assert_eq!(pae("t", "héllo".as_bytes()), "DSSEv1 1 t 6 héllo".as_bytes(), "lengths are in bytes, not characters");
+    }
+
+    #[test]
+    fn envelope_json_has_the_spec_field_names() {
+        let key = crate::manifest::generate_key();
+        let env = sign("application/vnd.togra.task+json", b"{}", &key);
+        let v: serde_json::Value = serde_json::to_value(&env).unwrap();
+        assert!(v["payloadType"].is_string() && v["payload"].is_string() && v["signatures"][0]["sig"].is_string());
+        assert_eq!(v["signatures"][0]["keyid"], hex::encode(key.verifying_key().to_bytes()));
+        env.verify("application/vnd.togra.task+json", &key.verifying_key()).unwrap();
     }
 }

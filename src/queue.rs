@@ -1,7 +1,8 @@
 //! Queue client (ADR 1: runners pull leases; ADR 8: an open protocol, many endpoints).
 
-use crate::manifest::TaskManifest;
-use crate::result::TaskResult;
+use crate::dsse::Envelope;
+use crate::manifest::peek_manifest;
+use crate::result::SignedResult;
 use crate::{Error, Result};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -9,11 +10,11 @@ use std::time::{Duration, Instant};
 
 pub trait QueueClient: Send + Sync {
     /// Tasks currently claimable. The runner picks locally so consent stays on the machine.
-    fn available(&self) -> Result<Vec<TaskManifest>>;
+    fn available(&self) -> Result<Vec<Envelope>>;
     fn claim(&self, task_id: &str, runner_id: &str, lease: Duration) -> Result<()>;
     fn heartbeat(&self, task_id: &str, runner_id: &str, lease: Duration) -> Result<()>;
     /// Idempotent per (task, runner): resubmitting the same result is not an error.
-    fn submit(&self, result: &TaskResult) -> Result<()>;
+    fn submit(&self, result: &SignedResult) -> Result<()>;
     /// The input bundle with this SHA-256 (hex), if the queue has it.
     fn bundle(&self, hash: &str) -> Result<Option<Vec<u8>>>;
     /// Gives a lease back without a result (rejected or aborted tasks).
@@ -21,7 +22,7 @@ pub trait QueueClient: Send + Sync {
 }
 
 impl<T: QueueClient + ?Sized> QueueClient for std::sync::Arc<T> {
-    fn available(&self) -> Result<Vec<TaskManifest>> {
+    fn available(&self) -> Result<Vec<Envelope>> {
         (**self).available()
     }
     fn claim(&self, task_id: &str, runner_id: &str, lease: Duration) -> Result<()> {
@@ -30,7 +31,7 @@ impl<T: QueueClient + ?Sized> QueueClient for std::sync::Arc<T> {
     fn heartbeat(&self, task_id: &str, runner_id: &str, lease: Duration) -> Result<()> {
         (**self).heartbeat(task_id, runner_id, lease)
     }
-    fn submit(&self, result: &TaskResult) -> Result<()> {
+    fn submit(&self, result: &SignedResult) -> Result<()> {
         (**self).submit(result)
     }
     fn release(&self, task_id: &str, runner_id: &str) -> Result<()> {
@@ -49,15 +50,18 @@ pub struct InMemoryQueue {
 
 #[derive(Default)]
 struct State {
-    tasks: Vec<TaskManifest>,
+    tasks: Vec<(String, Envelope)>,
     leases: HashMap<String, (String, Instant)>,
-    results: HashMap<(String, String), TaskResult>,
+    results: HashMap<(String, String), SignedResult>,
     bundles: HashMap<String, Vec<u8>>,
 }
 
 impl InMemoryQueue {
-    pub fn post(&self, t: TaskManifest) {
-        self.state.lock().unwrap().tasks.push(t);
+    /// Queues a signed task. The id is read from the unverified payload only to key leases;
+    /// runners verify before acting.
+    pub fn post(&self, t: Envelope) {
+        let id = peek_manifest(&t).map(|m| m.id).unwrap_or_default();
+        self.state.lock().unwrap().tasks.push((id, t));
     }
 
     /// Stores an input bundle and returns its hash for the manifest's `inputs`.
@@ -67,20 +71,20 @@ impl InMemoryQueue {
         h
     }
 
-    pub fn results(&self) -> Vec<TaskResult> {
+    pub fn results(&self) -> Vec<SignedResult> {
         self.state.lock().unwrap().results.values().cloned().collect()
     }
 }
 
 impl QueueClient for InMemoryQueue {
-    fn available(&self) -> Result<Vec<TaskManifest>> {
+    fn available(&self) -> Result<Vec<Envelope>> {
         let s = self.state.lock().unwrap();
         let now = Instant::now();
         let done = |id: &str| s.results.keys().any(|(t, _)| t == id);
         Ok(s.tasks
             .iter()
-            .filter(|t| !done(&t.id) && s.leases.get(&t.id).map_or(true, |(_, exp)| *exp <= now))
-            .cloned()
+            .filter(|(id, _)| !done(id) && s.leases.get(id).map_or(true, |(_, exp)| *exp <= now))
+            .map(|(_, e)| e.clone())
             .collect())
     }
 
@@ -106,9 +110,9 @@ impl QueueClient for InMemoryQueue {
         }
     }
 
-    fn submit(&self, result: &TaskResult) -> Result<()> {
-        result.verify()?;
-        self.state.lock().unwrap().results.insert((result.task_id.clone(), result.runner_id.clone()), result.clone());
+    fn submit(&self, result: &SignedResult) -> Result<()> {
+        let body = result.open()?;
+        self.state.lock().unwrap().results.insert((body.task_id, body.runner_id), result.clone());
         Ok(())
     }
 
@@ -156,9 +160,10 @@ impl DirQueue {
         Ok(Self { root })
     }
 
-    pub fn post(&self, t: &TaskManifest) -> Result<()> {
-        valid_id(&t.id)?;
-        write_atomic(&self.root.join("tasks").join(format!("{}.json", t.id)), &serde_json::to_vec_pretty(t)?)
+    pub fn post(&self, t: &Envelope) -> Result<()> {
+        let id = peek_manifest(t)?.id;
+        valid_id(&id)?;
+        write_atomic(&self.root.join("tasks").join(format!("{id}.json")), &serde_json::to_vec_pretty(t)?)
     }
 
     /// Stores an input bundle as `bundles/<sha256>` and returns the hash.
@@ -168,7 +173,7 @@ impl DirQueue {
         Ok(h)
     }
 
-    pub fn results(&self) -> Result<Vec<TaskResult>> {
+    pub fn results(&self) -> Result<Vec<SignedResult>> {
         let mut out = vec![];
         for e in std::fs::read_dir(self.root.join("results"))? {
             if let Ok(r) = serde_json::from_slice(&std::fs::read(e?.path())?) {
@@ -203,21 +208,22 @@ fn write_atomic(path: &std::path::Path, data: &[u8]) -> Result<()> {
 }
 
 impl QueueClient for DirQueue {
-    fn available(&self) -> Result<Vec<TaskManifest>> {
+    fn available(&self) -> Result<Vec<Envelope>> {
         let mut out = vec![];
         for e in std::fs::read_dir(self.root.join("tasks"))? {
             let path = e?.path();
             if path.extension().is_none_or(|x| x != "json") {
                 continue;
             }
-            let Ok(t) = serde_json::from_slice::<TaskManifest>(&std::fs::read(&path)?) else { continue };
-            let leased = self.read_lease(&t.id).is_some_and(|(_, exp)| exp > now_unix());
-            if valid_id(&t.id).is_ok() && !leased && !self.has_result(&t.id) {
-                out.push(t);
+            let Ok(env) = serde_json::from_slice::<Envelope>(&std::fs::read(&path)?) else { continue };
+            let Ok(id) = peek_manifest(&env).map(|m| m.id) else { continue };
+            let leased = self.read_lease(&id).is_some_and(|(_, exp)| exp > now_unix());
+            if valid_id(&id).is_ok() && !leased && !self.has_result(&id) {
+                out.push((id, env));
             }
         }
-        out.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(out)
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out.into_iter().map(|(_, e)| e).collect())
     }
 
     fn claim(&self, task_id: &str, runner_id: &str, lease: Duration) -> Result<()> {
@@ -254,10 +260,10 @@ impl QueueClient for DirQueue {
         }
     }
 
-    fn submit(&self, result: &TaskResult) -> Result<()> {
-        result.verify()?;
-        valid_id(&result.task_id)?;
-        let name = format!("{}.{}.json", result.task_id, &result.runner_id[..16]);
+    fn submit(&self, result: &SignedResult) -> Result<()> {
+        let body = result.open()?;
+        valid_id(&body.task_id)?;
+        let name = format!("{}.{}.json", body.task_id, &body.runner_id[..16]);
         write_atomic(&self.root.join("results").join(name), &serde_json::to_vec_pretty(result)?)
     }
 

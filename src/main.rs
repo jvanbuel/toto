@@ -135,8 +135,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("public key: {}", hex::encode(key.verifying_key().to_bytes()));
         }
         Cmd::ExtractResult { result, out } => {
-            let r: togra::result::TaskResult = serde_json::from_slice(&fs::read(&result)?)?;
-            r.verify()?;
+            let r: togra::result::SignedResult = serde_json::from_slice(&fs::read(&result)?)?;
+            let body = r.open()?; // verifies the runner's signature, output hash and artifacts hash
+            println!("result for {} by runner {}…: {} tokens", body.task_id, &body.runner_id[..12], body.tokens_used);
             let records = r.artifact_records(1 << 30)?;
             if records.is_empty() {
                 println!("no artifacts in this result (signature ok)");
@@ -161,7 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let signed = manifest.sign(&ed25519_dalek::SigningKey::from_bytes(&seed))?;
             queue.post(&signed)?;
-            println!("posted {} to {}", signed.id, cfg.queue_dir.display());
+            println!("posted {} to {}", manifest.id, cfg.queue_dir.display());
         }
         Cmd::Login { config } => {
             let cfg = togra::config::Config::load(&config_path(config))?;
@@ -243,7 +244,6 @@ fn demo() -> Result<(), Box<dyn std::error::Error>> {
             output_schema: OutputSchema { format: "text".into(), max_bytes: 4096, max_artifact_bytes: 0 },
             redundancy: 1,
             context: Default::default(),
-            signature: None,
         }
         .sign(&project_key)?,
     );
@@ -252,7 +252,7 @@ fn demo() -> Result<(), Box<dyn std::error::Error>> {
     let mut runner = Runner::new(
         policy, trusted, togra::manifest::generate_key(), queue,
         EchoHarness { tokens_per_run: 400 }, DirSandbox { root: dir.join("work") },
-        |_: &TaskManifest, _: &togra::result::TaskResult| true, AuditLog::new(&audit_path),
+        |_: &TaskManifest, _: &togra::result::SignedResult| true, AuditLog::new(&audit_path),
     );
     let outcome: Tick = runner.tick(Local::now())?;
     println!("{outcome:?}; audit log at {}", audit_path.display());

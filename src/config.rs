@@ -103,7 +103,7 @@ fn default_poll() -> u64 {
 /// The daemon has no human to ask, so review-before-submit is refused at startup.
 struct NoReview;
 impl Reviewer for NoReview {
-    fn approve(&self, _: &crate::manifest::TaskManifest, _: &crate::result::TaskResult) -> bool {
+    fn approve(&self, _: &crate::manifest::TaskManifest, _: &crate::result::SignedResult) -> bool {
         false
     }
 }
@@ -111,7 +111,7 @@ impl Reviewer for NoReview {
 pub type DaemonRunner = Runner<Arc<dyn QueueClient>, Box<dyn Harness>, Box<dyn Sandbox>, Box<dyn Reviewer>>;
 
 impl Reviewer for Box<dyn Reviewer> {
-    fn approve(&self, t: &crate::manifest::TaskManifest, r: &crate::result::TaskResult) -> bool {
+    fn approve(&self, t: &crate::manifest::TaskManifest, r: &crate::result::SignedResult) -> bool {
         (**self).approve(t, r)
     }
 }

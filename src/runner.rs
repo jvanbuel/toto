@@ -6,7 +6,7 @@ use crate::manifest::{TaskManifest, TrustedProjects};
 use crate::meter::UsageMeter;
 use crate::policy::Policy;
 use crate::queue::QueueClient;
-use crate::result::TaskResult;
+use crate::result::SignedResult;
 use crate::sandbox::Sandbox;
 use crate::{Error, Result};
 use chrono::{DateTime, Local};
@@ -17,11 +17,11 @@ use std::time::Duration;
 
 /// Review-before-submit hook; the TUI implements it, tests use closures.
 pub trait Reviewer: Send {
-    fn approve(&self, task: &TaskManifest, result: &TaskResult) -> bool;
+    fn approve(&self, task: &TaskManifest, result: &SignedResult) -> bool;
 }
 
-impl<F: Fn(&TaskManifest, &TaskResult) -> bool + Send> Reviewer for F {
-    fn approve(&self, task: &TaskManifest, result: &TaskResult) -> bool {
+impl<F: Fn(&TaskManifest, &SignedResult) -> bool + Send> Reviewer for F {
+    fn approve(&self, task: &TaskManifest, result: &SignedResult) -> bool {
         self(task, result)
     }
 }
@@ -73,22 +73,35 @@ impl<Q: QueueClient, H: Harness, S: Sandbox, R: Reviewer> Runner<Q, H, S, R> {
         let per_project = self.audit.usage_on(now.date_naive())?;
         let used_today: u64 = per_project.values().sum();
 
-        // 2-3. Candidates must verify (ADR 3) and pass policy before we claim anything.
-        let mut ok = Vec::new();
-        for m in self.queue.available()? {
-            if self.refused.contains(&m.id) {
+        // 2-3. Candidates must verify (ADR 3) and pass policy before we claim anything. Refusals
+        // are remembered by a hash of the signed bytes, never by a task id the sender chose.
+        let mut ok: Vec<(String, TaskManifest)> = Vec::new();
+        for env in self.queue.available()? {
+            let key = env.payload_bytes().map(|b| crate::archive::sha256_hex(&b)).unwrap_or_default();
+            if self.refused.contains(&key) {
                 continue;
             }
-            let supported = if m.context.is_empty() || self.harness.supports_context() { Ok(()) } else { Err(Error::Policy("harness cannot deliver skills or MCP servers".into())) };
-            match self.trusted.verify(&m).and_then(|_| self.policy.admit(&m, used_today, now)).and_then(|_| supported) {
-                Ok(()) => ok.push(m),
+            let verdict = self.trusted.verify(&env).and_then(|m| {
+                self.policy.admit(&m, used_today, now)?;
+                if !m.context.is_empty() && !self.harness.supports_context() {
+                    return Err(Error::Policy("harness cannot deliver skills or MCP servers".into()));
+                }
+                Ok(m)
+            });
+            match verdict {
+                Ok(m) => ok.push((key, m)),
                 Err(e) => {
-                    self.log(&m, "rejected", &e, 0, now)?;
-                    self.refused.insert(m.id.clone());
+                    // Unverified fields are only labels for the log here.
+                    let claimed = crate::manifest::peek_manifest(&env).ok();
+                    let (task_id, project_id) = claimed.map_or(("?".into(), "?".into()), |m| (m.id, m.project_id));
+                    self.audit.append(&AuditEntry { ts: now, task_id, project_id, outcome: "rejected".into(), detail: e.to_string(), tokens: 0 })?;
+                    self.refused.insert(key);
                 }
             }
         }
-        let Some(task) = self.policy.choose(&ok, &per_project).cloned() else { return Ok(Tick::Idle) };
+        let manifests: Vec<TaskManifest> = ok.iter().map(|(_, m)| m.clone()).collect();
+        let Some(task) = self.policy.choose(&manifests, &per_project).cloned() else { return Ok(Tick::Idle) };
+        let key = ok.iter().find(|(_, m)| m.id == task.id && m.project_id == task.project_id).map(|(k, _)| k.clone()).unwrap_or_default();
         let id = self.runner_id();
         if self.queue.claim(&task.id, &id, self.lease).is_err() {
             return Ok(Tick::Idle); // lost the race; try again next tick
@@ -97,9 +110,9 @@ impl<Q: QueueClient, H: Harness, S: Sandbox, R: Reviewer> Runner<Q, H, S, R> {
         *self.current_lease.lock().unwrap() = Some(task.id.clone());
         let out = self.run_claimed(task, &id, now);
         *self.current_lease.lock().unwrap() = None;
-        if let Ok(Tick::Dropped(t)) = &out {
+        if let Ok(Tick::Dropped(_)) = &out {
             // Never retry a task this runner already aborted or failed: it would burn tokens in a loop.
-            self.refused.insert(t.clone());
+            self.refused.insert(key);
         }
         out
     }
@@ -142,7 +155,7 @@ impl<Q: QueueClient, H: Harness, S: Sandbox, R: Reviewer> Runner<Q, H, S, R> {
         let run = self.prepare_inputs(&task, &ws).and_then(|_| self.harness.run(&task, &ws, &mut meter));
         let artifacts = if run.is_ok() { self.collect_artifacts(&task, &ws) } else { Ok(None) };
         self.sandbox.destroy(ws)?;
-        let packaged = run.and_then(|out| TaskResult::package(&task.id, out, meter.used(), &task.output_schema, &self.key, artifacts?));
+        let packaged = run.and_then(|out| SignedResult::package(&task.id, out, meter.used(), &task.output_schema, &self.key, artifacts?));
         let result = match packaged {
             Ok(r) => r,
             Err(e) => {
@@ -155,15 +168,16 @@ impl<Q: QueueClient, H: Harness, S: Sandbox, R: Reviewer> Runner<Q, H, S, R> {
 
         // 8. Optional review before anything leaves the machine.
         if self.policy.review_before_submit && !self.reviewer.approve(&task, &result) {
-            self.log(&task, "rejected", Error::ReviewRejected, result.tokens_used, now)?;
+            self.log(&task, "rejected", Error::ReviewRejected, meter.used(), now)?;
             self.queue.release(&task.id, &id)?;
             return Ok(Tick::Dropped(task.id));
         }
 
         // 9. Submit and record.
         self.queue.submit(&result)?;
-        let detail = if task.context.is_empty() { result.output_hash.clone() } else { format!("{} {}", result.output_hash, task.context.summary()) };
-        self.log(&task, "submitted", detail, result.tokens_used, now)?;
+        let hash = result.open()?.output_hash;
+        let detail = if task.context.is_empty() { hash } else { format!("{hash} {}", task.context.summary()) };
+        self.log(&task, "submitted", detail, meter.used(), now)?;
         Ok(Tick::Submitted(task.id))
     }
 }

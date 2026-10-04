@@ -9,6 +9,7 @@ pub mod audit;
 pub mod claude_cli;
 pub mod config;
 pub mod daemon;
+pub mod dsse;
 pub mod harness;
 pub mod manifest;
 pub mod meter;
