@@ -16,3 +16,13 @@ Implemented so far (milestone 1, offline): manifest signing/verification, a hard
 cargo test
 cargo run -- demo
 ```
+
+## Sandbox runtimes
+
+`DockerSandbox` works with Docker or Podman (`bin`), optionally under gVisor (`runtime = "runsc"`). `cargo test` runs live isolation checks for each combination and skips those whose daemon or `alpine` image is missing.
+
+gVisor needs a runtime registered that disables its own networking, because the sandbox runs with `--network none`:
+
+- Docker, `/etc/docker/daemon.json`: `{"runtimes":{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--network=none"]}}}`
+- Podman 4.x ignores runtime arguments in `containers.conf`; register a wrapper script that runs `runsc --network=none "$@"` instead.
+- Nested VMs (such as cloud dev containers) have no KVM and gVisor's default `systrap` platform hung there; add `--platform=ptrace` (slower, but works). On bare metal keep the default.

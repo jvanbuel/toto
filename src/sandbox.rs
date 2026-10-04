@@ -85,8 +85,8 @@ impl DockerSandbox {
         a.extend([
             "--cpus".into(), format!("{:.2}", p.cpu_millis as f64 / 1000.0),
             "--memory".into(), format!("{}m", p.memory_mb),
-            "--tmpfs".into(), format!("/workspace:rw,noexec,nosuid,uid=65534,gid=65534,mode=0700,size={}m", self.workspace_mb),
-            "--tmpfs".into(), "/tmp:rw,noexec,nosuid,uid=65534,gid=65534,mode=1777,size=64m".into(),
+            "--tmpfs".into(), format!("/workspace:rw,noexec,nosuid,mode=1777,size={}m", self.workspace_mb),
+            "--tmpfs".into(), "/tmp:rw,noexec,nosuid,mode=1777,size=64m".into(),
         ]);
         if let Some(rt) = &self.runtime {
             a.extend(["--runtime".into(), rt.clone()]);

@@ -184,22 +184,49 @@ mod docker {
         assert_eq!(DockerSandbox::container_name("a/b;rm -rf"), "togra-abrm-rf");
     }
 
-    /// Needs a Docker daemon and the alpine image; skipped otherwise.
-    #[test]
-    fn live_container_is_isolated() {
-        if std::process::Command::new("docker").args(["image", "inspect", "alpine"]).output().map_or(true, |o| !o.status.success()) {
-            eprintln!("skipping: no docker daemon or alpine image");
+    /// Runs the isolation checks against a real daemon; skips (returns) if it is unavailable.
+    fn live(bin: &str, runtime: Option<&str>, id: &str) {
+        let have_image = std::process::Command::new(bin).args(["image", "inspect", "alpine"]).output().is_ok_and(|o| o.status.success());
+        if !have_image {
+            eprintln!("skipping {bin}: no daemon or alpine image");
             return;
         }
-        let f = super::fixture("docker");
-        let t = super::task("live1", "a", 1, &f.key_a);
-        let sb = DockerSandbox::new("alpine");
+        let f = super::fixture(id);
+        let t = super::task(id, "a", 1, &f.key_a);
+        let mut sb = DockerSandbox::new("alpine");
+        sb.bin = bin.into();
+        sb.runtime = runtime.map(Into::into);
         let ws = sb.create(&t, &t.sandbox_profile).unwrap();
         let run = |cmd: &str| std::process::Command::new(&ws.exec_prefix[0]).args(&ws.exec_prefix[1..]).args(["sh", "-c", cmd]).output().unwrap();
-        assert!(run("echo hi > /workspace/x && cat /workspace/x").status.success());
-        assert!(!run("touch /etc/x").status.success(), "rootfs read-only");
-        assert!(!run("wget -T 2 -q -O- http://1.1.1.1").status.success(), "no network");
-        assert!(!run("ls /home/user /root").status.success(), "no host fs");
+        let checks = [
+            (run("echo hi > /workspace/x && cat /workspace/x").status.success(), "workspace writable"),
+            (!run("touch /etc/x").status.success(), "rootfs read-only"),
+            (!run("wget -T 2 -q -O- http://1.1.1.1").status.success(), "no network"),
+            (!run("ls /home/user /root").status.success(), "no host fs"),
+        ];
         sb.destroy(ws).unwrap();
+        for (ok, what) in checks {
+            assert!(ok, "{bin} {runtime:?}: {what}");
+        }
+    }
+
+    #[test]
+    fn live_docker() {
+        live("docker", None, "live-docker");
+    }
+
+    #[test]
+    fn live_docker_gvisor() {
+        live("docker", Some("runsc"), "live-docker-gvisor");
+    }
+
+    #[test]
+    fn live_podman() {
+        live("podman", None, "live-podman");
+    }
+
+    #[test]
+    fn live_podman_gvisor() {
+        live("podman", Some("runsc"), "live-podman-gvisor");
     }
 }
