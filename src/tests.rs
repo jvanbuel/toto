@@ -1478,3 +1478,450 @@ mod omnigent_context {
         assert!(h.run(&t, &ProjectContext::default(), &none, &mut UsageMeter::new(100, 25)).is_err(), "nowhere to run");
     }
 }
+
+mod proxy {
+    use super::fixture;
+    use crate::proxy::{Auth, AuthProxy};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Debug)]
+    struct Seen {
+        method: String,
+        path: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl Seen {
+        fn header(&self, k: &str) -> Vec<&str> {
+            self.headers.iter().filter(|(n, _)| n == k).map(|(_, v)| v.as_str()).collect()
+        }
+    }
+
+    /// A fake API origin that records requests and answers every one with the same response.
+    fn upstream(status: u16, ctype: &'static str, body: Vec<u8>) -> (String, Arc<Mutex<Vec<Seen>>>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                let mut r = BufReader::new(s.try_clone().unwrap());
+                let mut line = String::new();
+                r.read_line(&mut line).unwrap();
+                let mut p = line.split_whitespace();
+                let (method, path) = (p.next().unwrap_or("").to_string(), p.next().unwrap_or("").to_string());
+                let mut headers = vec![];
+                loop {
+                    let mut h = String::new();
+                    r.read_line(&mut h).unwrap();
+                    if h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = h.split_once(':') {
+                        headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+                    }
+                }
+                let len: usize = headers.iter().find(|(k, _)| k == "content-length").and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
+                let mut b = vec![0u8; len];
+                r.read_exact(&mut b).unwrap();
+                log.lock().unwrap().push(Seen { method, path, headers, body: b });
+                let mut s = s;
+                let _ = write!(s, "HTTP/1.1 {status} X\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                let _ = s.write_all(&body);
+            }
+        });
+        (url, seen)
+    }
+
+    /// Sends a raw request over the unix socket and returns (status, body).
+    fn call(sock: &std::path::Path, raw: &[u8]) -> (u16, Vec<u8>) {
+        let mut s = UnixStream::connect(sock).unwrap();
+        s.write_all(raw).unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        let text = String::from_utf8_lossy(&out).to_string();
+        let status = text.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let body = out.windows(4).position(|w| w == b"\r\n\r\n").map_or(vec![], |i| out[i + 4..].to_vec());
+        (status, body)
+    }
+
+    fn post(path: &str, headers: &str, body: &str) -> Vec<u8> {
+        format!("POST {path} HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\n{headers}\r\n{body}", body.len()).into_bytes()
+    }
+
+    fn start(f: &super::Fixture, upstream: &str, auth: Auth) -> AuthProxy {
+        let dir = f.dir.join("sock");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        AuthProxy::start(&dir.join("p.sock"), upstream, auth).unwrap()
+    }
+
+    const SSE: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":999,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":20}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+    #[test]
+    fn real_credential_replaces_whatever_the_client_sends() {
+        let f = fixture("px-auth");
+        let (url, seen) = upstream(200, "application/json", b"{}".to_vec());
+        let p = start(&f, &url, Auth::Bearer { token: "REAL-TOKEN".into(), oauth: false });
+        let hdr = "authorization: Bearer dummy-from-container\r\nx-api-key: also-dummy\r\ncookie: session=steal\r\nproxy-authorization: Basic x\r\nanthropic-version: 2023-06-01\r\nx-app: cli\r\n";
+        let (st, _) = call(p.socket(), &post("/v1/messages?beta=true", hdr, r#"{"model":"m"}"#));
+        assert_eq!(st, 200);
+        let s = seen.lock().unwrap()[0].clone();
+        assert_eq!((s.method.as_str(), s.path.as_str()), ("POST", "/v1/messages?beta=true"));
+        assert_eq!(s.header("authorization"), ["Bearer REAL-TOKEN"], "exactly one credential, the real one");
+        assert!(s.header("x-api-key").is_empty() && s.header("cookie").is_empty() && s.header("proxy-authorization").is_empty(), "{:?}", s.headers);
+        assert!(!format!("{:?}", s.headers).contains("dummy"));
+        assert_eq!((s.header("anthropic-version"), s.header("x-app")), (vec!["2023-06-01"], vec!["cli"]), "other headers pass through");
+        assert_eq!(s.header("accept-encoding"), ["identity"], "so usage can be read");
+        assert_eq!(s.body, br#"{"model":"m"}"#);
+        assert!(s.header("anthropic-beta").is_empty(), "no oauth flag for a plain bearer");
+    }
+
+    #[test]
+    fn oauth_adds_its_beta_flag_once_and_api_keys_use_x_api_key() {
+        let f = fixture("px-modes");
+        let (url, seen) = upstream(200, "application/json", b"{}".to_vec());
+        let p = start(&f, &url, Auth::Bearer { token: "T".into(), oauth: true });
+        call(p.socket(), &post("/v1/messages", "anthropic-beta: claude-code-20250219, effort-2025-11-24\r\n", "{}"));
+        call(p.socket(), &post("/v1/messages", "anthropic-beta: oauth-2025-04-20\r\n", "{}"));
+        let s = seen.lock().unwrap().clone();
+        assert_eq!(s[0].header("anthropic-beta"), ["claude-code-20250219,effort-2025-11-24,oauth-2025-04-20"]);
+        assert_eq!(s[1].header("anthropic-beta"), ["oauth-2025-04-20"], "not duplicated");
+        let f2 = fixture("px-key");
+        let (url2, seen2) = upstream(200, "application/json", b"{}".to_vec());
+        let p2 = start(&f2, &url2, Auth::ApiKey("sk-ant-api-REAL".into()));
+        call(p2.socket(), &post("/v1/messages", "authorization: Bearer nope\r\n", "{}"));
+        let s2 = seen2.lock().unwrap()[0].clone();
+        assert_eq!((s2.header("x-api-key"), s2.header("authorization")), (vec!["sk-ant-api-REAL"], vec![]));
+    }
+
+    #[test]
+    fn only_the_messages_endpoints_are_forwarded() {
+        let f = fixture("px-allow");
+        let (url, seen) = upstream(200, "application/json", b"{}".to_vec());
+        let p = start(&f, &url, Auth::ApiKey("K".into()));
+        let get = |path: &str| call(p.socket(), format!("GET {path} HTTP/1.1\r\nhost: x\r\n\r\n").as_bytes()).0;
+        for path in ["/v1/models", "/v1/messages", "/v1/organizations/me", "/v1/files", "/", "//v1/messages", "/v1/messages/../models"] {
+            assert_eq!(get(path), 403, "GET {path}");
+        }
+        for path in ["/v1/complete", "/v1/messages/batches", "/v1/messages/../models", "/v1/messages%2F..%2Fmodels", "/v1/messages/count_tokens/x"] {
+            assert_eq!(call(p.socket(), &post(path, "", "{}")).0, 403, "POST {path}");
+        }
+        assert_eq!(call(p.socket(), &post("/v1/messages/count_tokens", "", "{}")).0, 200, "count_tokens is allowed");
+        assert_eq!(seen.lock().unwrap().len(), 1, "nothing else reached upstream");
+        // the local connectivity check never reaches upstream either
+        let (st, _) = call(p.socket(), b"HEAD /api/hello HTTP/1.1\r\nhost: x\r\n\r\n");
+        assert_eq!(st, 200);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn streamed_responses_pass_through_and_tokens_are_counted() {
+        let f = fixture("px-sse");
+        let (url, _) = upstream(200, "text/event-stream", SSE.as_bytes().to_vec());
+        let p = start(&f, &url, Auth::ApiKey("K".into()));
+        let (st, body) = call(p.socket(), &post("/v1/messages", "", r#"{"stream":true}"#));
+        assert_eq!(st, 200);
+        assert_eq!(String::from_utf8(body).unwrap(), SSE, "byte-exact passthrough");
+        assert_eq!(p.tokens(), 10 + 5 + 20, "input + cache creation + final output; cache reads excluded");
+        call(p.socket(), &post("/v1/messages", "", "{}"));
+        assert_eq!((p.tokens(), p.requests()), (70, 2), "accumulates across requests");
+
+        let f2 = fixture("px-json");
+        let json = br#"{"id":"m","usage":{"input_tokens":7,"cache_creation_input_tokens":3,"output_tokens":4}}"#.to_vec();
+        let (url2, _) = upstream(200, "application/json", json);
+        let p2 = start(&f2, &url2, Auth::ApiKey("K".into()));
+        call(p2.socket(), &post("/v1/messages", "", "{}"));
+        assert_eq!(p2.tokens(), 14, "non-streamed responses are counted too");
+    }
+
+    #[test]
+    fn upstream_errors_pass_through_and_failures_do_not_hang() {
+        let f = fixture("px-err");
+        let (url, _) = upstream(401, "application/json", br#"{"type":"error","error":{"type":"authentication_error"}}"#.to_vec());
+        let p = start(&f, &url, Auth::ApiKey("K".into()));
+        let (st, body) = call(p.socket(), &post("/v1/messages", "", "{}"));
+        assert_eq!(st, 401);
+        assert!(String::from_utf8_lossy(&body).contains("authentication_error"));
+        assert_eq!(p.tokens(), 0);
+        let f2 = fixture("px-down");
+        let p2 = start(&f2, "http://127.0.0.1:9", Auth::ApiKey("K".into())); // nothing listens on :9
+        let (st2, body2) = call(p2.socket(), &post("/v1/messages", "", "{}"));
+        assert_eq!(st2, 502);
+        assert!(!String::from_utf8_lossy(&body2).contains("K\""), "no secret in error bodies");
+    }
+
+    #[test]
+    fn oversized_and_chunked_requests_are_refused_before_forwarding() {
+        let f = fixture("px-limits");
+        let (url, seen) = upstream(200, "application/json", b"{}".to_vec());
+        let p = start(&f, &url, Auth::ApiKey("K".into()));
+        let huge = b"POST /v1/messages HTTP/1.1\r\nhost: x\r\ncontent-length: 999999999\r\n\r\n";
+        assert_eq!(call(p.socket(), huge).0, 413);
+        let chunked = b"POST /v1/messages HTTP/1.1\r\nhost: x\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n";
+        assert_eq!(call(p.socket(), chunked).0, 400);
+        assert_eq!(call(p.socket(), b"garbage\r\n\r\n").0, 403);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn socket_is_reachable_from_a_container_and_removed_on_stop() {
+        let f = fixture("px-sock");
+        let (url, _) = upstream(200, "application/json", b"{}".to_vec());
+        let p = start(&f, &url, Auth::ApiKey("K".into()));
+        let sock = p.socket().to_path_buf();
+        assert_eq!(std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777, 0o666, "connectable through a bind mount by the container user");
+        assert_eq!(std::fs::metadata(sock.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700, "but the directory keeps other host users out");
+        p.stop();
+        assert!(!sock.exists());
+    }
+
+    #[test]
+    fn secrets_are_not_printable() {
+        let a = Auth::Bearer { token: "SECRET-VALUE".into(), oauth: true };
+        assert!(!format!("{a:?}").contains("SECRET"));
+        assert!(!format!("{:?}", Auth::ApiKey("SECRET-VALUE".into())).contains("SECRET"));
+    }
+}
+
+mod proxy_container {
+    use super::{fixture, task};
+    use crate::proxy::{Auth, AuthProxy};
+    use crate::sandbox::{exec, DockerSandbox, Sandbox};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    fn bridge() -> Option<std::path::PathBuf> {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/togra-mcp-exec");
+        p.exists().then_some(p)
+    }
+
+    pub fn docker_has(image: &str) -> bool {
+        std::process::Command::new("docker").args(["image", "inspect", image]).output().is_ok_and(|o| o.status.success())
+    }
+
+    /// Fake API origin recording the auth headers it receives.
+    pub fn fake_api(body: &'static str, ctype: &'static str) -> (String, Arc<Mutex<Vec<Vec<(String, String)>>>>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                let mut r = BufReader::new(s.try_clone().unwrap());
+                let mut first = String::new();
+                r.read_line(&mut first).unwrap();
+                let mut headers = vec![("path".to_string(), first.split_whitespace().nth(1).unwrap_or("").to_string())];
+                loop {
+                    let mut h = String::new();
+                    r.read_line(&mut h).unwrap();
+                    if h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = h.split_once(':') {
+                        headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+                    }
+                }
+                let len: usize = headers.iter().find(|(k, _)| k == "content-length").and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
+                let mut b = vec![0u8; len];
+                r.read_exact(&mut b).unwrap();
+                log.lock().unwrap().push(headers);
+                let mut s = s;
+                let _ = write!(s, "HTTP/1.1 200 OK\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        (url, seen)
+    }
+
+    #[test]
+    fn container_reaches_only_the_proxy_and_never_sees_the_credential() {
+        let (Some(bin), true) = (bridge(), docker_has("alpine")) else {
+            eprintln!("skipping: needs docker, alpine and the musl bridge build");
+            return;
+        };
+        let f = fixture("pxc");
+        let (url, seen) = fake_api(r#"{"usage":{"input_tokens":3,"output_tokens":4}}"#, "application/json");
+        let dir = f.dir.join("sock");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let proxy = AuthProxy::start(&dir.join("p.sock"), &url, Auth::Bearer { token: "REAL-SECRET-TOKEN".into(), oauth: false }).unwrap();
+
+        let t = task("pxc1", "a", 1, &f.key_a);
+        let mut sb = DockerSandbox::new("alpine");
+        sb.bridge = Some(bin);
+        sb.proxy_socket = Some(proxy.socket().to_path_buf());
+        let ws = sb.create(&t, &t.sandbox_profile).unwrap();
+        let sh = |c: &str| exec(&ws, &["sh", "-c", c], Duration::from_secs(20)).unwrap();
+
+        // 1. a request through the relay reaches upstream with the REAL credential, not the dummy
+        let out = sh("wget -q -O- --header 'authorization: Bearer dummy-in-container' --header 'x-api-key: dummy2' --post-data '{}' http://127.0.0.1:8080/v1/messages");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(String::from_utf8_lossy(&out.stdout).contains("input_tokens"));
+        let h = seen.lock().unwrap()[0].clone();
+        let get = |k: &str| h.iter().filter(|(n, _)| n == k).map(|(_, v)| v.clone()).collect::<Vec<_>>();
+        assert_eq!(get("authorization"), ["Bearer REAL-SECRET-TOKEN"]);
+        assert!(get("x-api-key").is_empty());
+        assert_eq!(proxy.tokens(), 7);
+
+        // 2. the credential is not anywhere in the container: environment, mounts, filesystem
+        let hay = sh("env; cat /proc/mounts; ls -la /togra; find / -xdev -type f -size -64k 2>/dev/null | head -2000 | xargs grep -l REAL-SECRET 2>/dev/null; echo done");
+        assert!(!String::from_utf8_lossy(&hay.stdout).contains("REAL-SECRET"), "credential leaked into the container");
+
+        // 3. the container still has no network: only the relay is reachable, and only the allowed calls pass
+        assert!(!sh("wget -T 2 -q -O- http://1.1.1.1").status.success(), "no outside network");
+        assert!(!sh("wget -T 2 -q -O- http://127.0.0.1:9999/").status.success(), "no other loopback service");
+        assert!(!sh("wget -q -O- http://127.0.0.1:8080/v1/models").status.success(), "the proxy refuses other endpoints (403)");
+        assert_eq!(seen.lock().unwrap().len(), 1, "upstream saw only the allowed request");
+        sb.destroy(ws).unwrap();
+    }
+}
+
+mod claude_in_container {
+    use super::proxy_container::{docker_has, fake_api};
+    use super::{fixture, task};
+    use crate::proxy::{Auth, AuthProxy};
+    use crate::sandbox::{exec_io, DockerSandbox, Sandbox, Workspace, AGENT_PATH, PROXY_ADDR};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    fn sse(blocks: &str, stop: &str, out: u64) -> String {
+        format!("event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-fake\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":25,\"output_tokens\":1}}}}}}\n\n{blocks}event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{stop}\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":{out}}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n")
+    }
+
+    fn text(t: &str) -> String {
+        sse(&format!("event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\nevent: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{t}\"}}}}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n"), "end_turn", 12)
+    }
+
+    fn tool_use(command: &str) -> String {
+        let input = serde_json::to_string(&serde_json::json!({"command": command, "description": "test"})).unwrap();
+        let partial = serde_json::to_string(&input).unwrap();
+        sse(&format!("event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Bash\",\"input\":{{}}}}}}\n\nevent: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":{partial}}}}}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n"), "tool_use", 30)
+    }
+
+    type Bodies = Arc<Mutex<Vec<(Vec<(String, String)>, String)>>>;
+
+    /// A fake Messages API: asks for one Bash call when it sees the marker prompt, then finishes.
+    fn fake_anthropic(command: &'static str) -> (String, Bodies) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let seen: Bodies = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                let log = log.clone();
+                std::thread::spawn(move || {
+                    let mut r = BufReader::new(s.try_clone().unwrap());
+                    let mut first = String::new();
+                    if r.read_line(&mut first).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let mut headers = vec![("path".to_string(), first.split_whitespace().nth(1).unwrap_or("").to_string())];
+                    loop {
+                        let mut h = String::new();
+                        r.read_line(&mut h).unwrap();
+                        if h.trim().is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = h.split_once(':') {
+                            headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+                        }
+                    }
+                    let len: usize = headers.iter().find(|(k, _)| k == "content-length").and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
+                    let mut b = vec![0u8; len];
+                    r.read_exact(&mut b).unwrap();
+                    let body = String::from_utf8_lossy(&b).to_string();
+                    log.lock().unwrap().push((headers, body.clone()));
+                    let streaming = body.contains("\"stream\":true");
+                    let (ctype, payload) = if !streaming {
+                        ("application/json", r#"{"id":"msg_x","type":"message","role":"assistant","model":"claude-fake","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":2}}"#.to_string())
+                    } else if body.contains("tool_result") {
+                        ("text/event-stream", text("DONE-FROM-FAKE-API"))
+                    } else if body.contains("RUN-THE-TOOL") {
+                        ("text/event-stream", tool_use(command))
+                    } else {
+                        ("text/event-stream", text("ok"))
+                    };
+                    let mut s = s;
+                    let _ = write!(s, "HTTP/1.1 200 OK\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}", payload.len());
+                });
+            }
+        });
+        (url, seen)
+    }
+
+    fn claude_bin() -> Option<std::path::PathBuf> {
+        let out = std::process::Command::new("which").arg("claude").output().ok()?;
+        let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!p.is_empty()).then(|| std::fs::canonicalize(p).ok()).flatten()
+    }
+
+    #[test]
+    fn the_real_cli_runs_a_tool_in_the_container_without_the_credential() {
+        let bridge = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/togra-mcp-exec");
+        let (Some(claude), true, true) = (claude_bin(), bridge.exists(), docker_has("debian:bookworm-slim")) else {
+            eprintln!("skipping: needs docker, debian:bookworm-slim, the musl bridge and a claude binary");
+            return;
+        };
+        let f = fixture("cic");
+        let (url, seen) = fake_anthropic("echo hello-from-tool > /workspace/x.txt; id -u; echo secret-check=${CLAUDE_CODE_OAUTH_TOKEN:-unset}-${ANTHROPIC_API_KEY:-unset}");
+        let dir = f.dir.join("sock");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let proxy = AuthProxy::start(&dir.join("p.sock"), &url, Auth::Bearer { token: "REAL-SECRET-TOKEN".into(), oauth: true }).unwrap();
+
+        let t = task("cic1", "a", 1, &f.key_a);
+        let mut sb = DockerSandbox::new("debian:bookworm-slim");
+        sb.bridge = Some(bridge);
+        sb.proxy_socket = Some(proxy.socket().to_path_buf());
+        sb.agent_binary = Some(claude);
+        let ws = sb.create(&t, &t.sandbox_profile).unwrap();
+
+        // Run the agent inside the container: env flags go before the container name in `docker exec`.
+        let (name, head) = ws.exec_prefix.split_last().unwrap();
+        let mut prefix: Vec<String> = head.to_vec();
+        for e in [format!("ANTHROPIC_BASE_URL=http://{PROXY_ADDR}"), "ANTHROPIC_AUTH_TOKEN=dummy-not-a-credential".into(), "HOME=/tmp/home".into(), "CLAUDE_CONFIG_DIR=/tmp/home/.claude".into(), "DISABLE_AUTOUPDATER=1".into(), "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1".into(), "TERM=dumb".into()] {
+            prefix.extend(["-e".into(), e]);
+        }
+        prefix.extend(["-w".into(), "/workspace".into(), name.clone()]);
+        let agent_ws = Workspace { exec_prefix: prefix, ..Workspace { task_id: ws.task_id.clone(), path: ws.path.clone(), exec_prefix: vec![], bridge: true } };
+        let args = [AGENT_PATH, "-p", "--output-format", "stream-json", "--verbose", "--no-session-persistence", "--setting-sources", "project", "--permission-mode", "dontAsk", "--allowedTools=Bash", "--tools", "Bash", "--max-turns", "5"];
+        let out = exec_io(&agent_ws, &args, Some(b"RUN-THE-TOOL please"), Duration::from_secs(120), 8 << 20).unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(out.status.success(), "claude failed.\nstdout tail: {}\nstderr: {stderr}", stdout.lines().rev().take(3).collect::<Vec<_>>().join("\n"));
+
+        let events: Vec<serde_json::Value> = stdout.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        let result = events.iter().find(|e| e["type"] == "result").expect("a result event");
+        assert!(result["result"].as_str().unwrap_or("").contains("DONE-FROM-FAKE-API"), "{result}");
+        let init = events.iter().find(|e| e["subtype"] == "init").expect("an init event");
+        assert_eq!(init["tools"], serde_json::json!(["Bash"]), "only the allowed built-in tool exists: {init}");
+
+        // the tool really ran inside the container, as the unprivileged user
+        let check = exec_io(&Workspace { task_id: "x".into(), path: ws.path.clone(), exec_prefix: ws.exec_prefix.clone(), bridge: true }, &["cat", "/workspace/x.txt"], None, Duration::from_secs(10), 1024).unwrap();
+        assert_eq!(String::from_utf8_lossy(&check.stdout), "hello-from-tool\n");
+        let bodies = seen.lock().unwrap().clone();
+        let tool_result_body = bodies.iter().map(|(_, b)| b.as_str()).find(|b| b.contains("tool_result")).expect("the model got the tool result back");
+        assert!(tool_result_body.contains("65534") && tool_result_body.contains("secret-check=unset-unset"), "tool ran as nobody with no credential in its environment: {tool_result_body}");
+
+        // every model call carried the REAL credential, added by the proxy; the container's dummy never arrived
+        let model_calls: Vec<_> = bodies.iter().filter(|(h, _)| h.iter().any(|(k, v)| k == "path" && v.starts_with("/v1/messages"))).collect();
+        assert!(model_calls.len() >= 2, "{} model calls", model_calls.len());
+        for (h, _) in &model_calls {
+            let auth: Vec<&str> = h.iter().filter(|(k, _)| k == "authorization").map(|(_, v)| v.as_str()).collect();
+            assert_eq!(auth, ["Bearer REAL-SECRET-TOKEN"]);
+            assert!(h.iter().any(|(k, v)| k == "anthropic-beta" && v.contains("oauth-2025-04-20")), "oauth beta flag added by the proxy");
+        }
+        assert!(proxy.tokens() > 50, "the proxy metered the traffic itself: {}", proxy.tokens());
+        let env = exec_io(&Workspace { task_id: "x".into(), path: ws.path.clone(), exec_prefix: ws.exec_prefix.clone(), bridge: true }, &["sh", "-c", "env; cat /proc/mounts"], None, Duration::from_secs(10), 1 << 20).unwrap();
+        assert!(!String::from_utf8_lossy(&env.stdout).contains("REAL-SECRET"));
+        sb.destroy(ws).unwrap();
+    }
+}

@@ -9,6 +9,11 @@ use std::time::{Duration, Instant};
 
 /// Where the MCP exec bridge appears inside a container sandbox.
 pub const BRIDGE_PATH: &str = "/togra/mcp-exec";
+/// Where the credential proxy's unix socket and the agent binary appear inside the container.
+pub const PROXY_SOCKET_PATH: &str = "/togra/proxy.sock";
+pub const AGENT_PATH: &str = "/togra/claude";
+/// Loopback address the in-container relay serves; the agent's API base URL points here.
+pub const PROXY_ADDR: &str = "127.0.0.1:8080";
 
 /// An isolated workspace for one task. Dropping it must destroy the environment.
 pub trait Sandbox: Send {
@@ -139,13 +144,18 @@ pub struct DockerSandbox {
     /// Static `togra-mcp-exec` binary to mount read-only at `BRIDGE_PATH`: the only host path a
     /// task container can see.
     pub bridge: Option<PathBuf>,
+    /// Credential proxy socket (host side), bind-mounted at `PROXY_SOCKET_PATH`. When set, a
+    /// loopback relay to it is started inside the container at `PROXY_ADDR` (ADR 12).
+    pub proxy_socket: Option<PathBuf>,
+    /// Agent CLI binary (glibc, e.g. the host's `claude`) mounted read-only at `AGENT_PATH`.
+    pub agent_binary: Option<PathBuf>,
     /// Content baselines of unpacked inputs, by task id (kept on the host, never in the container).
     baselines: std::sync::Mutex<std::collections::HashMap<String, std::collections::BTreeMap<String, String>>>,
 }
 
 impl DockerSandbox {
     pub fn new(image: impl Into<String>) -> Self {
-        Self { bin: "docker".into(), image: image.into(), runtime: None, workspace_mb: 512, bridge: None, baselines: Default::default() }
+        Self { bin: "docker".into(), image: image.into(), runtime: None, workspace_mb: 512, bridge: None, proxy_socket: None, agent_binary: None, baselines: Default::default() }
     }
 
     pub fn container_name(task_id: &str) -> String {
@@ -175,6 +185,12 @@ impl DockerSandbox {
         if let Some(b) = &self.bridge {
             a.extend(["--mount".into(), format!("type=bind,src={},dst={BRIDGE_PATH},readonly", b.display())]);
         }
+        if let Some(sock) = &self.proxy_socket {
+            a.extend(["--mount".into(), format!("type=bind,src={},dst={PROXY_SOCKET_PATH}", sock.display())]);
+        }
+        if let Some(bin) = &self.agent_binary {
+            a.extend(["--mount".into(), format!("type=bind,src={},dst={AGENT_PATH},readonly", bin.display())]);
+        }
         if let Some(rt) = &self.runtime {
             a.extend(["--runtime".into(), rt.clone()]);
         }
@@ -192,6 +208,25 @@ impl DockerSandbox {
     }
 }
 
+impl DockerSandbox {
+    /// Starts the loopback relay to the credential proxy inside the container and waits until it
+    /// accepts connections. Needs the bridge binary (which provides `relay` and `probe`).
+    fn start_relay(&self, container: &str) -> Result<()> {
+        if self.bridge.is_none() {
+            return Err(Error::Sandbox("the credential proxy relay needs the bridge binary".into()));
+        }
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        self.docker(&s(&["exec", "-d", container, BRIDGE_PATH, "relay", PROXY_ADDR, PROXY_SOCKET_PATH]))?;
+        for _ in 0..50 {
+            if self.docker(&s(&["exec", container, BRIDGE_PATH, "probe", PROXY_ADDR])).is_ok() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Err(Error::Sandbox("the credential proxy relay did not start".into()))
+    }
+}
+
 impl Sandbox for DockerSandbox {
     fn probe(&self) -> Result<()> {
         self.docker(&["version".into(), "--format".into(), "{{.Server.Version}}".into()])
@@ -205,7 +240,10 @@ impl Sandbox for DockerSandbox {
         let args = self.run_args(&task.id, profile)?;
         self.docker(&args)?;
         let name = Self::container_name(&task.id);
-        let exec_prefix = vec![self.bin.clone(), "exec".into(), "-i".into(), name];
+        let exec_prefix = vec![self.bin.clone(), "exec".into(), "-i".into(), name.clone()];
+        if self.proxy_socket.is_some() {
+            self.start_relay(&name)?;
+        }
         Ok(Workspace { task_id: task.id.clone(), path: PathBuf::new(), exec_prefix, bridge: self.bridge.is_some() })
     }
 

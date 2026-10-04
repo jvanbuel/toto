@@ -3,6 +3,9 @@ name = "togra"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["bridge"]
+
 [dependencies]
 base64 = "0.23.1"
 chrono = { version = "0.4.45", features = ["serde"] }
@@ -17,4 +20,4 @@ sha2 = "0.11.0"
 tar = { version = "0.4.46", default-features = false }
 thiserror = "2.0.21"
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
-ureq = { version = "3.4.2", default-features = false }
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }

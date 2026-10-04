@@ -1,0 +1,8 @@
+[package]
+name = "togra-mcp-exec"
+version = "0.1.0"
+edition = "2021"
+description = "Static helper that runs inside a task container: an MCP server with shell and file tools, and a loopback relay to the credential proxy"
+
+[dependencies]
+serde_json = "1"

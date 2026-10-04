@@ -16,6 +16,7 @@ pub mod manifest;
 pub mod meter;
 pub mod omnigent;
 pub mod policy;
+pub mod proxy;
 pub mod queue;
 pub mod result;
 pub mod runner;

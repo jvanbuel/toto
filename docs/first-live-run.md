@@ -17,11 +17,11 @@ Build the bridge as a static binary **for the architecture your containers run**
 
 ```
 mkdir -p dist && docker run --rm -v "$PWD":/src:ro -v "$PWD/dist":/out -e CARGO_TARGET_DIR=/out -w /src rust:alpine \
-  sh -c 'apk add --no-cache musl-dev && cargo build --release --bin togra-mcp-exec'
+  sh -c 'apk add --no-cache musl-dev && cargo build --release -p togra-mcp-exec'
 # result: dist/release/togra-mcp-exec
 ```
 
-On Linux x86_64 you can instead use `rustup target add x86_64-unknown-linux-musl` and `cargo build --release --target x86_64-unknown-linux-musl --bin togra-mcp-exec`.
+On Linux x86_64 you can instead use `rustup target add x86_64-unknown-linux-musl` and `cargo build --release --target x86_64-unknown-linux-musl -p togra-mcp-exec`.
 
 ## 2. Configure
 
