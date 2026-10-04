@@ -27,10 +27,23 @@ enum Cmd {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
-    /// Run the daemon in the foreground (what the service unit invokes).
+    /// Run the daemon in the foreground (what the service unit invokes). With --once, process
+    /// available tasks until none are left, print each outcome and exit (for testing).
     Run {
         #[arg(long)]
         config: Option<PathBuf>,
+        #[arg(long)]
+        once: bool,
+    },
+    /// Generate a project signing key (hex seed, mode 0600) and print its public key.
+    ProjectKey { out: PathBuf },
+    /// Sign a task manifest (JSON, no signature) with a project key and put it in the queue dir.
+    PostTask {
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        task: PathBuf,
     },
     /// Sign in the daemon's Claude subscription: runs `claude setup-token`, then stores the token.
     Login {
@@ -87,9 +100,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             fs::write(&path, serde_json::to_string_pretty(&cfg)?)?;
             println!("wrote {}\nrunner id: {id}\nNothing will run until you add a trusted project, allowed kinds and a share to the config.", path.display());
         }
-        Cmd::Run { config } => {
+        Cmd::Run { config, once: false } => {
             let cfg = togra::config::Config::load(&config_path(config))?;
             togra::daemon::run(cfg, shutdown_signal()).await?;
+        }
+        Cmd::Run { config, once: true } => {
+            let cfg = togra::config::Config::load(&config_path(config))?;
+            let mut runner = cfg.build()?;
+            runner.sandbox.probe()?;
+            runner.harness.probe()?;
+            println!("sandbox and harness probes passed");
+            loop {
+                match runner.tick(Local::now())? {
+                    Tick::Idle => break,
+                    other => println!("{other:?}"),
+                }
+            }
+            println!("queue empty; audit log: {}", cfg.state_dir.join("audit.jsonl").display());
+        }
+        Cmd::ProjectKey { out } => {
+            let key = togra::manifest::generate_key();
+            fs::write(&out, hex::encode(key.to_bytes()))?;
+            fs::set_permissions(&out, fs::Permissions::from_mode(0o600))?;
+            println!("public key: {}", hex::encode(key.verifying_key().to_bytes()));
+        }
+        Cmd::PostTask { key, config, task } => {
+            let cfg = togra::config::Config::load(&config_path(config))?;
+            let seed: [u8; 32] = hex::decode(fs::read_to_string(&key)?.trim()).ok().and_then(|b| b.try_into().ok()).ok_or("project key must be a 32-byte hex seed")?;
+            let manifest: TaskManifest = serde_json::from_slice(&fs::read(&task)?)?;
+            let signed = manifest.sign(&ed25519_dalek::SigningKey::from_bytes(&seed))?;
+            togra::queue::DirQueue::new(&cfg.queue_dir)?.post(&signed)?;
+            println!("posted {} to {}", signed.id, cfg.queue_dir.display());
         }
         Cmd::Login { config } => {
             let cfg = togra::config::Config::load(&config_path(config))?;
