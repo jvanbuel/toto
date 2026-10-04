@@ -14,6 +14,7 @@ pub mod doctor;
 pub mod dsse;
 pub mod harness;
 pub mod manifest;
+pub mod http_queue;
 pub mod meter;
 pub mod netfence;
 pub mod omnigent;

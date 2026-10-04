@@ -58,7 +58,18 @@ pub fn run_all(cfg: &Config) -> Vec<Check> {
     } else {
         c.push(Check::new(Level::Ok, "policy", format!("daily cap {} tokens, {} kinds", cfg.policy.daily_token_cap, cfg.policy.allowed_kinds.len())));
     }
-    c.push(if cfg.queue_dir.is_dir() { Check::new(Level::Ok, "queue", cfg.queue_dir.display().to_string()) } else { Check::new(Level::Warn, "queue", format!("{} does not exist yet", cfg.queue_dir.display())) });
+    for e in &cfg.queues {
+        let plain = e.url.starts_with("http://") && !e.url.contains("//127.") && !e.url.contains("//localhost");
+        let token = e.token_file.as_deref().map(crate::claude_cli::read_secret).transpose();
+        c.push(match token.map(|t| crate::http_queue::HttpQueue::new(&e.url, t)).and_then(|q| crate::queue::QueueClient::available(&q)) {
+            Ok(tasks) if plain => Check::new(Level::Warn, "queue", format!("{} reachable ({} tasks) but uses plain http; tasks and results cross the network unencrypted", e.url, tasks.len())),
+            Ok(tasks) => Check::new(Level::Ok, "queue", format!("{} reachable, {} tasks available", e.url, tasks.len())),
+            Err(err) => Check::new(Level::Fail, "queue", format!("{}: {err}", e.url)),
+        });
+    }
+    if cfg.queues.is_empty() {
+        c.push(if cfg.queue_dir.is_dir() { Check::new(Level::Ok, "queue", cfg.queue_dir.display().to_string()) } else { Check::new(Level::Warn, "queue", format!("{} does not exist yet", cfg.queue_dir.display())) });
+    }
 
     match &cfg.sandbox {
         SandboxConfig::Dir => c.push(Check::new(Level::Warn, "sandbox", "`dir` gives no isolation (development only)")),

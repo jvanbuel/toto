@@ -40,3 +40,7 @@ The target for federation is BOINC's model: each project runs its own queue spea
 - Fair scheduling, budgets and the public ledger are straightforward.
 - The coordinator is a single point of failure for availability, not for integrity: if it is down, runners idle; if it is compromised, signature checks still hold.
 - Federation remains a later, incremental step rather than a rewrite.
+
+## Update (2026-10-04): the queue protocol and a reference server
+
+The open protocol is written down in `docs/queue-protocol.md` (version 1: list, claim, heartbeat, release, submit result, fetch bundle). `toto` has an HTTP client for it and supports several coordinators at once (`queues` in the config; claims go back to the coordinator that listed the task, a dead coordinator is skipped). `toto serve-queue` is a reference server over the spool directory for pilots and tests. The Postgres-backed coordinator, project registry, ledger, per-runner authentication and posting over HTTP are not built; ADR 1's GitHub-issues option is still open as an alternative first queue.

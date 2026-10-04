@@ -96,6 +96,17 @@ enum Cmd {
         #[arg(long)]
         remove: bool,
     },
+    /// Serve a spool directory over the queue protocol (reference coordinator for pilots).
+    ServeQueue {
+        /// Spool directory (the same layout `post-task` writes to).
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        addr: String,
+        /// File holding the bearer token clients must send. Without it the server is open.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+    },
     /// Run one signed task end to end against an in-memory queue and an echo harness.
     Demo,
 }
@@ -176,6 +187,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 println!("done; set \"network\": \"{name}\" in the docker sandbox config, then run `toto doctor`");
             }
+        }
+        Cmd::ServeQueue { dir, addr, token_file } => {
+            let token = token_file.as_deref().map(toto::claude_cli::read_secret).transpose()?;
+            if token.is_none() && !addr.starts_with("127.") {
+                eprintln!("warning: serving without a token on {addr}; anyone who can reach it can claim tasks and read bundles");
+            }
+            let server = toto::http_queue::serve(std::sync::Arc::new(toto::queue::DirQueue::new(dir)?), &addr, token)?;
+            println!("serving the queue protocol on http://{}", server.addr);
+            shutdown_signal().await;
+            server.stop();
         }
         Cmd::ProjectKey { out } => {
             let key = toto::manifest::generate_key();

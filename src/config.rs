@@ -176,6 +176,11 @@ pub struct Config {
     pub state_dir: PathBuf,
     /// Spool directory acting as the queue (see `DirQueue`).
     pub queue_dir: PathBuf,
+    /// Coordinators speaking the queue protocol (`docs/queue-protocol.md`). Empty: the spool
+    /// directory above is the queue. With several, tasks from all are considered and each claim
+    /// goes back to the coordinator the task came from.
+    #[serde(default)]
+    pub queues: Vec<QueueEndpoint>,
     #[serde(default = "default_poll")]
     pub poll_secs: u64,
     pub sandbox: SandboxConfig,
@@ -184,6 +189,14 @@ pub struct Config {
     /// Trusted project public keys (hex ed25519), by project id.
     #[serde(default)]
     pub projects: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueEndpoint {
+    pub url: String,
+    /// File holding the bearer token for this coordinator, if it needs one.
+    #[serde(default)]
+    pub token_file: Option<PathBuf>,
 }
 
 fn default_poll() -> u64 {
@@ -218,6 +231,7 @@ impl Config {
             key_file: dir.join("runner.key"),
             state_dir: dir.join("state"),
             queue_dir: dir.join("queue"),
+            queues: vec![],
             poll_secs: default_poll(),
             sandbox: SandboxConfig::Docker { bin: docker_bin(), image: "alpine".into(), runtime: None, bridge: None, nested_userns: false, network: None },
             harness: HarnessConfig::Echo { tokens_per_run: 100 },
@@ -303,6 +317,18 @@ impl Config {
         Ok(std::sync::Arc::new(crate::proxy::AuthProxy::start(&dir.join("p.sock"), upstream, provider.provider(), auth)?))
     }
 
+    pub fn build_queue(&self) -> Result<Arc<dyn QueueClient>> {
+        if self.queues.is_empty() {
+            return Ok(Arc::new(DirQueue::new(&self.queue_dir)?));
+        }
+        let mut endpoints: Vec<Arc<dyn QueueClient>> = vec![];
+        for e in &self.queues {
+            let token = e.token_file.as_deref().map(crate::claude_cli::read_secret).transpose()?;
+            endpoints.push(Arc::new(crate::http_queue::HttpQueue::new(&e.url, token)));
+        }
+        Ok(Arc::new(crate::http_queue::MultiQueue::new(endpoints)))
+    }
+
     pub fn build(&self) -> Result<DaemonRunner> {
         if self.policy.review_before_submit {
             return Err(Error::Policy("review_before_submit needs the TUI; the daemon cannot ask a human".into()));
@@ -357,7 +383,7 @@ impl Config {
                 Box::new(h)
             }
         };
-        let queue: Arc<dyn QueueClient> = Arc::new(DirQueue::new(&self.queue_dir)?);
+        let queue = self.build_queue()?;
         Ok(Runner::new(
             self.policy.clone(),
             trusted,

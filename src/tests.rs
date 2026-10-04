@@ -2711,3 +2711,118 @@ mod doctor {
         }
     }
 }
+
+mod http_queue {
+    use crate::http_queue::*;
+    use crate::queue::{DirQueue, QueueClient};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct Env {
+        dir: std::path::PathBuf,
+        spool: Arc<DirQueue>,
+        key: ed25519_dalek::SigningKey,
+        server: Server,
+    }
+
+    fn env(name: &str, token: Option<&str>) -> Env {
+        let f = super::fixture(&format!("hq-{name}"));
+        let spool = Arc::new(DirQueue::new(f.dir.join("spool")).unwrap());
+        let server = serve(spool.clone(), "127.0.0.1:0", token.map(String::from)).unwrap();
+        Env { dir: f.dir, spool, key: f.key_a, server }
+    }
+
+    fn url(e: &Env) -> String {
+        format!("http://{}", e.server.addr)
+    }
+
+    #[test]
+    fn the_whole_lease_lifecycle_works_over_http() {
+        let e = env("life", None);
+        let q = HttpQueue::new(&url(&e), None);
+        e.spool.post(&super::task("h1", "a", 1, &e.key).sign(&e.key).unwrap()).unwrap();
+        let hash = e.spool.post_bundle(b"bundle-bytes").unwrap();
+
+        let tasks = q.available().unwrap();
+        assert_eq!(tasks.len(), 1);
+        q.claim("h1", "runner-a", Duration::from_secs(60)).unwrap();
+        assert!(q.claim("h1", "runner-b", Duration::from_secs(60)).is_err(), "second runner is refused");
+        assert!(q.heartbeat("h1", "runner-b", Duration::from_secs(60)).is_err(), "only the holder can renew");
+        q.heartbeat("h1", "runner-a", Duration::from_secs(60)).unwrap();
+        assert!(q.available().unwrap().is_empty(), "leased tasks are not offered");
+        q.release("h1", "runner-a").unwrap();
+        assert_eq!(q.available().unwrap().len(), 1, "released tasks come back");
+
+        assert_eq!(q.bundle(&hash).unwrap().as_deref(), Some(&b"bundle-bytes"[..]));
+        assert_eq!(q.bundle(&"0".repeat(64)).unwrap(), None);
+        assert!(q.bundle("../etc/passwd").is_err());
+        e.server.stop();
+    }
+
+    #[test]
+    fn a_token_is_required_when_configured() {
+        let e = env("tok", Some("s3cret"));
+        assert!(HttpQueue::new(&url(&e), None).available().is_err(), "no token");
+        assert!(HttpQueue::new(&url(&e), Some("wrong".into())).available().is_err(), "wrong token");
+        assert!(HttpQueue::new(&url(&e), Some("s3cret".into())).available().is_ok());
+        e.server.stop();
+    }
+
+    #[test]
+    fn a_runner_completes_a_task_over_http_and_resubmitting_is_harmless() {
+        let e = env("run", None);
+        let hq = Arc::new(HttpQueue::new(&url(&e), None));
+        let mut trusted = crate::manifest::TrustedProjects::default();
+        trusted.insert("a", e.key.verifying_key());
+        let mut runner = crate::runner::Runner::new(
+            super::policy(), trusted, crate::manifest::generate_key(), hq.clone(),
+            crate::harness::EchoHarness { tokens_per_run: 10 }, crate::sandbox::DirSandbox { root: e.dir.join("work") },
+            |_: &crate::manifest::TaskManifest, _: &crate::result::SignedResult| false,
+            crate::audit::AuditLog::new(e.dir.join("audit.jsonl")),
+        );
+        e.spool.post(&super::task("h2", "a", 10, &e.key).sign(&e.key).unwrap()).unwrap();
+        assert_eq!(runner.tick(chrono::Local::now()).unwrap(), crate::runner::Tick::Submitted("h2".into()));
+        let results = e.spool.results().unwrap();
+        assert_eq!(results.len(), 1);
+        results[0].open().unwrap();
+        hq.submit(&results[0]).unwrap();
+        assert_eq!(e.spool.results().unwrap().len(), 1, "idempotent");
+        assert!(hq.available().unwrap().is_empty(), "a finished task is gone");
+        e.server.stop();
+    }
+
+    #[test]
+    fn several_coordinators_route_claims_home_and_survive_one_being_down() {
+        let (a, b) = (env("multi-a", None), env("multi-b", None));
+        a.spool.post(&super::task("m-a", "a", 1, &a.key).sign(&a.key).unwrap()).unwrap();
+        b.spool.post(&super::task("m-b", "a", 1, &b.key).sign(&b.key).unwrap()).unwrap();
+        let down = HttpQueue::new("http://127.0.0.1:1", None); // nothing listens there
+        let multi = MultiQueue::new(vec![Arc::new(HttpQueue::new(&url(&a), None)), Arc::new(down), Arc::new(HttpQueue::new(&url(&b), None))]);
+        let ids: std::collections::BTreeSet<String> = multi.available().unwrap().iter().map(|t| crate::manifest::peek_manifest(t).unwrap().id).collect();
+        assert_eq!(ids, ["m-a".to_string(), "m-b".to_string()].into(), "tasks from both, the dead one skipped");
+        multi.claim("m-b", "r1", Duration::from_secs(60)).unwrap();
+        assert!(b.spool.available().unwrap().is_empty(), "the claim reached coordinator b");
+        assert_eq!(a.spool.available().unwrap().len(), 1, "and not a");
+        assert!(multi.claim("never-seen", "r1", Duration::from_secs(60)).is_err());
+        let all_down = MultiQueue::new(vec![Arc::new(HttpQueue::new("http://127.0.0.1:1", None))]);
+        assert!(all_down.available().is_err(), "all down is an error, not an empty queue");
+        a.server.stop();
+        b.server.stop();
+    }
+
+    #[test]
+    fn the_server_rejects_malformed_requests() {
+        let e = env("bad", None);
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let status = |m: &str, p: &str, body: &str| {
+            let req = ureq::http::Request::builder().method(m).uri(format!("{}{p}", url(&e))).body(body.as_bytes().to_vec()).unwrap();
+            agent.run(req).unwrap().status().as_u16()
+        };
+        assert_eq!(status("POST", "/v1/tasks/x/claim", "not json"), 400);
+        assert_eq!(status("POST", "/v1/tasks/x/claim", "{}"), 400);
+        assert_eq!(status("PUT", "/v1/results", "{}"), 400);
+        assert_eq!(status("POST", "/v1/tasks/..%2f..%2fx/claim", r#"{"runner_id":"r"}"#), 409, "ids are validated");
+        assert_eq!(status("GET", "/v1/nothing", ""), 404);
+        e.server.stop();
+    }
+}

@@ -110,6 +110,10 @@ Before the first task, run `toto doctor` (add `--config` if the config is not in
 
 Only for tasks whose manifest carries `network_allowlist` rules. As root: `toto net-setup --apply` creates the fenced bridge `toto-egress` (no route to private ranges, other containers or this host). Then set `"network": "toto-egress"` in the docker sandbox config, add the exact rules you accept to `policy.max_profile.network_allowlist`, and run `toto doctor`, which refuses to pass if the fence does not hold. `toto net-setup --remove --apply` undoes it. Without `network`, tasks with rules are refused.
 
+## Variant: a queue over HTTP
+
+`toto serve-queue --dir <spool> --addr 127.0.0.1:8787 [--token-file f]` serves a spool directory (the layout `post-task` writes) over the queue protocol (`docs/queue-protocol.md`). On the runner, add `"queues": [{"url": "http://127.0.0.1:8787", "token_file": "f"}]` to the config instead of relying on `queue_dir`. With several entries the runner considers tasks from all of them. `toto doctor` checks each endpoint.
+
 ## What to look for
 
 Success: `Submitted("live-1")`; `toto extract-result ~/.config/toto/queue/results/live-1.*.json ./out` lists `file    hello.txt (...)` and `out/hello.txt` contains the line (the task's changed files come back as signed artifacts); the audit line shows `submitted` and a plausible `tokens=` figure; the result in `~/.config/toto/queue/results/` has an `output` that reports `hello from the sandbox`, `65534` for `id -u`, and an error or empty listing for `ls /home`.
