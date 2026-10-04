@@ -78,6 +78,17 @@ togra post-task --key ./pilot.key --context /tmp/ctx docs/examples/hello-task.js
 
 This also checks the one thing unit tests cannot: that Claude Code lists the `Skill` tool alongside our MCP tools under `--tools "Skill"` and uses the skill (the answer should contain "Ahoy"). If the harness aborts with ``built-in tool `Skill` ...`` or the skill is ignored, send back the message.
 
+## Variant: agent inside the container (credential proxy)
+
+The same task with the agent in the container and no credential in it (ADR 12). Linux only. In `config.json`:
+
+```json
+"sandbox": {"kind": "docker", "image": "debian:bookworm-slim", "bridge": "/ABSOLUTE/PATH/TO/dist/release/togra-mcp-exec"},
+"harness": {"kind": "claude", "placement": "container"}
+```
+
+`docker pull debian:bookworm-slim`, then run exactly as above (`togra run --once` also checks that your `claude` binary runs in the image). What this settles: **does Anthropic accept your subscription token through the proxy?** If it does not, you will see `authentication_failed` or 401-style errors; send the message back. To compare with an API key, put one in a 0600 file and add `"api_key_file": "/path"`. While a task runs, `docker exec togra-live-1 env` must not show any token.
+
 ## What to look for
 
 Success: `Submitted("live-1")`; `togra extract-result ~/.config/togra/queue/results/live-1.*.json ./out` lists `file    hello.txt (...)` and `out/hello.txt` contains the line (the task's changed files come back as signed artifacts); the audit line shows `submitted` and a plausible `tokens=` figure; the result in `~/.config/togra/queue/results/` has an `output` that reports `hello from the sandbox`, `65534` for `id -u`, and an error or empty listing for `ls /home`.

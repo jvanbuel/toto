@@ -12,6 +12,12 @@ pub trait Harness: Send {
         Ok(())
     }
 
+    /// Whether the harness wants the project's context files (skills, CLAUDE.md, .mcp.json)
+    /// unpacked into the task workspace instead of receiving them as parsed data.
+    fn context_in_workspace(&self) -> bool {
+        false
+    }
+
     /// Whether this harness can deliver project-supplied skills and MCP servers (ADR 9).
     /// Tasks carrying context are refused by harnesses that cannot.
     fn supports_context(&self) -> bool {
@@ -29,6 +35,9 @@ impl<T: Harness + ?Sized> Harness for Box<T> {
     }
     fn supports_context(&self) -> bool {
         (**self).supports_context()
+    }
+    fn context_in_workspace(&self) -> bool {
+        (**self).context_in_workspace()
     }
     fn run(&self, task: &TaskManifest, ctx: &ProjectContext, ws: &Workspace, meter: &mut UsageMeter) -> Result<String> {
         (**self).run(task, ctx, ws, meter)

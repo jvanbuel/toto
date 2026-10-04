@@ -1390,7 +1390,7 @@ mod claude_cli {
     fn config_requires_a_container_with_the_bridge() {
         let f = fixture("claude-cfg");
         let mut c = crate::config::Config::starter(&f.dir);
-        c.harness = crate::config::HarnessConfig::Claude { bin: "claude".into(), token_file: None, model: None };
+        c.harness = crate::config::HarnessConfig::Claude { bin: "claude".into(), token_file: None, model: None, placement: Default::default(), upstream: "https://api.anthropic.com".into(), agent_binary: None, api_key_file: None };
         assert!(c.build().is_err(), "docker without bridge");
         c.sandbox = crate::config::SandboxConfig::Bwrap;
         assert!(c.build().is_err(), "bwrap has no bridge");
@@ -1783,7 +1783,7 @@ mod proxy_container {
 }
 
 mod claude_in_container {
-    use super::proxy_container::{docker_has, fake_api};
+    use super::proxy_container::docker_has;
     use super::{fixture, task};
     use crate::proxy::{Auth, AuthProxy};
     use crate::sandbox::{exec_io, DockerSandbox, Sandbox, Workspace, AGENT_PATH, PROXY_ADDR};
@@ -1861,6 +1861,65 @@ mod claude_in_container {
         let out = std::process::Command::new("which").arg("claude").output().ok()?;
         let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
         (!p.is_empty()).then(|| std::fs::canonicalize(p).ok()).flatten()
+    }
+
+    #[test]
+    fn the_runner_drives_the_whole_pipeline_with_the_agent_in_the_container() {
+        use crate::archive::{self, Record};
+        use crate::config::{Config, HarnessConfig, PlacementConfig, SandboxConfig};
+        use crate::queue::DirQueue;
+        use chrono::Local;
+        let bridge = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/togra-mcp-exec");
+        let (Some(claude), true, true) = (claude_bin(), bridge.exists(), docker_has("debian:bookworm-slim")) else {
+            eprintln!("skipping: needs docker, debian:bookworm-slim, the musl bridge and a claude binary");
+            return;
+        };
+        let f = fixture("cic-runner");
+        let (url, seen) = fake_anthropic("cat calc.txt; echo fixed > calc.txt; ls .claude/skills; cat AGENTS.md; id -u");
+
+        let mut cfg = Config::starter(&f.dir);
+        cfg.sandbox = SandboxConfig::Docker { bin: "docker".into(), image: "debian:bookworm-slim".into(), runtime: None, bridge: Some(bridge) };
+        cfg.harness = HarnessConfig::Claude { bin: "claude".into(), token_file: None, model: None, placement: PlacementConfig::Container, upstream: url, agent_binary: Some(claude), api_key_file: None };
+        cfg.policy = super::policy();
+        cfg.policy.allow_context = true;
+        cfg.policy.daily_token_cap = 10_000_000;
+        cfg.projects.insert("a".into(), hex::encode(f.key_a.verifying_key().to_bytes()));
+        std::fs::create_dir_all(&cfg.state_dir).unwrap();
+        crate::claude_cli::save_token(&cfg.token_path(), "REAL-SECRET-TOKEN").unwrap();
+
+        // a task with inputs (calc.txt), project context (a skill and AGENTS.md) and artifacts allowed
+        let q = DirQueue::new(&cfg.queue_dir).unwrap();
+        let inputs = q.post_bundle(&archive::to_bytes(&[Record::File { path: "calc.txt".into(), mode: 0o644, data: b"bug\n".to_vec() }]).unwrap()).unwrap();
+        let context = q.post_bundle(&super::ctxkit::tar(&[(".claude/skills/triage/SKILL.md", super::ctxkit::SKILL_MD), ("AGENTS.md", "Be terse.")])).unwrap();
+        let mut t = task("p1", "a", 100000, &f.key_a);
+        t.prompt = "RUN-THE-TOOL".into();
+        t.inputs = inputs;
+        t.context = Some(context);
+        t.output_schema.max_artifact_bytes = 65536;
+        q.post(&t.sign(&f.key_a).unwrap()).unwrap();
+
+        let mut runner = cfg.build().unwrap();
+        runner.sandbox.probe().unwrap(); // includes: does the mounted agent run in this image?
+        let tick = runner.tick(Local::now()).unwrap();
+        assert_eq!(tick, crate::runner::Tick::Submitted("p1".into()), "audit: {:?}", runner.audit.entries().unwrap());
+
+        let results = q.results().unwrap();
+        let body = results[0].open().unwrap();
+        assert!(body.output.contains("DONE-FROM-FAKE-API"), "{}", body.output);
+        // artifacts: only calc.txt changed; the context files (skill, AGENTS.md) are in the baseline, not reported
+        let recs = results[0].artifact_records(1 << 20).unwrap();
+        assert_eq!(recs, vec![Record::File { path: "calc.txt".into(), mode: 0o644, data: b"fixed\n".to_vec() }], "{recs:?}");
+        // the agent saw the input, the unpacked skill and AGENTS.md, and ran as nobody
+        let bodies = seen.lock().unwrap().clone();
+        let tool_result = bodies.iter().map(|(_, b)| b.as_str()).find(|b| b.contains("tool_result")).expect("tool result");
+        for want in ["bug", "triage", "Be terse.", "65534"] {
+            assert!(tool_result.contains(want), "missing {want:?} in {tool_result}");
+        }
+        assert!(bodies.iter().filter(|(h, _)| h.iter().any(|(k, v)| k == "path" && v.starts_with("/v1/messages"))).all(|(h, _)| h.iter().any(|(k, v)| k == "authorization" && v == "Bearer REAL-SECRET-TOKEN")));
+        // metering came from the proxy
+        let log = runner.audit.entries().unwrap();
+        assert!(log[0].outcome == "submitted" && log[0].tokens > 50, "{log:?}");
+        assert!(!bodies.iter().any(|(_, b)| b.contains("REAL-SECRET")), "the credential never appears in anything the agent sent");
     }
 
     #[test]

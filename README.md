@@ -73,3 +73,14 @@ A task's `inputs` is the SHA-256 of an input bundle in the queue (`bundles/<hash
 togra post-task --key pilot.key --bundle ./repo task.json     # pack ./repo as the inputs
 togra extract-result <queue>/results/<id>.<runner>.json ./out  # verify and write the changed files
 ```
+
+### Agent in the container (credential proxy)
+
+`"placement": "container"` in the claude harness config runs the agent *inside* the task container with its native tools, behind a host-side credential proxy (ADR 12): the container has no network and no credential; model calls reach the Messages API only through the proxy, which adds the real auth and counts the tokens.
+
+```json
+"sandbox": {"kind": "docker", "image": "debian:bookworm-slim", "bridge": "/abs/path/togra-mcp-exec"},
+"harness": {"kind": "claude", "placement": "container"}
+```
+
+The image must be glibc-based (the host's `claude` binary is mounted into it) and provide `tar`. Use `"api_key_file": "/path/to/key"` for an API key instead of the subscription token. Linux only so far; tested with a fake API, not yet with a real credential.

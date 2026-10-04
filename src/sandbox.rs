@@ -46,7 +46,9 @@ fn baseline_path(ws: &Workspace) -> Result<PathBuf> {
 fn host_put_inputs(ws: &Workspace, bundle: &[u8], max_bytes: u64) -> Result<()> {
     let records = crate::archive::from_bytes(bundle, crate::archive::Limits::new(max_bytes)).map_err(Error::Sandbox)?;
     crate::archive::unpack_to(&ws.path, &records).map_err(Error::Sandbox)?;
-    let base = crate::archive::baseline(&ws.path, 100_000).map_err(Error::Sandbox)?;
+    // Merge with any earlier baseline (inputs, then context).
+    let mut base: std::collections::BTreeMap<String, String> = std::fs::read(baseline_path(ws)?).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    base.extend(crate::archive::baseline_of(&records));
     std::fs::write(baseline_path(ws)?, serde_json::to_vec(&base)?)?;
     Ok(())
 }
@@ -233,13 +235,21 @@ impl Sandbox for DockerSandbox {
             .map_err(|e| Error::Sandbox(format!("{} daemon unreachable: {e}", self.bin)))?;
         self.docker(&["image".into(), "inspect".into(), self.image.clone()])
             .map_err(|_| Error::Sandbox(format!("image `{}` not present; run `{} pull {}`", self.image, self.bin, self.image)))?;
+        if let Some(agent) = &self.agent_binary {
+            // The mounted agent must run in this image (it is a glibc binary: Alpine/musl images will not do).
+            let mount = format!("type=bind,src={},dst={AGENT_PATH},readonly", agent.display());
+            self.docker(&["run".into(), "--rm".into(), "--network".into(), "none".into(), "--mount".into(), mount, self.image.clone(), AGENT_PATH.into(), "--version".into()])
+                .map_err(|e| Error::Sandbox(format!("the agent binary does not run in image `{}` (it needs a glibc-based image such as debian or ubuntu): {e}", self.image)))?;
+        }
         Ok(())
     }
 
     fn create(&self, task: &TaskManifest, profile: &SandboxProfile) -> Result<Workspace> {
         let args = self.run_args(&task.id, profile)?;
-        self.docker(&args)?;
         let name = Self::container_name(&task.id);
+        // A container left behind by a crash or an aborted run would block a retry of this task.
+        let _ = self.docker(&["rm".into(), "-f".into(), name.clone()]);
+        self.docker(&args)?;
         let exec_prefix = vec![self.bin.clone(), "exec".into(), "-i".into(), name.clone()];
         if self.proxy_socket.is_some() {
             self.start_relay(&name)?;
@@ -255,7 +265,7 @@ impl Sandbox for DockerSandbox {
         if !out.status.success() {
             return Err(Error::Sandbox(format!("unpacking inputs failed (the image must provide `tar`): {}", String::from_utf8_lossy(&out.stderr).trim())));
         }
-        self.baselines.lock().unwrap().insert(ws.task_id.clone(), crate::archive::baseline_of(&records));
+        self.baselines.lock().unwrap().entry(ws.task_id.clone()).or_default().extend(crate::archive::baseline_of(&records));
         Ok(())
     }
 

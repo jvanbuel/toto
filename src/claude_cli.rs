@@ -17,7 +17,8 @@ use crate::harness::Harness;
 use crate::context::{McpEntry, ProjectContext};
 use crate::manifest::TaskManifest;
 use crate::meter::UsageMeter;
-use crate::sandbox::Workspace;
+use crate::proxy::AuthProxy;
+use crate::sandbox::{Workspace, AGENT_PATH, PROXY_ADDR};
 use crate::{Error, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -25,8 +26,17 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
+
+/// Where the agent process runs.
+pub enum Placement {
+    /// On the host, with only an MCP bridge into the container (ADR 10, 11).
+    Host,
+    /// Inside the task container, with no credential: model calls go through the credential proxy
+    /// (ADR 12). Built-in tools run natively in the container.
+    Container(Arc<AuthProxy>),
+}
 
 pub struct ClaudeCliHarness {
     pub bin: String,
@@ -38,6 +48,7 @@ pub struct ClaudeCliHarness {
     pub runs_dir: PathBuf,
     pub model: Option<String>,
     pub max_turns: u32,
+    pub placement: Placement,
 }
 
 impl ClaudeCliHarness {
@@ -45,21 +56,32 @@ impl ClaudeCliHarness {
         let (home_dir, runs_dir) = (state_dir.join("claude-home"), state_dir.join("runs"));
         std::fs::create_dir_all(&home_dir)?;
         std::fs::create_dir_all(&runs_dir)?;
-        Ok(Self { bin: "claude".into(), token_file, home_dir, runs_dir, model: None, max_turns: 40 })
+        Ok(Self { bin: "claude".into(), token_file, home_dir, runs_dir, model: None, max_turns: 40, placement: Placement::Host })
+    }
+
+    /// Runs the agent inside the container behind `proxy` instead of on the host.
+    pub fn in_container(mut self, proxy: Arc<AuthProxy>) -> Self {
+        self.placement = Placement::Container(proxy);
+        self
     }
 
     /// Reads the token, refusing a file that other users can read.
     pub fn read_token(&self) -> Result<String> {
-        let meta = std::fs::metadata(&self.token_file).map_err(|e| Error::Harness(format!("no token at {} ({e}); run `togra login`", self.token_file.display())))?;
-        if meta.permissions().mode() & 0o077 != 0 {
-            return Err(Error::Harness(format!("{} is readable by others; chmod 600 it", self.token_file.display())));
-        }
-        let t = std::fs::read_to_string(&self.token_file)?.trim().to_string();
-        if t.is_empty() {
-            return Err(Error::Harness("token file is empty; run `togra login`".into()));
-        }
-        Ok(t)
+        read_secret(&self.token_file)
     }
+}
+
+/// Reads a secret file (token or API key), refusing one that other users can read.
+pub fn read_secret(path: &Path) -> Result<String> {
+    let meta = std::fs::metadata(path).map_err(|e| Error::Harness(format!("no credential at {} ({e}); run `togra login`", path.display())))?;
+    if meta.permissions().mode() & 0o077 != 0 {
+        return Err(Error::Harness(format!("{} is readable by others; chmod 600 it", path.display())));
+    }
+    let t = std::fs::read_to_string(path)?.trim().to_string();
+    if t.is_empty() {
+        return Err(Error::Harness(format!("{} is empty; run `togra login`", path.display())));
+    }
+    Ok(t)
 }
 
 /// Stores a token with mode 0600 (created with that mode, never briefly wider).
@@ -142,7 +164,14 @@ fn usage_tokens(u: &Value) -> u64 {
 const ACCOUNT_ERRORS: [&str; 5] = ["authentication_failed", "oauth_org_not_allowed", "account_on_hold", "billing_error", "rate_limit"];
 
 impl Harness for ClaudeCliHarness {
+    fn context_in_workspace(&self) -> bool {
+        matches!(self.placement, Placement::Container(_))
+    }
+
     fn probe(&self) -> Result<()> {
+        if matches!(self.placement, Placement::Container(_)) {
+            return Ok(()); // the sandbox probe checks that the agent binary runs in the image
+        }
         self.read_token()?;
         let out = Command::new(&self.bin).arg("--version").output().map_err(|e| Error::Harness(format!("cannot run `{}`: {e}", self.bin)))?;
         if out.status.success() { Ok(()) } else { Err(Error::Harness("`claude --version` failed".into())) }
@@ -154,38 +183,65 @@ impl Harness for ClaudeCliHarness {
 
     fn run(&self, task: &TaskManifest, ctx: &ProjectContext, ws: &Workspace, meter: &mut UsageMeter) -> Result<String> {
         let bridge = ws.bridge_argv().ok_or_else(|| Error::Harness("the claude harness needs a container sandbox with the exec bridge".into()))?;
-        let token = self.read_token()?;
-
+        let skill_tool = !ctx.skills.is_empty();
+        let in_container = matches!(self.placement, Placement::Container(_));
+        let proxy_start = if let Placement::Container(p) = &self.placement { p.tokens() } else { 0 };
         let run_dir = self.runs_dir.join(crate::sandbox::DockerSandbox::container_name(&task.id));
         std::fs::create_dir_all(&run_dir)?;
         let _cleanup = RemoveOnDrop(run_dir.clone());
-        write_context(&run_dir, ctx)?;
-        // The raw project `.mcp.json` is never written: only the translated config is passed.
-        let mcp_path = run_dir.join("togra-mcp.json");
-        std::fs::write(&mcp_path, serde_json::to_vec(&mcp_config(ctx, &ws.exec_prefix, &bridge))?)?;
-        // Built-in tools stay off, except `Skill` (loads instructions, runs nothing) when the project ships skills.
-        let skill_tool = !ctx.skills.is_empty();
-        let allowed: Vec<String> = ctx.mcp.iter().map(|m| format!("mcp__{}", m.name())).chain([format!("mcp__{}", crate::manifest::BRIDGE_SERVER_NAME)]).chain(skill_tool.then(|| "Skill".to_string())).collect();
 
-        let mut cmd = Command::new(&self.bin);
-        cmd.args(["-p", "--output-format", "stream-json", "--verbose", "--no-session-persistence"])
-            .args(["--tools", if skill_tool { "Skill" } else { "" }])
-            .args(["--strict-mcp-config", "--mcp-config"]).arg(&mcp_path)
-            .args(["--setting-sources", "project", "--permission-mode", "dontAsk", "--permission-prompts", "none"])
-            .arg(format!("--allowedTools={}", allowed.join(",")))
-            .args(["--max-turns", &self.max_turns.to_string()]);
+        let common = ["-p", "--output-format", "stream-json", "--verbose", "--no-session-persistence", "--setting-sources", "project", "--permission-mode", "dontAsk", "--permission-prompts", "none"];
+        let (mut cmd, allowed_builtins): (Command, Vec<&str>) = if let Placement::Container(_) = &self.placement {
+            if ctx.mcp.iter().any(|m| matches!(m, McpEntry::Remote { .. })) {
+                return Err(Error::Harness("remote MCP servers are unreachable from a container without network; use command servers or the host placement".into()));
+            }
+            // The agent runs in the container. Project context (skills, CLAUDE.md, .mcp.json) was
+            // unpacked into /workspace by the runner; command servers start there, in the sandbox.
+            let builtins: Vec<&str> = ["Bash", "Read", "Edit", "Write", "Glob", "Grep"].into_iter().chain(skill_tool.then_some("Skill")).collect();
+            let allowed: Vec<String> = builtins.iter().map(|b| b.to_string()).chain(ctx.mcp.iter().map(|m| format!("mcp__{}", m.name()))).collect();
+            let (name, head) = ws.exec_prefix.split_last().expect("a container sandbox has an exec prefix");
+            let mut c = Command::new(&head[0]);
+            c.args(&head[1..]);
+            for e in [format!("ANTHROPIC_BASE_URL=http://{PROXY_ADDR}"), "ANTHROPIC_AUTH_TOKEN=not-a-credential".into(), "HOME=/tmp/home".into(), "CLAUDE_CONFIG_DIR=/tmp/home/.claude".into(), "DISABLE_AUTOUPDATER=1".into(), "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1".into(), "TERM=dumb".into()] {
+                c.args(["-e", &e]);
+            }
+            c.args(["-w", "/workspace", name, AGENT_PATH]).args(common).args(["--tools", &builtins.join(",")]).arg(format!("--allowedTools={}", allowed.join(",")));
+            // Only what the CLI needs to reach the container runtime: nothing else from the host.
+            c.env_clear();
+            for k in ["PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "CONTAINER_HOST", "XDG_RUNTIME_DIR", "TMPDIR"] {
+                if let Ok(v) = std::env::var(k) {
+                    c.env(k, v);
+                }
+            }
+            (c, builtins)
+        } else {
+            let token = self.read_token()?;
+            write_context(&run_dir, ctx)?;
+            // The raw project `.mcp.json` is never written: only the translated config is passed.
+            let mcp_path = run_dir.join("togra-mcp.json");
+            std::fs::write(&mcp_path, serde_json::to_vec(&mcp_config(ctx, &ws.exec_prefix, &bridge))?)?;
+            // Built-in tools stay off, except `Skill` (loads instructions, runs nothing) when the project ships skills.
+            let allowed: Vec<String> = ctx.mcp.iter().map(|m| format!("mcp__{}", m.name())).chain([format!("mcp__{}", crate::manifest::BRIDGE_SERVER_NAME)]).chain(skill_tool.then(|| "Skill".to_string())).collect();
+            let mut c = Command::new(&self.bin);
+            c.args(common)
+                .args(["--tools", if skill_tool { "Skill" } else { "" }])
+                .args(["--strict-mcp-config", "--mcp-config"]).arg(&mcp_path)
+                .arg(format!("--allowedTools={}", allowed.join(",")))
+                .current_dir(&run_dir)
+                .env_clear()
+                .envs(cli_env(&self.home_dir, &token));
+            (c, if skill_tool { vec!["Skill"] } else { vec![] })
+        };
+        cmd.args(["--max-turns", &self.max_turns.to_string()]);
         if let Some(m) = &self.model {
             cmd.args(["--model", m]);
         }
         let mut child = cmd
-            .current_dir(&run_dir)
-            .env_clear()
-            .envs(cli_env(&self.home_dir, &token))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| Error::Harness(format!("cannot run `{}`: {e}", self.bin)))?;
+            .map_err(|e| Error::Harness(format!("cannot run the agent: {e}")))?;
 
         // The prompt goes over stdin: no argv exposure, no length limit, and variadic flags
         // cannot swallow it.
@@ -222,14 +278,14 @@ impl Harness for ClaudeCliHarness {
                     match (ev["type"].as_str(), ev["subtype"].as_str()) {
                         (Some("system"), Some("init")) => {
                             // Defence in depth: only our MCP tools may exist, and every MCP server must have loaded.
-                            let builtin = ev["tools"].as_array().into_iter().flatten().filter_map(Value::as_str).find(|t| !t.starts_with("mcp__") && !(skill_tool && *t == "Skill"));
+                            let builtin = ev["tools"].as_array().into_iter().flatten().filter_map(Value::as_str).find(|t| !t.starts_with("mcp__") && !allowed_builtins.contains(t));
                             if let Some(t) = builtin {
                                 return Err(abort(&mut child, Error::Harness(format!("built-in tool `{t}` is enabled; refusing to run"))));
                             }
                             if ev["mcp_server_errors"].as_array().is_some_and(|a| !a.is_empty()) {
                                 return Err(abort(&mut child, Error::Harness(format!("mcp server config rejected: {}", ev["mcp_server_errors"]))));
                             }
-                            let down = ev["mcp_servers"].as_array().into_iter().flatten().find(|s| s["name"] == crate::manifest::BRIDGE_SERVER_NAME && s["status"] != "connected");
+                            let down = ev["mcp_servers"].as_array().into_iter().flatten().find(|s| !in_container && s["name"] == crate::manifest::BRIDGE_SERVER_NAME && s["status"] != "connected");
                             if let Some(s) = down {
                                 return Err(abort(&mut child, Error::Harness(format!("sandbox bridge did not connect: {s}"))));
                             }
@@ -239,7 +295,7 @@ impl Harness for ClaudeCliHarness {
                                 account_error = Some(e.to_string());
                             }
                         }
-                        (Some("assistant"), _) => {
+                        (Some("assistant"), _) if !in_container => {
                             if let (Some(id), usage) = (ev["message"]["id"].as_str(), &ev["message"]["usage"]) {
                                 // The same message can appear once per content block: keep the latest figure per id.
                                 per_message.insert(id.to_string(), usage_tokens(usage));
@@ -260,6 +316,17 @@ impl Harness for ClaudeCliHarness {
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
+            // In a container the proxy counts the tokens itself, independent of anything the agent says.
+            if let Placement::Container(p) = &self.placement {
+                let used = p.tokens().saturating_sub(proxy_start);
+                if used > charged {
+                    let delta = used - charged;
+                    charged = used;
+                    if let Err(e) = meter.record(delta) {
+                        return Err(abort(&mut child, e));
+                    }
+                }
+            }
             if Instant::now() >= deadline {
                 return Err(abort(&mut child, Error::Harness(format!("timed out after {}s", task.sandbox_profile.timeout_secs))));
             }
@@ -271,8 +338,14 @@ impl Harness for ClaudeCliHarness {
             let why = account_error.map_or_else(|| stderr.lines().last().unwrap_or("no result").to_string(), |e| format!("{e} (account problem)"));
             return Err(Error::Harness(format!("claude exited with {status} and no result: {why}")));
         };
-        if let Some(total) = res.get("usage").map(usage_tokens).filter(|t| *t > charged) {
+        if let Some(total) = res.get("usage").map(usage_tokens).filter(|t| *t > charged && !in_container) {
             meter.record(total - charged)?; // final figure may exceed what the stream showed
+        }
+        if let Placement::Container(p) = &self.placement {
+            let used = p.tokens().saturating_sub(proxy_start); // the last response may land after the final poll
+            if used > charged {
+                meter.record(used - charged)?;
+            }
         }
         if res["is_error"].as_bool().unwrap_or(false) || !status.success() {
             let why = res["result"].as_str().unwrap_or("error");

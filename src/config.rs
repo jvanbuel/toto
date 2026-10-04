@@ -55,6 +55,19 @@ pub enum HarnessConfig {
         token_file: Option<PathBuf>,
         #[serde(default)]
         model: Option<String>,
+        /// `host` (default): agent on the host, tools in the container over MCP (ADR 10, 11).
+        /// `container`: agent inside the container behind the credential proxy (ADR 12).
+        #[serde(default)]
+        placement: PlacementConfig,
+        /// API origin the proxy forwards to (container placement).
+        #[serde(default = "default_upstream")]
+        upstream: String,
+        /// Agent binary mounted into the container; default: the `claude` found on PATH.
+        #[serde(default)]
+        agent_binary: Option<PathBuf>,
+        /// Use an API key (from this file) instead of the subscription token (container placement).
+        #[serde(default)]
+        api_key_file: Option<PathBuf>,
     },
     /// Omnigent in no-network mode (see `omnigent.rs`); needs sandbox `dir` or `bwrap`.
     Omnigent {
@@ -65,6 +78,22 @@ pub enum HarnessConfig {
         #[serde(default = "omnigent_harness")]
         harness: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlacementConfig {
+    #[default]
+    Host,
+    Container,
+}
+
+fn default_upstream() -> String {
+    "https://api.anthropic.com".into()
+}
+
+fn which_claude() -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join("claude")).find(|c| c.is_file())).and_then(|c| std::fs::canonicalize(c).ok())
 }
 
 fn claude_bin() -> String {
@@ -171,6 +200,10 @@ impl Config {
     }
 
     pub fn build_sandbox(&self) -> Box<dyn Sandbox> {
+        self.build_sandbox_with(None, None)
+    }
+
+    fn build_sandbox_with(&self, proxy_socket: Option<PathBuf>, agent: Option<PathBuf>) -> Box<dyn Sandbox> {
         let work = self.state_dir.join("work");
         match &self.sandbox {
             SandboxConfig::Dir => Box::new(DirSandbox { root: work }),
@@ -180,6 +213,8 @@ impl Config {
                 s.bin = bin.clone();
                 s.runtime = runtime.clone();
                 s.bridge = bridge.clone();
+                s.proxy_socket = proxy_socket;
+                s.agent_binary = agent;
                 Box::new(s)
             }
         }
@@ -195,15 +230,31 @@ impl Config {
             let bytes: [u8; 32] = hex::decode(k).ok().and_then(|b| b.try_into().ok()).ok_or_else(|| Error::Verify(format!("bad key for project `{id}`")))?;
             trusted.insert(id, VerifyingKey::from_bytes(&bytes).map_err(|_| Error::Verify(format!("bad key for project `{id}`")))?);
         }
+        let (mut proxy_socket, mut agent): (Option<PathBuf>, Option<PathBuf>) = (None, None);
         let harness: Box<dyn Harness> = match &self.harness {
             HarnessConfig::Echo { tokens_per_run } => Box::new(EchoHarness { tokens_per_run: *tokens_per_run }),
-            HarnessConfig::Claude { bin, token_file, model } => {
+            HarnessConfig::Claude { bin, token_file, model, placement, upstream, agent_binary, api_key_file } => {
                 if !matches!(self.sandbox, SandboxConfig::Docker { bridge: Some(_), .. }) {
                     return Err(Error::Policy("the claude harness needs a Docker/Podman sandbox with `bridge` set to the static togra-mcp-exec binary".into()));
                 }
-                let mut h = ClaudeCliHarness::new(&self.state_dir, token_file.clone().unwrap_or_else(|| self.token_path()))?;
+                let token_file = token_file.clone().unwrap_or_else(|| self.token_path());
+                let mut h = ClaudeCliHarness::new(&self.state_dir, token_file.clone())?;
                 h.bin = bin.clone();
                 h.model = model.clone();
+                if *placement == PlacementConfig::Container {
+                    // The credential stays with this process: the proxy adds it to model calls.
+                    let auth = match api_key_file {
+                        Some(f) => crate::proxy::Auth::ApiKey(crate::claude_cli::read_secret(f)?),
+                        None => crate::proxy::Auth::Bearer { token: crate::claude_cli::read_secret(&token_file)?, oauth: true },
+                    };
+                    let dir = self.state_dir.join("proxy");
+                    std::fs::create_dir_all(&dir)?;
+                    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+                    let proxy = std::sync::Arc::new(crate::proxy::AuthProxy::start(&dir.join("p.sock"), upstream, auth)?);
+                    proxy_socket = Some(proxy.socket().to_path_buf());
+                    agent = Some(agent_binary.clone().or_else(which_claude).ok_or_else(|| Error::Policy("no `claude` binary found for the container; set `agent_binary`".into()))?);
+                    h = h.in_container(proxy);
+                }
                 Box::new(h)
             }
             HarnessConfig::Omnigent { bin, server_url, harness } => {
@@ -224,7 +275,7 @@ impl Config {
             self.load_or_create_key()?,
             queue,
             harness,
-            self.build_sandbox(),
+            self.build_sandbox_with(proxy_socket, agent),
             Box::new(NoReview),
             AuditLog::new(self.state_dir.join("audit.jsonl")),
         ))
