@@ -1,0 +1,38 @@
+# Drop this into the project repository as .github/workflows/toto-results.yml.
+# Every 15 minutes it turns finished toto tasks into pull requests (see docs/github-queue.md).
+name: toto results
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+# One run at a time: two runs could both open a PR for the same result.
+concurrency: toto-results
+
+permissions:
+  contents: write        # push the toto/* branches
+  pull-requests: write   # open the PRs
+  issues: write          # comment on and close the task issues
+
+jobs:
+  results-to-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Pushes made with the default GITHUB_TOKEN do not start other workflows, so the toto PRs
+          # would get no CI. Use a fine-grained token or a GitHub App token instead if you want CI on them.
+          token: ${{ secrets.TOTO_TOKEN || secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install toto
+        run: cargo install --locked --git https://github.com/jvanbuel/togra toto-runner
+      - name: Open pull requests for finished tasks
+        env:
+          GITHUB_TOKEN: ${{ secrets.TOTO_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          # TOTO_PROJECT is "<project id>=<hex public key>", the key printed by `toto project-key`.
+          toto results-to-pr "$GITHUB_REPOSITORY" --base "${{ github.event.repository.default_branch }}" \
+            --project "${{ vars.TOTO_PROJECT }}" --max-open 10

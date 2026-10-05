@@ -35,3 +35,7 @@ Unlike BOINC's deterministic computations, LLM output is not reproducible, so "a
 ## Simpler v1 option
 
 Make results pull requests: the project's normal code review and CI are the verification.
+
+## Update (2026-10-04): review happens in the project's pull request process
+
+Review of a result is not a toto feature. For GitHub queues, `toto results-to-pr` turns each verified result into a pull request automatically (`docs/github-queue.md`): file changes become a PR with the provenance in its description, text answers become a comment on the task issue. Maintainers review and merge with their normal tools (diffs, CI, CODEOWNERS, approvals); closing a PR is the rejection. Contributors never see the project. This replaces the idea of a toto review UI; the only contributor-side control left is the optional hold before submission (the daemon cannot ask a human, so `review_before_submit` stays refused until a file-based outbox exists). Redundancy across runners is not implemented on the GitHub queue.

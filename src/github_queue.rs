@@ -139,17 +139,22 @@ type Part = (usize, usize, String);
 /// Complete, signature-checked results for `task_id` found in a comment list.
 fn results_in(comments: &[Comment], task_id: &str) -> Vec<SignedResult> {
     let mut groups: HashMap<(String, String), Vec<Part>> = HashMap::new();
+    let mut first: HashMap<(String, String), u64> = HashMap::new();
     for c in comments {
         let Some(("result", kv)) = marker(&c.body) else { continue };
         let (Some(runner), Some(sum), Some((i, n))) = (kv.get("runner"), kv.get("sum"), kv.get("part").and_then(|p| p.split_once('/'))) else { continue };
         let (Ok(i), Ok(n)) = (i.parse::<usize>(), n.parse::<usize>()) else { continue };
         let Some(text) = c.body.split("```json\n").nth(1).and_then(|t| t.rsplit_once("\n```")).map(|(t, _)| t.to_string()) else { continue };
         if (1..=MAX_PARTS).contains(&n) && (1..=n).contains(&i) {
-            groups.entry((runner.to_string(), sum.to_string())).or_default().push((i, n, text));
+            let key = (runner.to_string(), sum.to_string());
+            first.entry(key.clone()).and_modify(|f| *f = (*f).min(c.id)).or_insert(c.id);
+            groups.entry(key).or_default().push((i, n, text));
         }
     }
     let mut out = vec![];
-    for ((_, sum), mut parts) in groups {
+    let mut ordered: Vec<_> = groups.into_iter().collect();
+    ordered.sort_by_key(|(k, _)| first[k]); // the earliest result first, whatever the map order
+    for ((_, sum), mut parts) in ordered {
         parts.sort_by_key(|p| p.0);
         parts.dedup_by_key(|p| p.0);
         let n = parts[0].1;
@@ -170,6 +175,19 @@ fn results_in(comments: &[Comment], task_id: &str) -> Vec<SignedResult> {
 }
 
 // -------------------------------------------------------------------------------------- the client
+
+/// A task whose result is in, as seen by the project.
+pub struct Finished {
+    pub issue: u64,
+    pub manifest: crate::manifest::TaskManifest,
+    pub result: SignedResult,
+    pub handled: bool,
+}
+
+/// Marker for the comment the project leaves once it has dealt with a result.
+pub fn handled_comment(kind: &str, task_id: &str, runner: &str, text: &str) -> String {
+    format!("<!-- toto:{kind} task={task_id} runner={runner} -->\n{text}")
+}
 
 #[derive(Default)]
 struct Cache {
@@ -329,6 +347,52 @@ impl GitHubQueue {
             return Err(Self::fail(status, "asset upload", &body));
         }
         Ok(hash)
+    }
+
+    /// Open task issues that have a complete, correctly signed result and whose task the project
+    /// itself signed (project side). `handled` is true once a PR or skip marker is on the issue.
+    pub fn open_results(&self, trusted: &crate::manifest::TrustedProjects) -> Result<Vec<Finished>> {
+        let mut out = vec![];
+        for (issue, env, id) in self.task_issues("open")? {
+            let Ok(manifest) = trusted.verify(&env) else { continue };
+            if issue.comments == 0 {
+                continue;
+            }
+            let (comments, _) = self.comments(issue.number)?;
+            let Some(result) = results_in(&comments, &id).into_iter().next() else { continue };
+            let handled = comments.iter().any(|c| matches!(marker(&c.body), Some(("pr" | "skip", _))));
+            out.push(Finished { issue: issue.number, manifest, result, handled });
+        }
+        Ok(out)
+    }
+
+    pub fn comment(&self, issue: u64, body: &str) -> Result<()> {
+        self.send_json("POST", &self.api_url(&format!("/issues/{issue}/comments")), &serde_json::json!({"body": body})).map(|_| ())
+    }
+
+    pub fn close_issue(&self, issue: u64) -> Result<()> {
+        self.send_json("PATCH", &self.api_url(&format!("/issues/{issue}")), &serde_json::json!({"state": "closed", "state_reason": "completed"})).map(|_| ())
+    }
+
+    /// Whether a pull request (open or closed) already exists for the head branch.
+    pub fn pull_exists(&self, branch: &str) -> Result<bool> {
+        let owner = self.repo.split('/').next().unwrap_or_default();
+        let (body, _) = self.get(&self.api_url(&format!("/pulls?state=all&head={owner}:{branch}")))?;
+        Ok(!serde_json::from_slice::<Vec<serde_json::Value>>(&body)?.is_empty())
+    }
+
+    /// Open pull requests whose head branch starts with `prefix`.
+    pub fn open_pulls_with_prefix(&self, prefix: &str) -> Result<usize> {
+        let (pulls, _): (Vec<serde_json::Value>, _) = self.pages(&self.api_url("/pulls?state=open"))?;
+        Ok(pulls.iter().filter(|p| p["head"]["ref"].as_str().is_some_and(|r| r.starts_with(prefix))).count())
+    }
+
+    pub fn open_pull(&self, head: &str, base: &str, title: &str, body: &str) -> Result<u64> {
+        let v = self.send_json("POST", &self.api_url("/pulls"), &serde_json::json!({"title": title, "head": head, "base": base, "body": body}))?;
+        let n = v["number"].as_u64().ok_or_else(|| qerr("GitHub did not return a pull request number"))?;
+        // Best effort: a label makes toto PRs easy to find and filter.
+        let _ = self.send_json("POST", &self.api_url(&format!("/issues/{n}/labels")), &serde_json::json!({"labels": [self.label]}));
+        Ok(n)
     }
 
     fn release(&self) -> Option<serde_json::Value> {

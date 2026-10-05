@@ -60,6 +60,33 @@ enum Cmd {
         #[arg(long, default_value = toto::github_queue::DEFAULT_API)]
         github_api: String,
     },
+    /// Project side: open a pull request for every finished task's result (run it on a schedule,
+    /// e.g. from a GitHub Action in the project repository; see docs/github-queue.md).
+    ResultsToPr {
+        /// `owner/name`
+        repo: String,
+        /// Checkout of the project repository with push access to `origin`.
+        #[arg(long, default_value = ".")]
+        repo_dir: PathBuf,
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// A project allowed to post tasks, as `id=<hex public key>` (repeatable). Only tasks it
+        /// signed are acted on.
+        #[arg(long = "project", required = true)]
+        projects: Vec<String>,
+        /// Token file; default: the GITHUB_TOKEN environment variable.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        #[arg(long, default_value = toto::github_queue::DEFAULT_API)]
+        api: String,
+        /// Stop opening PRs while this many toto PRs are open.
+        #[arg(long, default_value_t = 10)]
+        max_open: usize,
+        /// Extra path (prefix if it ends in `/`) a result may not touch; repeatable. `.github/`,
+        /// `.gitlab-ci.yml`, `.git/` and a few more are always protected.
+        #[arg(long = "protect")]
+        protect: Vec<String>,
+    },
     /// Download the verified results found on a GitHub queue's issues, one file per result, ready
     /// for `extract-result`.
     GithubResults {
@@ -238,6 +265,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     toto::archive::Record::File { path, data, .. } => println!("file    {path} ({} bytes)", data.len()),
                     toto::archive::Record::Deleted { path } => println!("deleted {path}"),
                 }
+            }
+        }
+        Cmd::ResultsToPr { repo, repo_dir, base, projects, token_file, api, max_open, protect } => {
+            let token = match &token_file {
+                Some(f) => toto::claude_cli::read_secret(f)?,
+                None => std::env::var("GITHUB_TOKEN").map_err(|_| "no token: pass --token-file or set GITHUB_TOKEN")?,
+            };
+            let mut trusted = toto::manifest::TrustedProjects::default();
+            for p in &projects {
+                let (id, key) = p.split_once('=').ok_or("--project needs `id=<hex public key>`")?;
+                let bytes: [u8; 32] = hex::decode(key).ok().and_then(|b| b.try_into().ok()).ok_or("project key must be 32 bytes of hex")?;
+                trusted.insert(id, ed25519_dalek::VerifyingKey::from_bytes(&bytes).map_err(|_| "bad project key")?);
+            }
+            let q = toto::github_queue::GitHubQueue::new(&api, &repo, toto::github_queue::DEFAULT_LABEL, Some(token));
+            let mut opts = toto::pr_flow::Options::new(repo_dir, &base);
+            opts.max_open = max_open;
+            opts.protected.extend(protect);
+            for o in toto::pr_flow::run(&q, &repo, &trusted, &opts)? {
+                println!("{o:?}");
             }
         }
         Cmd::GithubResults { repo, token_file, api, out } => {

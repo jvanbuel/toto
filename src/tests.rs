@@ -2846,6 +2846,7 @@ mod github_queue {
         body: String,
         labels: Vec<String>,
         pr: bool,
+        closed: bool,
         comments: Vec<(u64, String, i64, i64)>, // id, body, created, updated (unix secs)
     }
 
@@ -2857,6 +2858,7 @@ mod github_queue {
         next_id: u64,
         not_modified: u64,
         requests: u64,
+        pulls: Vec<(u64, String, String, String, String)>, // number, head, base, title, body
     }
 
     /// A tiny stand-in for the parts of GitHub's REST API the queue uses. `advance` moves its clock.
@@ -2957,8 +2959,7 @@ mod github_queue {
                 ("GET", ["repos", "org", "proj", "issues"]) => {
                     let label = q("labels").unwrap_or_default();
                     let state_q = q("state").unwrap_or_default();
-                    let _ = state_q;
-                    let all: Vec<Value> = st.issues.iter().filter(|i| i.labels.contains(&label)).map(|i| {
+                    let all: Vec<Value> = st.issues.iter().filter(|i| i.labels.contains(&label) && (state_q == "all" || !i.closed)).map(|i| {
                         let mut v = json!({"number": i.number, "title": i.title, "body": i.body, "comments": i.comments.len()});
                         if i.pr {
                             v["pull_request"] = json!({"url": "x"});
@@ -3022,6 +3023,30 @@ mod github_queue {
                     st.assets.push((id, name, body.clone()));
                     (201, "application/json", json!({"id": id}).to_string().into_bytes())
                 }
+                ("PATCH", ["repos", "org", "proj", "issues", n]) => {
+                    let n: u64 = n.parse().unwrap_or(0);
+                    let closing = json_body()["state"] == "closed";
+                    match st.issues.iter_mut().find(|i| i.number == n) {
+                        Some(i) => {
+                            i.closed = closing;
+                            (200, "application/json", json!({"number": n}).to_string().into_bytes())
+                        }
+                        None => (404, "application/json", b"{}".to_vec()),
+                    }
+                }
+                ("GET", ["repos", "org", "proj", "pulls"]) => {
+                    let head = q("head").unwrap_or_default().replace("%3A", ":");
+                    let want = head.split_once(':').map(|x| x.1.to_string());
+                    let list: Vec<Value> = st.pulls.iter().filter(|p| want.as_ref().is_none_or(|w| &p.1 == w)).map(|p| json!({"number": p.0, "head": {"ref": p.1}, "base": {"ref": p.2}, "title": p.3, "body": p.4})).collect();
+                    (200, "application/json", serde_json::to_vec(&list).unwrap())
+                }
+                ("POST", ["repos", "org", "proj", "pulls"]) => {
+                    let v = json_body();
+                    let number = 500 + st.pulls.len() as u64;
+                    st.pulls.push((number, v["head"].as_str().unwrap_or("").into(), v["base"].as_str().unwrap_or("").into(), v["title"].as_str().unwrap_or("").into(), v["body"].as_str().unwrap_or("").into()));
+                    (201, "application/json", json!({"number": number}).to_string().into_bytes())
+                }
+                ("POST", ["repos", "org", "proj", "issues", _, "labels"]) => (200, "application/json", b"[]".to_vec()),
                 ("GET", ["assets", id]) => match st.assets.iter().find(|a| a.0.to_string() == *id) {
                     Some(a) => (200, "application/octet-stream", a.2.clone()),
                     None => (404, "application/json", b"{}".to_vec()),
@@ -3257,5 +3282,184 @@ mod github_queue {
         // a heartbeat (edit) keeps a's lease past b's attempt.
         let c = vec![claim(1, "a", 100, 0, 120), claim(2, "b", 100, 110, 110)];
         assert_eq!(holder_at(&c, t(130)).unwrap().runner, "a");
+    }
+
+    // ------------------------------------------------------------------ results to pull requests
+
+    use crate::archive::Record;
+    use crate::pr_flow::{run as to_prs, Options, Outcome};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let o = Command::new("git").current_dir(dir).args(args).output().unwrap();
+        assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+
+    /// A bare "origin" and a working clone of it, with `main` holding the given files.
+    fn repo(name: &str, files: &[(&str, &str)]) -> (PathBuf, PathBuf) {
+        let root = super::fixture(name).dir;
+        let (remote, work) = (root.join("remote.git"), root.join("work"));
+        std::fs::create_dir_all(&remote).unwrap();
+        git(&remote, &["init", "-q", "--bare", "-b", "main"]);
+        git(&root, &["clone", "-q", remote.to_str().unwrap(), "work"]);
+        git(&work, &["config", "user.email", "t@example.org"]);
+        git(&work, &["config", "user.name", "t"]);
+        git(&work, &["checkout", "-q", "-b", "main"]);
+        for (p, c) in files {
+            std::fs::create_dir_all(work.join(p).parent().unwrap()).unwrap();
+            std::fs::write(work.join(p), c).unwrap();
+        }
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-q", "-m", "init"]);
+        git(&work, &["push", "-q", "origin", "main"]);
+        (remote, work)
+    }
+
+    fn file(path: &str, data: &str) -> Record {
+        Record::File { path: path.into(), mode: 0o644, data: data.as_bytes().to_vec() }
+    }
+
+    /// Posts task `id` as the project and submits `records` as a runner's result.
+    fn finished(p: &Project, id: &str, output: &str, records: &[Record]) -> ed25519_dalek::SigningKey {
+        let mut m = super::task(id, "a", 10, &p.key);
+        m.output_schema.max_bytes = 10_000;
+        m.output_schema.max_artifact_bytes = 1 << 20;
+        p.fake.queue(Some(TOKEN)).post_task(&m.sign(&p.key).unwrap()).unwrap();
+        let runner_key = crate::manifest::generate_key();
+        let tar = if records.is_empty() { None } else { Some(crate::archive::to_bytes(records).unwrap()) };
+        let r = crate::result::SignedResult::package(id, output.into(), 42, &m.output_schema, &runner_key, tar).unwrap();
+        let q = p.fake.queue(Some(TOKEN));
+        q.available().unwrap();
+        q.submit(&r).unwrap();
+        runner_key
+    }
+
+    fn trusted(p: &Project) -> crate::manifest::TrustedProjects {
+        let mut t = crate::manifest::TrustedProjects::default();
+        t.insert("a", p.key.verifying_key());
+        t
+    }
+
+    fn issue_closed(p: &Project, n: usize) -> bool {
+        p.fake.state.lock().unwrap().issues[n].closed
+    }
+
+    #[test]
+    fn a_result_becomes_a_pull_request_automatically() {
+        let p = project();
+        let (remote, work) = repo("pr1", &[("src/a.txt", "old"), ("src/gone.txt", "bye"), ("README", "hi")]);
+        let runner = finished(&p, "pr-1", "Fixed it.\n```\n@everyone [x](http://evil.example)\n```", &[file("src/a.txt", "new"), file("docs/new.md", "# new"), Record::Deleted { path: "src/gone.txt".into() }]);
+        let rid = hex::encode(runner.verifying_key().to_bytes());
+        let q = p.fake.queue(Some(TOKEN));
+        let out = to_prs(&q, "org/proj", &trusted(&p), &Options::new(&work, "main")).unwrap();
+        assert_eq!(out, [Outcome::PullRequest { task: "pr-1".into(), number: 500 }]);
+
+        let branch = format!("toto/pr-1-{}", &rid[..8]);
+        let show = |path: &str| Command::new("git").current_dir(&remote).args(["show", &format!("{branch}:{path}")]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&show("src/a.txt").stdout), "new");
+        assert_eq!(String::from_utf8_lossy(&show("docs/new.md").stdout), "# new");
+        assert!(!show("src/gone.txt").status.success(), "deleted in the PR");
+        assert_eq!(String::from_utf8_lossy(&show("README").stdout), "hi", "untouched files stay");
+        assert_eq!(git(&remote, &["rev-parse", "main"]), git(&work, &["rev-parse", "origin/main"]), "main itself is untouched");
+
+        let st = p.fake.state.lock().unwrap();
+        let (_, head, base, title, body) = &st.pulls[0];
+        assert_eq!((head.as_str(), base.as_str()), (branch.as_str(), "main"));
+        assert!(title.contains("pr-1"));
+        assert!(body.contains(&rid) && body.contains("42") && body.contains("verified"), "provenance: {body}");
+        assert!(body.contains("````text"), "hostile output sits in a fence longer than any backtick run in it: {body}");
+        drop(st);
+        assert!(issue_closed(&p, 0));
+        assert!(git(&work, &["status", "--porcelain"]).is_empty(), "the checkout is left clean");
+        assert!(git(&work, &["branch", "--list", &branch]).is_empty(), "and without the local branch");
+
+        assert!(to_prs(&q, "org/proj", &trusted(&p), &Options::new(&work, "main")).unwrap().is_empty(), "nothing is opened twice");
+        assert_eq!(p.fake.state.lock().unwrap().pulls.len(), 1);
+    }
+
+    #[test]
+    fn results_that_touch_ci_or_escape_the_repo_are_not_applied() {
+        let p = project();
+        let (remote, work) = repo("pr2", &[("README", "hi")]);
+        finished(&p, "bad-ci", "x", &[file(".GitHub/workflows/evil.yml", "on: push"), file("ok.txt", "fine")]);
+        finished(&p, "bad-lnk", "x", &[file("link/pwned.txt", "x")]);
+        finished(&p, "bad-lnk2", "x", &[file("evil", "overwritten")]);
+        let victim = work.parent().unwrap().join("victim.txt");
+        std::fs::write(&victim, "untouched").unwrap();
+        std::os::unix::fs::symlink("/tmp", work.join("link")).unwrap();
+        std::os::unix::fs::symlink(&victim, work.join("evil")).unwrap();
+        git(&work, &["add", "link", "evil"]);
+        git(&work, &["commit", "-q", "-m", "link"]);
+        git(&work, &["push", "-q", "origin", "main"]);
+        let q = p.fake.queue(Some(TOKEN));
+        let out = to_prs(&q, "org/proj", &trusted(&p), &Options::new(&work, "main")).unwrap();
+        assert!(matches!(&out[0], Outcome::Refused { task, why } if task == "bad-ci" && why.contains(".GitHub/workflows")), "{out:?}");
+        assert!(matches!(&out[1], Outcome::Refused { task, .. } if task == "bad-lnk"), "{out:?}");
+        assert!(matches!(&out[2], Outcome::Refused { task, .. } if task == "bad-lnk2"), "{out:?}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched", "a symlinked file is not written through");
+        assert!(p.fake.state.lock().unwrap().pulls.is_empty());
+        assert!(git(&remote, &["branch", "--list", "toto/*"]).is_empty(), "nothing was pushed");
+        assert!(!Path::new("/tmp/pwned.txt").exists());
+        assert!(git(&work, &["status", "--porcelain"]).is_empty());
+        assert!(!issue_closed(&p, 0), "left open for a maintainer");
+        let again = to_prs(&q, "org/proj", &trusted(&p), &Options::new(&work, "main")).unwrap();
+        assert!(again.iter().all(|o| matches!(o, Outcome::AlreadyHandled(_))), "refusals are remembered, not repeated: {again:?}");
+        let comments = p.fake.state.lock().unwrap().issues[0].comments.len();
+        assert_eq!(comments, 2, "the result and one skip note");
+    }
+
+    #[test]
+    fn text_only_unchanged_and_capped_results() {
+        let p = project();
+        let (_, work) = repo("pr3", &[("a.txt", "same")]);
+        finished(&p, "t-text", "just an answer", &[]);
+        finished(&p, "t-same", "no-op", &[file("a.txt", "same")]);
+        finished(&p, "t-one", "one", &[file("one.txt", "1")]);
+        finished(&p, "t-two", "two", &[file("two.txt", "2")]);
+        let q = p.fake.queue(Some(TOKEN));
+        let mut o = Options::new(&work, "main");
+        o.max_open = 1;
+        let out = to_prs(&q, "org/proj", &trusted(&p), &o).unwrap();
+        assert_eq!(out[0], Outcome::TextOnly("t-text".into()));
+        assert_eq!(out[1], Outcome::NoChange("t-same".into()));
+        assert!(matches!(out[2], Outcome::PullRequest { .. }), "{out:?}");
+        assert_eq!(out[3], Outcome::Deferred("t-two".into()), "the cap stops a flood");
+        assert!(issue_closed(&p, 0) && issue_closed(&p, 1) && issue_closed(&p, 2) && !issue_closed(&p, 3));
+        // The text answer was posted as a comment, inside a fence.
+        let st = p.fake.state.lock().unwrap();
+        assert!(st.issues[0].comments.iter().any(|c| c.1.contains("just an answer") && c.1.contains("```text")));
+    }
+
+    #[test]
+    fn forged_tasks_and_untrusted_projects_are_ignored() {
+        let p = project();
+        let (_, work) = repo("pr4", &[("a.txt", "x")]);
+        // an issue whose task was signed by somebody else, with a perfectly valid result under it
+        let imposter = crate::manifest::generate_key();
+        let mut m = super::task("forged", "a", 10, &imposter);
+        m.output_schema.max_bytes = 100;
+        p.fake.queue(Some(TOKEN)).post_task(&m.sign(&imposter).unwrap()).unwrap();
+        let q = p.fake.queue(Some(TOKEN));
+        q.available().unwrap();
+        let r = crate::result::SignedResult::package("forged", "x".into(), 1, &m.output_schema, &crate::manifest::generate_key(), None).unwrap();
+        q.submit(&r).unwrap();
+        let out = to_prs(&q, "org/proj", &trusted(&p), &Options::new(&work, "main")).unwrap();
+        assert!(out.is_empty(), "{out:?}");
+        assert!(!issue_closed(&p, 0));
+    }
+
+    #[test]
+    fn a_dirty_checkout_is_not_touched() {
+        let p = project();
+        let (_, work) = repo("pr5", &[("a.txt", "x")]);
+        finished(&p, "dirty", "x", &[file("b.txt", "y")]);
+        std::fs::write(work.join("a.txt"), "local edit").unwrap();
+        let q = p.fake.queue(Some(TOKEN));
+        let err = to_prs(&q, "org/proj", &trusted(&p), &Options::new(&work, "main")).unwrap_err();
+        assert!(err.to_string().contains("uncommitted"), "{err}");
+        assert_eq!(std::fs::read_to_string(work.join("a.txt")).unwrap(), "local edit");
+        assert!(!issue_closed(&p, 0));
     }
 }
