@@ -60,6 +60,13 @@ enum Cmd {
         #[arg(long, default_value = toto::github_queue::DEFAULT_API)]
         github_api: String,
     },
+    /// Choose which projects your runner supports: add, list or remove.
+    Projects {
+        #[command(subcommand)]
+        cmd: ProjectsCmd,
+        #[arg(long, global = true)]
+        config: Option<PathBuf>,
+    },
     /// Project side: open a pull request for every finished task's result (run it on a schedule,
     /// e.g. from a GitHub Action in the project repository; see docs/github-queue.md).
     ResultsToPr {
@@ -156,6 +163,42 @@ enum Cmd {
     },
     /// Run one signed task end to end against an in-memory queue and an echo harness.
     Demo,
+}
+
+#[derive(Subcommand)]
+enum ProjectsCmd {
+    /// Support a project: reads its `.toto/project.json` from GitHub, shows what it asks for and,
+    /// after you confirm, trusts its key, gives it a share and adds its queue to your config. Anything
+    /// that widens what a task may do stays off unless you accept it with `--accept`.
+    Add {
+        /// `owner/name` of the project's repository
+        repo: String,
+        /// Relative weight against your other projects.
+        #[arg(long, default_value_t = 1)]
+        share: u32,
+        /// Permissions to grant: network, context, stdio-mcp, mcp-hosts (repeatable).
+        #[arg(long = "accept")]
+        accept: Vec<String>,
+        /// File with your GitHub token (it only needs to comment on issues).
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        #[arg(long, default_value = toto::github_queue::DEFAULT_API)]
+        api: String,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show the projects you support.
+    List,
+    /// Stop supporting a project.
+    Remove { id: String },
+}
+
+fn save_config(path: &std::path::Path, cfg: &toto::config::Config) -> Result<(), Box<dyn std::error::Error>> {
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_string_pretty(cfg)?)?;
+    fs::rename(tmp, path)?;
+    Ok(())
 }
 
 fn home() -> PathBuf {
@@ -264,6 +307,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match rec {
                     toto::archive::Record::File { path, data, .. } => println!("file    {path} ({} bytes)", data.len()),
                     toto::archive::Record::Deleted { path } => println!("deleted {path}"),
+                }
+            }
+        }
+        Cmd::Projects { cmd, config } => {
+            let path = config_path(config);
+            let mut cfg = toto::config::Config::load(&path)?;
+            match cmd {
+                ProjectsCmd::List => {
+                    let lines = toto::projects::list(&cfg);
+                    if lines.is_empty() {
+                        println!("no projects yet: `toto projects add owner/name`");
+                    }
+                    for l in lines {
+                        println!("{l}");
+                    }
+                }
+                ProjectsCmd::Remove { id } => {
+                    println!("{}", toto::projects::remove(&mut cfg, &id)?);
+                    save_config(&path, &cfg)?;
+                }
+                ProjectsCmd::Add { repo, share, accept, token_file, api, yes } => {
+                    use std::io::{BufRead, IsTerminal, Write};
+                    let token = token_file.as_deref().map(toto::claude_cli::read_secret).transpose()?;
+                    let gh = toto::github_queue::GitHubQueue::new(&api, &repo, toto::github_queue::DEFAULT_LABEL, token);
+                    let bytes = gh.file(toto::projects::DESCRIPTOR_PATH)?.ok_or_else(|| format!("{repo} has no {} (is it a toto project?)", toto::projects::DESCRIPTOR_PATH))?;
+                    let d = toto::projects::Descriptor::parse(&bytes)?;
+                    let opts = toto::projects::AddOptions { share, accept: accept.into_iter().collect(), token_file };
+                    let mut updated = cfg.clone();
+                    let notes = toto::projects::add(&mut updated, &repo, &d, &opts)?;
+                    println!("{} ({}), from github:{repo}\n{}\n", d.name, d.id, d.description);
+                    println!("  key fingerprint  {} (compare it with what the project publishes)", d.fingerprint());
+                    println!("  task kinds       {}", d.kinds.join(", "));
+                    println!("  share            {}", share.max(1));
+                    for n in &notes {
+                        println!("  {n}");
+                    }
+                    if !yes {
+                        if !std::io::stdin().is_terminal() {
+                            return Err("not a terminal: re-run with --yes to confirm".into());
+                        }
+                        print!("\nSupport this project? [y/N] ");
+                        std::io::stdout().flush()?;
+                        let mut answer = String::new();
+                        std::io::stdin().lock().read_line(&mut answer)?;
+                        if !answer.trim().eq_ignore_ascii_case("y") {
+                            println!("nothing changed");
+                            return Ok(());
+                        }
+                    }
+                    save_config(&path, &updated)?;
+                    println!("\nadded; run `toto doctor` to check the setup");
                 }
             }
         }

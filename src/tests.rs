@@ -2859,6 +2859,7 @@ mod github_queue {
         not_modified: u64,
         requests: u64,
         pulls: Vec<(u64, String, String, String, String)>, // number, head, base, title, body
+        files: Vec<(String, Vec<u8>)>,
     }
 
     /// A tiny stand-in for the parts of GitHub's REST API the queue uses. `advance` moves its clock.
@@ -3047,6 +3048,10 @@ mod github_queue {
                     (201, "application/json", json!({"number": number}).to_string().into_bytes())
                 }
                 ("POST", ["repos", "org", "proj", "issues", _, "labels"]) => (200, "application/json", b"[]".to_vec()),
+                ("GET", ["repos", "org", "proj", "contents", rest @ ..]) => match st.files.iter().find(|f| f.0 == rest.join("/")) {
+                    Some(f) => (200, "application/octet-stream", f.1.clone()),
+                    None => (404, "application/json", br#"{"message":"Not Found"}"#.to_vec()),
+                },
                 ("GET", ["assets", id]) => match st.assets.iter().find(|a| a.0.to_string() == *id) {
                     Some(a) => (200, "application/octet-stream", a.2.clone()),
                     None => (404, "application/json", b"{}".to_vec()),
@@ -3461,5 +3466,110 @@ mod github_queue {
         assert!(err.to_string().contains("uncommitted"), "{err}");
         assert_eq!(std::fs::read_to_string(work.join("a.txt")).unwrap(), "local edit");
         assert!(!issue_closed(&p, 0));
+    }
+
+    // ----------------------------------------------------------------- contributors choose projects
+
+    use crate::config::{Config, QueueEndpoint};
+    use crate::projects::{self, AddOptions, Descriptor};
+    use std::collections::BTreeSet;
+
+    fn descriptor(key: &ed25519_dalek::SigningKey, extra: &str) -> String {
+        format!(
+            r#"{{"version": 1, "id": "acme", "name": "Acme Docs", "description": "Keeps docs current.", "public_key": "{}", "kinds": ["summarise"]{extra}}}"#,
+            hex::encode(key.verifying_key().to_bytes())
+        )
+    }
+
+    fn contributor(name: &str) -> Config {
+        Config::starter(&super::fixture(name).dir)
+    }
+
+    fn accept(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    const NEEDS: &str = r#", "needs": {"network": ["GET api.github.com/repos/acme/**"], "context": true, "stdio_mcp": true, "mcp_hosts": ["mcp.acme.example"]}"#;
+
+    #[test]
+    fn adding_a_project_trusts_it_but_leaves_risky_permissions_off() {
+        let p = project();
+        p.fake.state.lock().unwrap().files.push((".toto/project.json".into(), descriptor(&p.key, NEEDS).into_bytes()));
+        let bytes = p.fake.queue(None).file(projects::DESCRIPTOR_PATH).unwrap().expect("descriptor");
+        let d = Descriptor::parse(&bytes).unwrap();
+        assert_eq!(d.fingerprint().len(), 16);
+
+        let mut cfg = contributor("proj-add");
+        let notes = projects::add(&mut cfg, "org/proj", &d, &AddOptions { share: 3, accept: accept(&[]), token_file: None }).unwrap();
+        assert_eq!(cfg.projects["acme"], d.public_key);
+        assert_eq!((cfg.policy.project_shares["acme"], cfg.sources["acme"].as_str()), (3, "org/proj"));
+        assert_eq!(cfg.policy.allowed_kinds, ["summarise"]);
+        assert!(matches!(&cfg.queues[..], [QueueEndpoint::Github { repo, .. }] if repo == "org/proj"));
+        assert_eq!(notes.iter().filter(|n| n.starts_with("NOT granted")).count(), 4, "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("no GitHub token")));
+        assert!(cfg.policy.max_profile.network_allowlist.is_empty() && !cfg.policy.allow_context && !cfg.policy.allow_stdio_mcp && cfg.policy.allowed_mcp_hosts.is_empty());
+
+        // A task from the project is now admitted by policy; a task asking for its network rule is not yet.
+        let now = chrono::Local::now();
+        let mut t = super::task("acme-1", "acme", 10, &p.key);
+        assert!(cfg.policy.admit(&t, 0, now).is_ok());
+        t.sandbox_profile.network_allowlist = vec!["GET api.github.com/repos/acme/**".into()];
+        assert!(cfg.policy.admit(&t, 0, now).is_err(), "the network rule was not accepted");
+
+        // Accepting by name grants exactly those things, and adding again changes nothing else.
+        let all = AddOptions { share: 3, accept: accept(&["network", "context", "stdio-mcp", "mcp-hosts"]), token_file: Some("/gh.token".into()) };
+        projects::add(&mut cfg, "org/proj", &d, &all).unwrap();
+        projects::add(&mut cfg, "org/proj", &d, &all).unwrap();
+        assert!(cfg.policy.admit(&t, 0, now).is_ok());
+        assert!(cfg.policy.allow_context && cfg.policy.allow_stdio_mcp);
+        assert_eq!(cfg.policy.allowed_mcp_hosts, ["mcp.acme.example"]);
+        assert_eq!((cfg.queues.len(), cfg.policy.allowed_kinds.len(), cfg.policy.max_profile.network_allowlist.len()), (1, 1, 1), "idempotent");
+    }
+
+    #[test]
+    fn a_changed_key_unknown_permissions_and_bad_descriptors_are_refused() {
+        let p = project();
+        let d = Descriptor::parse(descriptor(&p.key, "").as_bytes()).unwrap();
+        let mut cfg = contributor("proj-bad");
+        let opts = |a: &[&str]| AddOptions { share: 1, accept: accept(a), token_file: None };
+        projects::add(&mut cfg, "org/proj", &d, &opts(&[])).unwrap();
+        let other = Descriptor::parse(descriptor(&crate::manifest::generate_key(), "").as_bytes()).unwrap();
+        let e = projects::add(&mut cfg, "org/proj", &other, &opts(&[])).unwrap_err().to_string();
+        assert!(e.contains("different key"), "a project cannot swap its key silently: {e}");
+        assert_eq!(cfg.projects["acme"], d.public_key);
+        assert!(projects::add(&mut contributor("proj-bad2"), "org/proj", &d, &opts(&["everything"])).is_err());
+
+        let good = descriptor(&p.key, "");
+        for (what, text) in [
+            ("version", good.replace("\"version\": 1", "\"version\": 2")),
+            ("id", good.replace("\"acme\"", "\"Acme Corp!\"")),
+            ("key", good.replace(&d.public_key, "abcd")),
+            ("kinds", good.replace("[\"summarise\"]", "[]")),
+            ("rule", descriptor(&p.key, r#", "needs": {"network": ["not a rule"]}"#)),
+            ("host", descriptor(&p.key, r#", "needs": {"mcp_hosts": ["evil.com/x"]}"#)),
+            ("json", "{".into()),
+        ] {
+            assert!(Descriptor::parse(text.as_bytes()).is_err(), "{what} should be refused");
+        }
+        assert!(p.fake.queue(None).file(projects::DESCRIPTOR_PATH).unwrap().is_none(), "no descriptor is not an error, just absent");
+    }
+
+    #[test]
+    fn removing_a_project_keeps_a_shared_queue_for_the_others() {
+        let p = project();
+        let d1 = Descriptor::parse(descriptor(&p.key, "").as_bytes()).unwrap();
+        let d2 = Descriptor::parse(descriptor(&p.key, "").replace("acme", "acme-two").as_bytes()).unwrap();
+        let mut cfg = contributor("proj-rm");
+        let opts = AddOptions { share: 1, accept: accept(&[]), token_file: None };
+        projects::add(&mut cfg, "org/proj", &d1, &opts).unwrap();
+        projects::add(&mut cfg, "org/proj", &d2, &opts).unwrap();
+        assert_eq!(projects::list(&cfg).len(), 2);
+        projects::remove(&mut cfg, "acme").unwrap();
+        assert_eq!(cfg.queues.len(), 1, "acme-two still reads that repository");
+        assert!(!cfg.projects.contains_key("acme") && !cfg.policy.project_shares.contains_key("acme"));
+        projects::remove(&mut cfg, "acme-two").unwrap();
+        assert!(cfg.queues.is_empty() && cfg.projects.is_empty());
+        assert!(projects::remove(&mut cfg, "acme").is_err());
+        assert!(projects::list(&cfg).is_empty());
     }
 }

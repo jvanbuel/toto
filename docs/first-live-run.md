@@ -118,6 +118,10 @@ Only for tasks whose manifest carries `network_allowlist` rules. As root: `toto 
 
 For a pilot with no server: the project posts tasks with `toto post-task --github org/repo --github-token-file gh.token ...`; the runner config gets `"queues": [{"kind": "github", "repo": "org/repo", "token_file": "gh.token"}]`. The runner token only needs to comment on issues. See `docs/github-queue.md` for the format, limits and what a hostile commenter can do, and run `toto doctor` to check the endpoint.
 
+## Variant: choose a project with `toto projects add`
+
+Instead of editing `projects`, `policy.project_shares` and `queues` by hand: `toto projects add owner/name --token-file gh.token` reads the project's `.toto/project.json`, shows what it asks for and, after you confirm, writes all three. Risky permissions stay off unless you pass `--accept ...`. See `docs/projects.md`.
+
 ## What to look for
 
 Success: `Submitted("live-1")`; `toto extract-result ~/.config/toto/queue/results/live-1.*.json ./out` lists `file    hello.txt (...)` and `out/hello.txt` contains the line (the task's changed files come back as signed artifacts); the audit line shows `submitted` and a plausible `tokens=` figure; the result in `~/.config/toto/queue/results/` has an `output` that reports `hello from the sandbox`, `65534` for `id -u`, and an error or empty listing for `ls /home`.

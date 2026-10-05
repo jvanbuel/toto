@@ -366,6 +366,16 @@ impl GitHubQueue {
         Ok(out)
     }
 
+    /// A file from the repository's default branch (`None` if it does not exist).
+    pub fn file(&self, path: &str) -> Result<Option<Vec<u8>>> {
+        let (status, body, _) = self.request("GET", &self.api_url(&format!("/contents/{path}")), None, "application/json", "application/vnd.github.raw+json", None)?;
+        match status {
+            200 => Ok(Some(body)),
+            404 => Ok(None),
+            _ => Err(Self::fail(status, "GET", &body)),
+        }
+    }
+
     pub fn comment(&self, issue: u64, body: &str) -> Result<()> {
         self.send_json("POST", &self.api_url(&format!("/issues/{issue}/comments")), &serde_json::json!({"body": body})).map(|_| ())
     }

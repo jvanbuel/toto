@@ -189,6 +189,9 @@ pub struct Config {
     /// Trusted project public keys (hex ed25519), by project id.
     #[serde(default)]
     pub projects: BTreeMap<String, String>,
+    /// Where each project was added from (`owner/name` on GitHub), set by `toto projects add`.
+    #[serde(default)]
+    pub sources: BTreeMap<String, String>,
 }
 
 /// Where tasks come from.
@@ -292,6 +295,7 @@ impl Config {
                 max_input_bytes: 64 * 1024 * 1024,
             },
             projects: BTreeMap::new(),
+            sources: BTreeMap::new(),
         }
     }
 

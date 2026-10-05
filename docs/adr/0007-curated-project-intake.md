@@ -27,3 +27,7 @@ In BOINC, curation lives in *account managers* (BAM!, Science United): contribut
 ## Simpler v1 option
 
 An allowlist file of approved repositories in this repo; projects apply by pull request and maintainers approve by merging. The board can come later.
+
+## Update (2026-10-04): contributors opt in per project
+
+Curation says which projects are vetted; each contributor still chooses which of them to support. `toto projects add|list|remove` (`docs/projects.md`) reads a project's `.toto/project.json` descriptor and edits only the contributor's own config; permissions that widen what a task may do are granted only when named. A directory of vetted projects is not built; `add` takes any `owner/name`, so a directory only has to supply that.

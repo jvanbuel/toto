@@ -21,6 +21,7 @@ pub mod netfence;
 pub mod omnigent;
 pub mod policy;
 pub mod pr_flow;
+pub mod projects;
 pub mod proxy;
 pub mod queue;
 pub mod result;
