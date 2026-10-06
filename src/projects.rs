@@ -33,6 +33,16 @@ pub struct Needs {
     pub mcp_hosts: Vec<String>,
 }
 
+/// Where a project's environment image comes from: named directly, or read from its
+/// `devcontainer.json` (a strict subset, see `devcontainer`). Exactly one of the two.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Environment {
+    #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub devcontainer: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Descriptor {
     pub version: u32,
@@ -45,6 +55,9 @@ pub struct Descriptor {
     pub kinds: Vec<String>,
     #[serde(default = "no_needs")]
     pub needs: Needs,
+    /// The image the project's tasks run in. Without one, tasks run in the contributor's default.
+    #[serde(default)]
+    pub environment: Option<Environment>,
 }
 
 fn no_needs() -> Needs {
@@ -80,7 +93,29 @@ impl Descriptor {
         if let Some(h) = d.needs.mcp_hosts.iter().find(|h| h.is_empty() || !h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')) {
             return Err(bad(format!("bad MCP host `{h}`")));
         }
+        match &d.environment {
+            Some(Environment { image: Some(i), devcontainer: None }) if crate::devcontainer::valid_image_ref(i) => {}
+            Some(Environment { image: Some(i), devcontainer: None }) => return Err(bad(format!("environment image `{i}` must be fully qualified with a registry and a tag or digest"))),
+            Some(Environment { image: None, devcontainer: Some(p) }) if crate::archive::valid_path(p) => {}
+            Some(_) => return Err(bad("environment needs exactly one of `image` or `devcontainer` (a relative path)".into())),
+            None => {}
+        }
         Ok(d)
+    }
+
+    /// The environment image and any warnings about ignored `devcontainer.json` keys. `fetch` reads a
+    /// file from the project repository (`None` if absent).
+    pub fn environment_image(&self, fetch: &dyn Fn(&str) -> Result<Option<Vec<u8>>>) -> Result<Option<(String, Vec<String>)>> {
+        Ok(match &self.environment {
+            None => None,
+            Some(Environment { image: Some(i), .. }) => Some((i.clone(), vec![])),
+            Some(Environment { devcontainer: Some(path), .. }) => {
+                let bytes = fetch(path)?.ok_or_else(|| Error::Policy(format!("the project names {path} as its environment, but the file is not there")))?;
+                let parsed = crate::devcontainer::parse(&String::from_utf8_lossy(&bytes))?;
+                Some((parsed.image, parsed.warnings))
+            }
+            Some(_) => None,
+        })
     }
 
     /// Short fingerprint of the key, for the contributor to compare with what the project publishes.
@@ -97,6 +132,8 @@ pub struct AddOptions {
     pub accept: BTreeSet<String>,
     /// File with the contributor's GitHub token (to claim and answer tasks); `None` leaves it unset.
     pub token_file: Option<PathBuf>,
+    /// The project's environment image, resolved from its descriptor (`Descriptor::environment_image`).
+    pub image: Option<String>,
 }
 
 /// Adds the project to `cfg`; returns what was granted and what was left off, for the contributor.
@@ -111,6 +148,17 @@ pub fn add(cfg: &mut Config, repo: &str, d: &Descriptor, o: &AddOptions) -> Resu
     cfg.projects.insert(d.id.clone(), d.public_key.clone());
     cfg.policy.project_shares.insert(d.id.clone(), o.share.max(1));
     cfg.sources.insert(d.id.clone(), repo.to_string());
+    match &o.image {
+        Some(image) if crate::devcontainer::valid_image_ref(image) => {
+            cfg.environments.insert(d.id.clone(), image.clone());
+            notes.push(format!("environment {image} (its tasks run in this image, as an unprivileged user, with no network unless you grant it)"));
+        }
+        Some(image) => return Err(Error::Policy(format!("environment image `{image}` is not a fully qualified reference"))),
+        None => {
+            cfg.environments.remove(&d.id);
+            notes.push("environment: none named; its tasks run in your default sandbox image".into());
+        }
+    }
     for k in &d.kinds {
         if !cfg.policy.allowed_kinds.contains(k) {
             cfg.policy.allowed_kinds.push(k.clone());
@@ -160,6 +208,7 @@ pub fn remove(cfg: &mut Config, id: &str) -> Result<String> {
         return Err(Error::Policy(format!("project `{id}` is not configured")));
     }
     cfg.policy.project_shares.remove(id);
+    cfg.environments.remove(id);
     let repo = cfg.sources.remove(id);
     if let Some(repo) = repo.filter(|r| !cfg.sources.values().any(|o| o == r)) {
         cfg.queues.retain(|q| !matches!(q, QueueEndpoint::Github { repo: r, .. } if *r == repo));

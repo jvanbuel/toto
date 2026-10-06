@@ -95,3 +95,9 @@ Install Omnigent in the project image (see `docs/examples/omnigent-image/Dockerf
 ```
 
 For Codex: `"harness": "codex"`, `"provider": "openai"`, `"api_key_file": "/path/to/key"`, `"model": "..."`, and `"agent_files": ["/path/to/codex", "/path/to/codex-code-mode-host"]` (static binaries from the `@openai/codex` package; they are mounted under `/toto/agent` and put on `PATH`). The proxy holds the credential; the container has none and no network. Tested against fake provider APIs only; costs: a larger image and about 20 s of startup per task.
+
+## Guides
+
+- Contributors: [docs/first-live-run.md](docs/first-live-run.md) (setup and variants), [docs/projects.md](docs/projects.md) (choosing projects).
+- Project owners: [docs/project-owner-guide.md](docs/project-owner-guide.md), with a complete example in `docs/examples/project/`.
+- Queues: [docs/github-queue.md](docs/github-queue.md), [docs/queue-protocol.md](docs/queue-protocol.md).

@@ -141,7 +141,10 @@ impl Sandbox for DirSandbox {
 pub struct DockerSandbox {
     /// `docker` or `podman`.
     pub bin: String,
+    /// The image for tasks of projects without their own.
     pub image: String,
+    /// The environment image each project names (project id to image); see `devcontainer`.
+    pub images: std::collections::HashMap<String, String>,
     pub runtime: Option<String>,
     pub workspace_mb: u32,
     /// Static `toto-mcp-exec` binary to mount read-only at `BRIDGE_PATH`: the only host path a
@@ -165,7 +168,7 @@ pub struct DockerSandbox {
 
 impl DockerSandbox {
     pub fn new(image: impl Into<String>) -> Self {
-        Self { bin: "docker".into(), image: image.into(), runtime: None, workspace_mb: 512, bridge: None, proxy_socket: None, seccomp_profile: None, network: None, agent_files: vec![], baselines: Default::default() }
+        Self { bin: "docker".into(), image: image.into(), images: Default::default(), runtime: None, workspace_mb: 512, bridge: None, proxy_socket: None, seccomp_profile: None, network: None, agent_files: vec![], baselines: Default::default() }
     }
 
     pub fn container_name(task_id: &str) -> String {
@@ -173,8 +176,29 @@ impl DockerSandbox {
         format!("toto-{safe}")
     }
 
-    /// The `run` argument list; pure so the hardening flags are unit-tested without a daemon.
+    /// The image a project's tasks run in: the one it names, else the runner's default.
+    pub fn image_for(&self, project: &str) -> &str {
+        self.images.get(project).map_or(self.image.as_str(), String::as_str)
+    }
+
+    /// Every distinct image this sandbox may start.
+    fn all_images(&self) -> Vec<&str> {
+        let mut v = vec![self.image.as_str()];
+        for i in self.images.values() {
+            if !v.contains(&i.as_str()) {
+                v.push(i);
+            }
+        }
+        v
+    }
+
+    /// The `run` argument list for the default image.
     pub fn run_args(&self, task_id: &str, p: &SandboxProfile) -> Result<Vec<String>> {
+        self.run_args_for(task_id, &self.image, p)
+    }
+
+    /// The `run` argument list; pure so the hardening flags are unit-tested without a daemon.
+    pub fn run_args_for(&self, task_id: &str, image: &str, p: &SandboxProfile) -> Result<Vec<String>> {
         let net = match (&self.network, p.network_allowlist.is_empty()) {
             (_, true) => "none",
             (Some(name), false) => name.as_str(),
@@ -209,7 +233,7 @@ impl DockerSandbox {
         if let Some(rt) = &self.runtime {
             a.extend(["--runtime".into(), rt.clone()]);
         }
-        a.extend([self.image.clone(), "sleep".into(), p.timeout_secs.to_string()]);
+        a.extend([image.to_string(), "sleep".into(), p.timeout_secs.to_string()]);
         Ok(a)
     }
 
@@ -247,30 +271,47 @@ impl DockerSandbox {
     }
 }
 
+impl DockerSandbox {
+    /// The image must be present; a project's image that is not is pulled (the contributor's docker
+    /// does the pulling; tasks never get network for it).
+    fn ensure_image(&self, image: &str) -> Result<()> {
+        if self.docker(&["image".into(), "inspect".into(), image.into()]).is_ok() {
+            return Ok(());
+        }
+        if image == self.image {
+            return Err(Error::Sandbox(format!("image `{image}` not present; run `{} pull {image}`", self.bin)));
+        }
+        self.docker(&["pull".into(), "-q".into(), image.into()]).map(|_| ()).map_err(|e| Error::Sandbox(format!("could not pull the project's image `{image}`: {e}")))
+    }
+}
+
 impl Sandbox for DockerSandbox {
     fn probe(&self) -> Result<()> {
         self.docker(&["version".into(), "--format".into(), "{{.Server.Version}}".into()])
             .map_err(|e| Error::Sandbox(format!("{} daemon unreachable: {e}", self.bin)))?;
-        self.docker(&["image".into(), "inspect".into(), self.image.clone()])
-            .map_err(|_| Error::Sandbox(format!("image `{}` not present; run `{} pull {}`", self.image, self.bin, self.image)))?;
-        if let Some(net) = &self.network {
-            crate::netfence::verify(&self.bin, net, &self.image)?;
-        }
-        if let Some(exe) = self.agent_exe() {
-            // The mounted agent must run in this image (the Claude CLI is a glibc binary: Alpine/musl images will not do).
-            let mut args: Vec<String> = ["run", "--rm", "--network", "none"].map(String::from).into();
-            for f in &self.agent_files {
-                args.extend(["--mount".into(), format!("type=bind,src={},dst={AGENT_DIR}/{},readonly", f.display(), f.file_name().unwrap_or_default().to_string_lossy())]);
+        for image in self.all_images() {
+            self.ensure_image(image)?;
+            if let Some(net) = &self.network {
+                crate::netfence::verify(&self.bin, net, image)?;
             }
-            args.extend([self.image.clone(), exe, "--version".into()]);
-            self.docker(&args)
-                .map_err(|e| Error::Sandbox(format!("the agent binary does not run in image `{}` (it needs a glibc-based image such as debian or ubuntu): {e}", self.image)))?;
+            if let Some(exe) = self.agent_exe() {
+                // The mounted agent must run in this image (the Claude CLI is a glibc binary: Alpine/musl images will not do).
+                let mut args: Vec<String> = ["run", "--rm", "--network", "none"].map(String::from).into();
+                for f in &self.agent_files {
+                    args.extend(["--mount".into(), format!("type=bind,src={},dst={AGENT_DIR}/{},readonly", f.display(), f.file_name().unwrap_or_default().to_string_lossy())]);
+                }
+                args.extend([image.to_string(), exe, "--version".into()]);
+                self.docker(&args)
+                    .map_err(|e| Error::Sandbox(format!("the agent binary does not run in image `{image}` (it needs a glibc-based image such as debian or ubuntu): {e}")))?;
+            }
         }
         Ok(())
     }
 
     fn create(&self, task: &TaskManifest, profile: &SandboxProfile) -> Result<Workspace> {
-        let args = self.run_args(&task.id, profile)?;
+        let image = self.image_for(&task.project_id);
+        self.ensure_image(image)?;
+        let args = self.run_args_for(&task.id, image, profile)?;
         let name = Self::container_name(&task.id);
         // A container left behind by a crash or an aborted run would block a retry of this task.
         let _ = self.docker(&["rm".into(), "-f".into(), name.clone()]);

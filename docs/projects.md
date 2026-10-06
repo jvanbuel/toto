@@ -37,9 +37,12 @@ Publish `.toto/project.json` on the default branch of the repository that holds 
     "context": true,
     "stdio_mcp": false,
     "mcp_hosts": []
-  }
+  },
+  "environment": { "devcontainer": ".devcontainer/toto/devcontainer.json" }
 }
 ```
+
+`environment` names the image your tasks run in, either directly (`{"image": "ghcr.io/acme/env:1.0"}`) or by pointing at a `devcontainer.json` whose `image` key toto reads (a strict subset of the spec: `docs/project-owner-guide.md`). Without it your tasks run in the contributor's default image. The contributor sees the image when adding your project; its tasks then run in that image only.
 
 `id` is 1-64 characters of `a-z`, `0-9`, `-`, `_`. `needs` is optional and lists only what your tasks actually use, so contributors can accept it knowingly. Egress rules use Omnigent's syntax (`METHODS host/path`).
 

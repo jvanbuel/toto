@@ -40,3 +40,7 @@ What stays fixed whatever a project declares: no credentials in the container, n
 - One sandbox model for everything a project ships; the trust boundary is the container, not a list of allowed fields.
 - The MCP stream from the container is parsed by the trusted harness, so a hostile container can attack through tool output (prompt injection) and the MCP protocol parser, but not through code execution on the host.
 - Result review (ADR 6) stays important.
+
+## Update (2026-10-04): the project names its image, through a dev container subset
+
+The environment is now the project's, not the runner's: `.toto/project.json` names an image (directly or through the `image` key of a `devcontainer.json`), `toto projects add` records it in the contributor's `environments`, and the docker sandbox starts that project's tasks in that image, with the same hardening (read-only, no capabilities, unprivileged user, no network unless granted). The dev container spec is used only as the place to name the image: files that build an image or act on the host (`build`, `dockerFile`, `features`, `mounts`, `runArgs`, `privileged`, `capAdd`, `securityOpt`, `initializeCommand`, ...) are refused, since honouring them would run a stranger's install scripts as root on the contributor's machine; the project builds and publishes the image in its own CI. Images must be fully qualified with a tag or digest; digest pinning is not required. A missing image is pulled by the contributor's docker; `probe` checks every configured image. Owner guide: `docs/project-owner-guide.md`.

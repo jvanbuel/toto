@@ -1,0 +1,7 @@
+// What toto reads: only `image` (a published image, fully qualified, with a tag or digest).
+// Keep your developers' own devcontainer.json (with `build`, `features`, ...) in .devcontainer/ and let
+// your CI build and push the image from it; toto refuses files that build or act on the host.
+{
+  "name": "acme-docs toto environment",
+  "image": "ghcr.io/acme/toto-env:1.0"
+}

@@ -333,7 +333,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let gh = toto::github_queue::GitHubQueue::new(&api, &repo, toto::github_queue::DEFAULT_LABEL, token);
                     let bytes = gh.file(toto::projects::DESCRIPTOR_PATH)?.ok_or_else(|| format!("{repo} has no {} (is it a toto project?)", toto::projects::DESCRIPTOR_PATH))?;
                     let d = toto::projects::Descriptor::parse(&bytes)?;
-                    let opts = toto::projects::AddOptions { share, accept: accept.into_iter().collect(), token_file };
+                    let env = d.environment_image(&|path| gh.file(path))?;
+                    let opts = toto::projects::AddOptions { share, accept: accept.into_iter().collect(), token_file, image: env.as_ref().map(|e| e.0.clone()) };
                     let mut updated = cfg.clone();
                     let notes = toto::projects::add(&mut updated, &repo, &d, &opts)?;
                     println!("{} ({}), from github:{repo}\n{}\n", d.name, d.id, d.description);
@@ -342,6 +343,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("  share            {}", share.max(1));
                     for n in &notes {
                         println!("  {n}");
+                    }
+                    for w in env.iter().flat_map(|e| &e.1) {
+                        println!("  note: devcontainer.json {w}");
                     }
                     if !yes {
                         if !std::io::stdin().is_terminal() {

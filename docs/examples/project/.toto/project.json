@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "id": "acme-docs",
+  "name": "Acme Docs",
+  "description": "Keeps the Acme documentation current: fixes broken examples and stale API references.",
+  "public_key": "<hex key printed by `toto project-key project.key`>",
+  "kinds": ["docs-fix"],
+  "needs": {
+    "network": ["GET docs.acme.example/**", "GET api.github.com/repos/acme/**"],
+    "context": true,
+    "stdio_mcp": false,
+    "mcp_hosts": []
+  },
+  "environment": { "devcontainer": ".devcontainer/toto/devcontainer.json" }
+}
