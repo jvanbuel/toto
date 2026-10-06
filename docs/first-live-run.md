@@ -52,7 +52,7 @@ toto run --once
 toto audit ~/.config/toto/state/audit.jsonl
 ```
 
-`run --once` probes the sandbox and the harness, then processes the queue and exits. The result lands as a comment on the task issue; `toto results-to-pr you/scratch --project <id>=<hex>` opens it as a pull request, or `toto github-results you/scratch --out results/` and `toto extract-result results/<id>.<runner>.json ./out` write the changed files locally.
+`run --once` probes the sandbox and the harness, then processes the queue and exits. `toto run` without `--once` is the daemon: it also serves the local page and prints its URL; `toto pause` and `toto resume` work while it runs. The result lands as a comment on the task issue; `toto results-to-pr you/scratch --project <id>=<hex>` opens it as a pull request, or `toto github-results you/scratch --out results/` and `toto extract-result results/<id>.<runner>.json ./out` write the changed files locally.
 
 ## Variant: an agent with egress rules
 

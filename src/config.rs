@@ -104,6 +104,9 @@ pub struct Config {
     pub queues: Vec<QueueEndpoint>,
     #[serde(default = "default_poll")]
     pub poll_secs: u64,
+    /// Loopback address the daemon serves the local page and API on; `null` turns it off.
+    #[serde(default = "default_ui_addr")]
+    pub ui_addr: Option<String>,
     pub sandbox: SandboxConfig,
     pub harness: HarnessConfig,
     pub policy: Policy,
@@ -199,6 +202,10 @@ fn default_poll() -> u64 {
     30
 }
 
+fn default_ui_addr() -> Option<String> {
+    Some("127.0.0.1:7707".into())
+}
+
 /// The daemon has no human to ask, so review-before-submit is refused at startup.
 struct NoReview;
 impl Reviewer for NoReview {
@@ -237,6 +244,7 @@ impl Config {
             queue_dir: dir.join("queue"),
             queues: vec![],
             poll_secs: default_poll(),
+            ui_addr: default_ui_addr(),
             sandbox: SandboxConfig::Docker { bin: docker_bin(), runtime: None, nested_userns: false, network: None },
             harness: HarnessConfig::Omnigent { provider: ProviderConfig::Anthropic, upstream: None, token_file: None, api_key_file: None },
             policy: Policy {

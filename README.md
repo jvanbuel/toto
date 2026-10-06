@@ -43,6 +43,7 @@ toto projects add <name>                    # shows the image and the agent; you
 toto doctor                                 # what works, what is missing
 toto run --once                             # or: toto install-service
 toto ui                                     # the local page: status, usage, projects, approvals
+toto pause                                  # take no new tasks until `toto resume`
 ```
 
 `config.json`, the parts you set:
@@ -75,7 +76,7 @@ Linux, macOS and Windows hosts with Docker Desktop, Docker Engine or Podman. Not
 
 ## The local page
 
-`toto ui` serves a page on loopback (default `127.0.0.1:7707`) and prints its URL with a session token. It shows the runner's status and pause reason, today's usage against the cap, the audit tail and every supported project with what was approved for it. It adds projects, checks and approves updates, removes projects and edits the policy through the same previews the CLI uses: nothing is approved that was not shown. Every call carries the token in a header, so other sites in your browser cannot drive it. See `ui/README.md`.
+The daemon serves a page on loopback while it runs (`ui_addr`, default `127.0.0.1:7707`); `toto ui` prints its URL, or serves the page itself when no daemon is running. It shows the runner's status and pause reason live, today's usage against the cap, the audit tail and every supported project with what was approved for it. It pauses and resumes the runner (`toto pause` and `toto resume` do the same from a terminal; a running task finishes first), adds projects, checks and approves updates, removes projects and edits the policy, through the same previews the CLI uses: nothing is approved that was not shown. Every call carries a session token kept in `state/ui.token` (mode 600) in a header, so other users on the machine and other sites in your browser cannot drive it. The API is what a native app will talk to. See `ui/README.md`.
 
 ## The site
 

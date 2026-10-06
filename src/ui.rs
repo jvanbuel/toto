@@ -37,6 +37,7 @@ enum Pending {
 
 pub struct UiState {
     pub config_path: PathBuf,
+    pub state_dir: PathBuf,
     pub token: String,
     /// GitHub API origin for project reads (the directory's, which is the same GitHub).
     pub api: String,
@@ -46,7 +47,7 @@ pub struct UiState {
 impl UiState {
     pub fn new(config_path: PathBuf, token: String) -> Result<Self> {
         let cfg = Config::load(&config_path)?;
-        Ok(Self { config_path, token, api: cfg.directory.api_url.clone(), pending: Mutex::new(HashMap::new()) })
+        Ok(Self { config_path, state_dir: cfg.state_dir.clone(), token, api: cfg.directory.api_url.clone(), pending: Mutex::new(HashMap::new()) })
     }
 
     fn config(&self) -> Result<Config> {
@@ -60,7 +61,7 @@ impl UiState {
     }
 }
 
-/// A random token for one `toto ui` session.
+/// A random token (tests); the daemon and `toto ui` share the one in the state directory.
 pub fn new_token() -> String {
     hex::encode(crate::manifest::generate_key().to_bytes())
 }
@@ -319,6 +320,60 @@ pub struct PolicyView {
     pub project_shares: std::collections::BTreeMap<String, u32>,
 }
 
+async fn pause(State(s): State<Arc<UiState>>) -> ApiResult<crate::daemon::Status> {
+    crate::control::pause(&s.state_dir)?;
+    Ok(Json(status_now(&s)))
+}
+
+async fn resume(State(s): State<Arc<UiState>>) -> ApiResult<crate::daemon::Status> {
+    crate::control::resume(&s.state_dir)?;
+    Ok(Json(status_now(&s)))
+}
+
+/// The daemon's status file, with the pause marker applied: the file lags the marker by a few
+/// seconds, and the page should not.
+fn status_now(s: &UiState) -> crate::daemon::Status {
+    let mut st = crate::daemon::Status::read(&s.state_dir).unwrap_or_default();
+    let paused = crate::control::is_paused(&s.state_dir);
+    if paused && !st.user_paused {
+        st.user_paused = true;
+        st.pause_reason = Some("paused by you".into());
+        if st.state != "stopped" {
+            st.state = "paused".into();
+        }
+    } else if !paused && st.user_paused {
+        st.user_paused = false;
+        st.pause_reason = None;
+        st.state = "idle".into();
+    }
+    st
+}
+
+#[derive(Deserialize)]
+struct EventsQuery {
+    token: Option<String>,
+}
+
+/// Server-sent events: the status whenever it changes (and once on connect). `EventSource`
+/// cannot set headers, so this endpoint alone takes the token as a query parameter.
+async fn events(State(s): State<Arc<UiState>>, axum::extract::Query(q): axum::extract::Query<EventsQuery>) -> Response {
+    if !q.token.as_deref().is_some_and(|t| constant_eq(t, &s.token)) {
+        return ApiError(StatusCode::UNAUTHORIZED, "missing or wrong session token".into()).into_response();
+    }
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    let stream = futures_util::stream::unfold((s, String::new()), |(s, last)| async move {
+        loop {
+            let now = serde_json::to_string(&status_now(&s)).unwrap_or_default();
+            if now != last {
+                let ev = Ok::<Event, std::convert::Infallible>(Event::default().event("status").data(now.clone()));
+                return Some((ev, (s, now)));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+}
+
 async fn get_policy(State(s): State<Arc<UiState>>) -> ApiResult<PolicyView> {
     let p = s.config()?.policy;
     Ok(Json(PolicyView { daily_token_cap: p.daily_token_cap, reserve_pct: p.reserve_pct, quiet_hours: p.quiet_hours, project_shares: p.project_shares }))
@@ -394,21 +449,42 @@ pub fn router(state: Arc<UiState>) -> Router {
         .route("/projects/{id}/remove", post(remove))
         .route("/pending/{id}/approve", post(approve))
         .route("/policy", get(get_policy).put(put_policy))
+        .route("/pause", post(pause))
+        .route("/resume", post(resume))
         .layer(axum::middleware::from_fn_with_state(state.clone(), require_token))
-        .with_state(state);
-    Router::new().nest("/api", api).fallback(get(asset))
+        .with_state(state.clone());
+    let stream = Router::new().route("/api/events", get(events)).with_state(state);
+    Router::new().nest("/api", api).merge(stream).fallback(get(asset))
 }
 
-/// Serves the page on `addr` (loopback) until the process ends; prints the URL with the token.
-pub async fn serve(config_path: PathBuf, addr: &str) -> Result<()> {
-    let token = new_token();
+/// Binds `addr` (loopback only) with the shared token from the state directory. Returns the
+/// listener, the state and the URL to open.
+pub async fn bind(config_path: PathBuf, state_dir: &std::path::Path, addr: &str) -> Result<(tokio::net::TcpListener, Arc<UiState>, String)> {
+    let token = crate::control::load_or_create_token(state_dir)?;
     let state = Arc::new(UiState::new(config_path, token.clone())?);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| Error::Sandbox(format!("cannot listen on {addr}: {e}")))?;
     let local = listener.local_addr()?;
     if !local.ip().is_loopback() {
-        return Err(Error::Policy(format!("`toto ui` serves loopback only, not {local}")));
+        return Err(Error::Policy(format!("the local page serves loopback only, not {local}")));
     }
-    println!("toto ui: http://{local}/?token={token}\n(the page keeps the token for this session; close it with Ctrl-C)");
-    axum::serve(listener, router(state)).await?;
-    Ok(())
+    Ok((listener, state, format!("http://{local}/?token={token}")))
+}
+
+/// `toto ui`: serves the page on `addr` until the process ends. When the daemon already serves
+/// it there, prints that URL instead and returns.
+pub async fn serve(config_path: PathBuf, addr: &str) -> Result<()> {
+    let cfg = Config::load(&config_path)?;
+    match bind(config_path, &cfg.state_dir, addr).await {
+        Ok((listener, state, url)) => {
+            println!("toto ui: {url}\n(close it with Ctrl-C)");
+            axum::serve(listener, router(state)).await?;
+            Ok(())
+        }
+        Err(e) if e.to_string().contains("in use") => {
+            let token = crate::control::load_or_create_token(&cfg.state_dir)?;
+            println!("already served (by the daemon): http://{addr}/?token={token}");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }

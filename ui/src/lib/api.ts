@@ -47,8 +47,17 @@ export type Status = {
 	last_error: string | null;
 	paused_until: string | null;
 	pause_reason: string | null;
+	user_paused: boolean;
 	updated: string;
 };
+
+/// Live status over server-sent events; returns a stop function. Falls back to nothing: the
+/// caller keeps a slow poll for the rest of the overview.
+export function watchStatus(onStatus: (s: Status) => void): () => void {
+	const es = new EventSource(`/api/events?token=${encodeURIComponent(token())}`);
+	es.addEventListener('status', (e) => onStatus(JSON.parse((e as MessageEvent).data)));
+	return () => es.close();
+}
 
 export type AuditEntry = {
 	ts: string;

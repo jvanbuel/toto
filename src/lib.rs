@@ -8,6 +8,7 @@ pub mod agent;
 pub mod archive;
 pub mod audit;
 pub mod config;
+pub mod control;
 pub mod daemon;
 pub mod doctor;
 pub mod devcontainer;

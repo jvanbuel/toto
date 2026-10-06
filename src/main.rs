@@ -81,6 +81,16 @@ enum Cmd {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Stop taking new tasks until `resume`; a running task finishes first.
+    Pause {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Take tasks again after `pause`.
+    Resume {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Show daemon status from the state directory.
     Status {
         #[arg(long)]
@@ -325,8 +335,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("wrote {}\nrunner id: {id}\nNext: `toto login`, `toto projects add owner/name`, `toto doctor`.", path.display());
         }
         Cmd::Run { config, once: false } => {
+            let path = config_path(config);
+            let cfg = toto::config::Config::load(&path)?;
+            toto::daemon::run(cfg, Some(path), shutdown_signal()).await?;
+        }
+        Cmd::Pause { config } => {
             let cfg = toto::config::Config::load(&config_path(config))?;
-            toto::daemon::run(cfg, shutdown_signal()).await?;
+            toto::control::pause(&cfg.state_dir)?;
+            println!("paused: no new task is taken until `toto resume`; a running task finishes first");
+        }
+        Cmd::Resume { config } => {
+            let cfg = toto::config::Config::load(&config_path(config))?;
+            toto::control::resume(&cfg.state_dir)?;
+            println!("resumed");
         }
         Cmd::Run { config, once: true } => {
             let cfg = toto::config::Config::load(&config_path(config))?;

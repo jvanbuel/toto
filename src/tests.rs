@@ -318,6 +318,36 @@ mod daemon {
         assert!(crate::service::install(std::path::Path::new("/tmp"), std::path::Path::new("x"), std::path::Path::new("rel")).is_err());
     }
 
+    /// The contributor's pause: the daemon takes nothing while the marker exists, says so in its
+    /// status, and picks the queue up within seconds of `resume`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_daemon_honours_a_pause_and_resumes() {
+        let f = fixture("daemon-pause");
+        let cfg = config(&f.dir, &f.key_a, SandboxConfig::Dir);
+        let q = DirQueue::new(&cfg.queue_dir).unwrap();
+        q.post(&task("p1", "a", 1000, &f.key_a).sign(&f.key_a).unwrap()).unwrap();
+        crate::control::pause(&cfg.state_dir).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let state = cfg.state_dir.clone();
+        let handle = tokio::spawn(crate::daemon::run(cfg, None, async { let _ = rx.await; }));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(q.results().unwrap().is_empty(), "nothing taken while paused");
+        let st = crate::daemon::Status::read(&state).unwrap();
+        assert!(st.user_paused && st.state == "paused" && st.pause_reason.as_deref() == Some("paused by you"), "{st:?}");
+        crate::control::resume(&state).unwrap();
+        for _ in 0..100 {
+            if q.results().unwrap().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(q.results().unwrap().len(), 1, "resumed within seconds");
+        tx.send(()).unwrap();
+        handle.await.unwrap().unwrap();
+        let st = crate::daemon::Status::read(&state).unwrap();
+        assert!(!st.user_paused && st.state == "stopped");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn daemon_processes_queue_and_stops_cleanly() {
         let f = fixture("daemon");
@@ -334,7 +364,7 @@ mod daemon {
         q.post(&bad).unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let state = cfg.state_dir.clone();
-        let handle = tokio::spawn(crate::daemon::run(cfg, async { let _ = rx.await; }));
+        let handle = tokio::spawn(crate::daemon::run(cfg, None, async { let _ = rx.await; }));
         for _ in 0..600 {
             if q.results().unwrap().len() == 1 {
                 break;
@@ -2524,6 +2554,39 @@ mod github_queue {
         assert_eq!(call("POST", &format!("/api/pending/{pending}/approve"), t.clone(), None).await.0, 200);
         assert!(Config::load(&path).unwrap().environments["acme"].agent.skills.is_empty(), "the new version has no skill");
 
+        // Pause and resume: the marker, and the status the page shows at once.
+        let (st, paused) = call("POST", "/api/pause", t.clone(), None).await;
+        assert_eq!((st, paused["user_paused"].as_bool(), paused["state"].as_str()), (200, Some(true), Some("paused")), "{paused}");
+        assert!(crate::control::is_paused(&Config::load(&path).unwrap().state_dir));
+        let (_, resumed) = call("POST", "/api/resume", t.clone(), None).await;
+        assert_eq!(resumed["user_paused"].as_bool(), Some(false));
+
+        // The event stream: refused without the token; with it, the first event is the status.
+        assert_eq!(call("GET", "/api/events", None, None).await.0, 401);
+        let (sbase, stoken) = (base.clone(), token.clone());
+        let first = tokio::task::spawn_blocking(move || {
+            use std::io::{BufRead, Read, Write};
+            let addr = sbase.trim_start_matches("http://").to_string();
+            let mut c = std::net::TcpStream::connect(&addr).unwrap();
+            c.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            write!(c, "GET /api/events?token={stoken} HTTP/1.1\r\nhost: x\r\naccept: text/event-stream\r\n\r\n").unwrap();
+            let mut r = std::io::BufReader::new(c.try_clone().unwrap());
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            assert!(line.contains("200"), "{line}");
+            let mut out = String::new();
+            let mut buf = [0u8; 1024];
+            while !out.contains("\n\n") {
+                let n = r.read(&mut buf).unwrap_or(0);
+                if n == 0 { break; }
+                out.push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+            out
+        })
+        .await
+        .unwrap();
+        assert!(first.contains("event: status") && first.contains("\"user_paused\":false"), "{first}");
+
         // Remove.
         assert_eq!(call("POST", "/api/projects/acme/remove", t.clone(), None).await.0, 200);
         assert!(Config::load(&path).unwrap().projects.is_empty());
@@ -2959,6 +3022,28 @@ mod quota_runner {
         *signal.lock().unwrap() = None;
         assert_eq!(r.tick(Local::now()).unwrap(), Tick::Submitted("q2".into()));
         assert_eq!(*runs.lock().unwrap(), 3);
+    }
+}
+
+mod control {
+    use crate::control::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn the_token_is_created_once_private_and_reused() {
+        let f = super::fixture("control");
+        let a = load_or_create_token(&f.dir).unwrap();
+        assert_eq!(a.len(), 64);
+        assert_eq!(std::fs::metadata(token_path(&f.dir)).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(load_or_create_token(&f.dir).unwrap(), a, "the daemon and `toto ui` share it");
+        std::fs::write(token_path(&f.dir), "short").unwrap();
+        assert_ne!(load_or_create_token(&f.dir).unwrap(), "short", "a damaged file is replaced");
+        assert!(!is_paused(&f.dir));
+        pause(&f.dir).unwrap();
+        assert!(is_paused(&f.dir));
+        resume(&f.dir).unwrap();
+        resume(&f.dir).unwrap();
+        assert!(!is_paused(&f.dir));
     }
 }
 

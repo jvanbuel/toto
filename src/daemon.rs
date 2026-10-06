@@ -29,6 +29,9 @@ pub struct Status {
     pub paused_until: Option<String>,
     #[serde(default)]
     pub pause_reason: Option<String>,
+    /// The contributor paused the runner (`toto pause`, or the page); `state` is `paused`.
+    #[serde(default)]
+    pub user_paused: bool,
     pub updated: String,
 }
 
@@ -52,12 +55,48 @@ impl Status {
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
-/// Runs until `shutdown` resolves. Fails fast if the configured sandbox does not work.
-pub async fn run(cfg: Config, shutdown: impl Future<Output = ()>) -> Result<()> {
+/// Runs until `shutdown` resolves. Fails fast if the configured sandbox does not work. With
+/// `config_path` and `ui_addr` set, also serves the local page and API from this process.
+pub async fn run(cfg: Config, config_path: Option<std::path::PathBuf>, shutdown: impl Future<Output = ()>) -> Result<()> {
     let runner = cfg.build()?;
     runner.sandbox.probe()?;
     runner.harness.probe()?;
-    run_runner(runner, cfg, shutdown).await
+    let ui = match (&cfg.ui_addr, config_path) {
+        (Some(addr), Some(path)) => match crate::ui::bind(path, &cfg.state_dir, addr).await {
+            Ok((listener, state, url)) => {
+                println!("local page: {url}");
+                Some(tokio::spawn(async move {
+                    let _ = axum::serve(listener, crate::ui::router(state)).await;
+                }))
+            }
+            Err(e) => {
+                eprintln!("the local page is not served: {e}");
+                None
+            }
+        },
+        _ => None,
+    };
+    let out = run_runner(runner, cfg, shutdown).await;
+    if let Some(ui) = ui {
+        ui.abort();
+    }
+    out
+}
+
+/// Sleeps `wait`, waking early when the contributor's pause marker appears or disappears.
+async fn wait_or_control(state_dir: &Path, wait: Duration) {
+    let was = crate::control::is_paused(state_dir);
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        tokio::time::sleep(left.min(Duration::from_secs(2))).await;
+        if crate::control::is_paused(state_dir) != was {
+            return;
+        }
+    }
 }
 
 async fn run_runner(runner: DaemonRunner, cfg: Config, shutdown: impl Future<Output = ()>) -> Result<()> {
@@ -69,6 +108,18 @@ async fn run_runner(runner: DaemonRunner, cfg: Config, shutdown: impl Future<Out
     status.write(&cfg.state_dir, "idle", None);
 
     'main: loop {
+        // The contributor's pause comes before anything else: no task is taken while it holds.
+        if crate::control::is_paused(&cfg.state_dir) {
+            status.user_paused = true;
+            status.pause_reason = Some("paused by you".into());
+            status.paused_until = None;
+            status.write(&cfg.state_dir, "paused", None);
+            tokio::select! {
+                _ = wait_or_control(&cfg.state_dir, Duration::from_secs(3600)) => continue 'main,
+                _ = &mut shutdown => break 'main,
+            }
+        }
+        status.user_paused = false;
         let r = runner.clone();
         let mut tick = tokio::task::spawn_blocking(move || r.lock().unwrap().tick(Local::now()));
         status.write(&cfg.state_dir, "polling", None);
@@ -124,7 +175,7 @@ async fn run_runner(runner: DaemonRunner, cfg: Config, shutdown: impl Future<Out
             }
         };
         tokio::select! {
-            _ = tokio::time::sleep(wait) => {}
+            _ = wait_or_control(&cfg.state_dir, wait) => {}
             _ = &mut shutdown => break 'main,
         }
     }

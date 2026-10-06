@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { Badge, Card, CardSection } from '#lib/components/ui/index.js';
-	import { fmt, get, type Overview } from '#lib/api.js';
+	import { Badge, Button, Card, CardSection } from '#lib/components/ui/index.js';
+	import { fmt, get, post, watchStatus, type Overview, type Status } from '#lib/api.js';
 
 	let data = $state<Overview | null>(null);
 	let error = $state('');
@@ -16,9 +16,29 @@
 	}
 	onMount(() => {
 		refresh();
-		const t = setInterval(refresh, 5000);
-		return () => clearInterval(t);
+		const t = setInterval(refresh, 15000);
+		const stop = watchStatus((s) => {
+			if (data) data.status = s;
+		});
+		return () => {
+			clearInterval(t);
+			stop();
+		};
 	});
+
+	let toggling = $state(false);
+	async function toggle() {
+		if (!data) return;
+		toggling = true;
+		try {
+			const s = await post<Status>(data.status?.user_paused ? '/resume' : '/pause');
+			data.status = s;
+		} catch (e) {
+			error = (e as Error).message;
+		} finally {
+			toggling = false;
+		}
+	}
 
 	const runnerState = $derived(data?.status?.state ?? 'not running');
 	const pct = $derived(
@@ -41,6 +61,16 @@
 				{#if data.status?.task}
 					<p class="mt-1 text-sm text-muted-foreground">last task {data.status.task}</p>
 				{/if}
+				<div class="mt-3">
+					<Button
+						size="sm"
+						variant={data.status?.user_paused ? 'default' : 'outline'}
+						onclick={toggle}
+						disabled={toggling}
+					>
+						{data.status?.user_paused ? 'Resume' : 'Pause'}
+					</Button>
+				</div>
 				{#if data.status}
 					<p class="mt-1 text-xs text-muted-foreground">
 						{data.status.submitted} submitted, {data.status.dropped} dropped, updated {when(
@@ -78,7 +108,16 @@
 		</Card>
 	</div>
 
-	{#if data.status?.state === 'paused'}
+	{#if data.status?.user_paused}
+		<Card class="mt-4">
+			<CardSection>
+				<p class="font-medium">Paused by you</p>
+				<p class="text-sm text-muted-foreground">
+					No new task is taken until you resume; a task that was running finishes first.
+				</p>
+			</CardSection>
+		</Card>
+	{:else if data.status?.state === 'paused'}
 		<Card class="mt-4">
 			<CardSection>
 				<p class="font-medium">Paused: {data.status.pause_reason}</p>

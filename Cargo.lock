@@ -1125,6 +1125,7 @@ dependencies = [
  "chrono",
  "clap",
  "ed25519-dalek",
+ "futures-util",
  "hex",
  "rand",
  "rpassword",
