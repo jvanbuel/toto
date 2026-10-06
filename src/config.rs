@@ -3,12 +3,13 @@
 use crate::audit::AuditLog;
 use crate::harness::{EchoHarness, Harness};
 use crate::manifest::{generate_key, TrustedProjects};
-use crate::claude_cli::ClaudeCliHarness;
-use crate::omnigent::OmnigentHarness;
+use crate::omnigent::{ApprovedAgent, OmnigentHarness};
 use crate::policy::Policy;
-use crate::queue::{DirQueue, QueueClient};
+use crate::projects::Approval;
+use crate::proxy::Provider;
+use crate::queue::{DirQueue, MultiQueue, QueueClient};
 use crate::runner::{Reviewer, Runner};
-use crate::sandbox::{BwrapSandbox, DirSandbox, DockerSandbox, Sandbox};
+use crate::sandbox::{DirSandbox, DockerSandbox, Environment, Sandbox};
 use crate::{Error, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -19,28 +20,25 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum SandboxConfig {
-    /// A plain directory. **No isolation**; development only.
+    /// A plain directory. **No isolation**; development and tests only.
     Dir,
-    /// Docker or Podman; set `runtime` to `runsc` for gVisor.
+    /// Docker or Podman; set `runtime` to `runsc` for gVisor. Tasks run in each project's approved image.
     Docker {
         #[serde(default = "docker_bin")]
         bin: String,
-        image: String,
         #[serde(default)]
         runtime: Option<String>,
-        /// Path to the static `toto-mcp-exec` binary, mounted read-only into the container.
+        /// Path to the static `toto-relay` binary, mounted read-only into the container.
         #[serde(default)]
-        bridge: Option<PathBuf>,
-        /// Use toto's seccomp profile that allows a nested bubblewrap, so tools like Omnigent can
-        /// run their own sandbox inside the container (see `profiles/README.md`). Opt-in.
+        relay: Option<PathBuf>,
+        /// Use toto's seccomp profile that allows a nested bubblewrap, so Omnigent can run its own
+        /// sandbox inside the container (see `profiles/README.md`). Opt-in.
         #[serde(default)]
         nested_userns: bool,
-        /// Fenced docker network for tasks with egress rules (`toto net-setup`).
+        /// Fenced docker network for agents that need one (`toto net-setup`).
         #[serde(default)]
         network: Option<String>,
     },
-    /// bubblewrap (Linux), no daemon or image.
-    Bwrap,
 }
 
 fn docker_bin() -> String {
@@ -50,48 +48,11 @@ fn docker_bin() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum HarnessConfig {
-    /// Placeholder until the Omnigent harness lands.
+    /// Echoes the prompt; development and tests only.
     Echo { tokens_per_run: u64 },
-    /// The official `claude` CLI with the contributor's subscription token (ADR 11). Needs a
-    /// container sandbox with the exec bridge.
-    Claude {
-        #[serde(default = "claude_bin")]
-        bin: String,
-        /// Token from `claude setup-token`, stored by `toto login` (default: <state_dir>/claude.token).
-        #[serde(default)]
-        token_file: Option<PathBuf>,
-        #[serde(default)]
-        model: Option<String>,
-        /// `host` (default): agent on the host, tools in the container over MCP (ADR 10, 11).
-        /// `container`: agent inside the container behind the credential proxy (ADR 12).
-        #[serde(default)]
-        placement: PlacementConfig,
-        /// API origin the proxy forwards to (container placement).
-        #[serde(default = "default_upstream")]
-        upstream: String,
-        /// Agent binary mounted into the container; default: the `claude` found on PATH.
-        #[serde(default)]
-        agent_binary: Option<PathBuf>,
-        /// Companion files mounted next to the agent executable (container placement).
-        #[serde(default)]
-        agent_extra_files: Vec<PathBuf>,
-        /// Use an API key (from this file) instead of the subscription token (container placement).
-        #[serde(default)]
-        api_key_file: Option<PathBuf>,
-    },
-    /// Omnigent in no-network mode (see `omnigent.rs`); needs sandbox `dir` or `bwrap`.
+    /// Omnigent inside the project's image, behind the credential proxy.
     Omnigent {
-        #[serde(default = "omnigent_bin")]
-        bin: String,
-        #[serde(default = "omnigent_url")]
-        server_url: String,
-        #[serde(default = "omnigent_harness")]
-        harness: String,
-        /// `host` (default) or `container`: Omnigent and the agent inside the sandbox image,
-        /// behind the credential proxy (ADR 12). The image must contain `omnigent`.
-        #[serde(default)]
-        placement: PlacementConfig,
-        /// Which API the proxy fronts (container placement).
+        /// Which API the proxy fronts. Projects whose agent uses the other one are refused.
         #[serde(default)]
         provider: ProviderConfig,
         /// API origin the proxy forwards to; default per provider.
@@ -103,13 +64,6 @@ pub enum HarnessConfig {
         /// API key file; required for the `openai` provider.
         #[serde(default)]
         api_key_file: Option<PathBuf>,
-        /// Agent CLI files mounted under /toto/agent and put on PATH (e.g. codex and its companion
-        /// `codex-code-mode-host`), for harnesses whose CLI is not in the image.
-        #[serde(default)]
-        agent_files: Vec<PathBuf>,
-        /// Model for the agent (`executor.model`); needed in container placement.
-        #[serde(default)]
-        model: Option<String>,
     },
 }
 
@@ -123,10 +77,10 @@ pub enum ProviderConfig {
 }
 
 impl ProviderConfig {
-    fn provider(self) -> crate::proxy::Provider {
+    pub fn provider(self) -> Provider {
         match self {
-            ProviderConfig::Anthropic => crate::proxy::Provider::Anthropic,
-            ProviderConfig::Openai => crate::proxy::Provider::OpenAi,
+            ProviderConfig::Anthropic => Provider::Anthropic,
+            ProviderConfig::Openai => Provider::OpenAi,
         }
     }
 
@@ -138,47 +92,17 @@ impl ProviderConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PlacementConfig {
-    #[default]
-    Host,
-    Container,
-}
-
-fn default_upstream() -> String {
-    "https://api.anthropic.com".into()
-}
-
-fn which_claude() -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join("claude")).find(|c| c.is_file())).and_then(|c| std::fs::canonicalize(c).ok())
-}
-
 /// Docker's default seccomp profile plus what a nested bubblewrap needs (generated; see profiles/).
 const NESTED_USERNS_PROFILE: &str = include_str!("../profiles/seccomp-nested-userns.json");
-
-fn claude_bin() -> String {
-    "claude".into()
-}
-fn omnigent_bin() -> String {
-    "omnigent".into()
-}
-fn omnigent_url() -> String {
-    "http://127.0.0.1:6767".into()
-}
-fn omnigent_harness() -> String {
-    "claude-sdk".into()
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub key_file: PathBuf,
     pub state_dir: PathBuf,
-    /// Spool directory acting as the queue (see `DirQueue`).
+    /// Spool directory used as the queue when `queues` is empty (development and `post-task`).
     pub queue_dir: PathBuf,
-    /// Coordinators speaking the queue protocol (`docs/queue-protocol.md`). Empty: the spool
-    /// directory above is the queue. With several, tasks from all are considered and each claim
-    /// goes back to the coordinator the task came from.
+    /// Where tasks come from. With several, tasks from all are considered and each claim goes
+    /// back to the queue the task came from.
     #[serde(default)]
     pub queues: Vec<QueueEndpoint>,
     #[serde(default = "default_poll")]
@@ -189,11 +113,9 @@ pub struct Config {
     /// Trusted project public keys (hex ed25519), by project id.
     #[serde(default)]
     pub projects: BTreeMap<String, String>,
-    /// The environment each project named and the contributor approved (`toto projects add`), pinned
-    /// by digest with a snapshot of what was reviewed. Its tasks run in that exact image instead of
-    /// the sandbox's default.
+    /// Each project's approved environment and agent (`toto projects add`), by project id.
     #[serde(default)]
-    pub environments: BTreeMap<String, crate::image::EnvApproval>,
+    pub environments: BTreeMap<String, Approval>,
     /// Where each project was added from (`owner/name` on GitHub), set by `toto projects add`.
     #[serde(default)]
     pub sources: BTreeMap<String, String>,
@@ -203,13 +125,6 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum QueueEndpoint {
-    /// A coordinator speaking the HTTP queue protocol (`docs/queue-protocol.md`).
-    Http {
-        url: String,
-        /// File holding the bearer token for this coordinator, if it needs one.
-        #[serde(default)]
-        token_file: Option<PathBuf>,
-    },
     /// GitHub issues in `repo` (`owner/name`) labelled `label` (`docs/github-queue.md`). The token
     /// needs only to comment on issues; without one the queue is read-only.
     Github {
@@ -234,15 +149,13 @@ fn default_api() -> String {
 impl QueueEndpoint {
     pub fn describe(&self) -> String {
         match self {
-            Self::Http { url, .. } => url.clone(),
             Self::Github { repo, .. } => format!("github:{repo}"),
         }
     }
 
     pub fn build(&self) -> Result<Arc<dyn QueueClient>> {
-        let token = |f: &Option<PathBuf>| f.as_deref().map(crate::claude_cli::read_secret).transpose();
+        let token = |f: &Option<PathBuf>| f.as_deref().map(crate::secrets::read_secret).transpose();
         Ok(match self {
-            Self::Http { url, token_file } => Arc::new(crate::http_queue::HttpQueue::new(url, token(token_file)?)),
             Self::Github { repo, token_file, label, api_url } => Arc::new(crate::github_queue::GitHubQueue::new(api_url, repo, label, token(token_file)?)),
         })
     }
@@ -273,8 +186,8 @@ impl Config {
         Ok(serde_json::from_slice(&std::fs::read(path)?)?)
     }
 
-    /// A safe starter config: strict policy and no trusted projects, so nothing runs until the
-    /// contributor adds one.
+    /// A safe starter config: strict policy and no projects, so nothing runs until the contributor
+    /// adds one.
     pub fn starter(dir: &Path) -> Self {
         Config {
             key_file: dir.join("runner.key"),
@@ -282,8 +195,8 @@ impl Config {
             queue_dir: dir.join("queue"),
             queues: vec![],
             poll_secs: default_poll(),
-            sandbox: SandboxConfig::Docker { bin: docker_bin(), image: "alpine".into(), runtime: None, bridge: None, nested_userns: false, network: None },
-            harness: HarnessConfig::Echo { tokens_per_run: 100 },
+            sandbox: SandboxConfig::Docker { bin: docker_bin(), runtime: None, relay: None, nested_userns: false, network: None },
+            harness: HarnessConfig::Omnigent { provider: ProviderConfig::Anthropic, upstream: None, token_file: None, api_key_file: None },
             policy: Policy {
                 daily_token_cap: 100_000,
                 project_shares: BTreeMap::new(),
@@ -292,16 +205,12 @@ impl Config {
                 review_before_submit: false,
                 max_profile: Default::default(),
                 abort_margin_pct: 25,
-                available_tools: vec!["echo".into()],
-                allow_context: false,
-                allow_stdio_mcp: false,
-                allowed_mcp_hosts: vec![],
-                max_context_bytes: 64 * 1024,
+                available_tools: vec!["claude".into(), "omnigent".into()],
                 max_input_bytes: 64 * 1024 * 1024,
             },
             projects: BTreeMap::new(),
-            sources: BTreeMap::new(),
             environments: BTreeMap::new(),
+            sources: BTreeMap::new(),
         }
     }
 
@@ -325,22 +234,45 @@ impl Config {
         self.state_dir.join("claude.token")
     }
 
-    pub fn build_sandbox(&self) -> Box<dyn Sandbox> {
-        self.build_sandbox_with(None, None)
+    pub fn docker_bin(&self) -> Option<&str> {
+        match &self.sandbox {
+            SandboxConfig::Docker { bin, .. } => Some(bin),
+            SandboxConfig::Dir => None,
+        }
     }
 
-    fn build_sandbox_with(&self, proxy_socket: Option<PathBuf>, agent: Option<Vec<PathBuf>>) -> Box<dyn Sandbox> {
-        let work = self.state_dir.join("work");
+    pub fn sandbox_network(&self) -> Option<&str> {
         match &self.sandbox {
-            SandboxConfig::Dir => Box::new(DirSandbox { root: work }),
-            SandboxConfig::Bwrap => Box::new(BwrapSandbox::new(work)),
-            SandboxConfig::Docker { bin, image, runtime, bridge, nested_userns, network } => {
-                let mut s = DockerSandbox::new(image);
+            SandboxConfig::Docker { network, .. } => network.as_deref(),
+            SandboxConfig::Dir => None,
+        }
+    }
+
+    pub fn sandbox_nested_userns(&self) -> bool {
+        matches!(self.sandbox, SandboxConfig::Docker { nested_userns: true, .. })
+    }
+
+    pub fn harness_provider(&self) -> Option<Provider> {
+        match &self.harness {
+            HarnessConfig::Omnigent { provider, .. } => Some(provider.provider()),
+            HarnessConfig::Echo { .. } => None,
+        }
+    }
+
+    pub fn build_sandbox(&self) -> Box<dyn Sandbox> {
+        self.build_sandbox_with(None)
+    }
+
+    fn build_sandbox_with(&self, proxy_socket: Option<PathBuf>) -> Box<dyn Sandbox> {
+        match &self.sandbox {
+            SandboxConfig::Dir => Box::new(DirSandbox { root: self.state_dir.join("work") }),
+            SandboxConfig::Docker { bin, runtime, relay, nested_userns, network } => {
+                let mut s = DockerSandbox::new();
                 s.bin = bin.clone();
                 s.runtime = runtime.clone();
-                s.bridge = bridge.clone();
+                s.relay = relay.clone();
                 s.network = network.clone();
-                s.images = self.environments.iter().map(|(k, v)| (k.clone(), v.pinned())).collect();
+                s.environments = self.environments.iter().map(|(k, a)| (k.clone(), Environment { image: a.pinned(), network: a.agent.needs_network })).collect();
                 if *nested_userns {
                     let path = self.state_dir.join("seccomp-nested-userns.json");
                     let _ = std::fs::create_dir_all(&self.state_dir);
@@ -348,25 +280,25 @@ impl Config {
                     s.seccomp_profile = Some(path);
                 }
                 s.proxy_socket = proxy_socket;
-                s.agent_files = agent.unwrap_or_default();
                 Box::new(s)
             }
         }
     }
 
-    /// Starts the credential proxy for container placements. The secret stays in this process.
-    fn start_proxy(&self, provider: ProviderConfig, upstream: &str, token_file: &Path, api_key_file: Option<&Path>) -> Result<std::sync::Arc<crate::proxy::AuthProxy>> {
+    /// Starts the credential proxy. The secret stays in this process.
+    fn start_proxy(&self, provider: ProviderConfig, upstream: &str, token_file: &Path, api_key_file: Option<&Path>) -> Result<Arc<crate::proxy::AuthProxy>> {
         use crate::proxy::Auth;
+        use crate::secrets::read_secret;
         let auth = match (provider, api_key_file) {
-            (ProviderConfig::Anthropic, Some(f)) => Auth::ApiKey(crate::claude_cli::read_secret(f)?),
-            (ProviderConfig::Anthropic, None) => Auth::Bearer { token: crate::claude_cli::read_secret(token_file)?, oauth: true },
-            (ProviderConfig::Openai, Some(f)) => Auth::Bearer { token: crate::claude_cli::read_secret(f)?, oauth: false },
+            (ProviderConfig::Anthropic, Some(f)) => Auth::ApiKey(read_secret(f)?),
+            (ProviderConfig::Anthropic, None) => Auth::Bearer { token: read_secret(token_file)?, oauth: true },
+            (ProviderConfig::Openai, Some(f)) => Auth::Bearer { token: read_secret(f)?, oauth: false },
             (ProviderConfig::Openai, None) => return Err(Error::Policy("the openai provider needs `api_key_file` (ChatGPT sign-in is not supported by the proxy yet)".into())),
         };
         let dir = self.state_dir.join("proxy");
         std::fs::create_dir_all(&dir)?;
         std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
-        Ok(std::sync::Arc::new(crate::proxy::AuthProxy::start(&dir.join("p.sock"), upstream, provider.provider(), auth)?))
+        Ok(Arc::new(crate::proxy::AuthProxy::start(&dir.join("p.sock"), upstream, provider.provider(), auth)?))
     }
 
     pub fn build_queue(&self) -> Result<Arc<dyn QueueClient>> {
@@ -374,12 +306,12 @@ impl Config {
             return Ok(Arc::new(DirQueue::new(&self.queue_dir)?));
         }
         let endpoints = self.queues.iter().map(QueueEndpoint::build).collect::<Result<Vec<_>>>()?;
-        Ok(Arc::new(crate::http_queue::MultiQueue::new(endpoints)))
+        Ok(Arc::new(MultiQueue::new(endpoints)))
     }
 
     pub fn build(&self) -> Result<DaemonRunner> {
         if self.policy.review_before_submit {
-            return Err(Error::Policy("review_before_submit needs the TUI; the daemon cannot ask a human".into()));
+            return Err(Error::Policy("review_before_submit is not supported by the daemon (results are reviewed in the project's pull requests)".into()));
         }
         std::fs::create_dir_all(&self.state_dir)?;
         let mut trusted = TrustedProjects::default();
@@ -387,46 +319,19 @@ impl Config {
             let bytes: [u8; 32] = hex::decode(k).ok().and_then(|b| b.try_into().ok()).ok_or_else(|| Error::Verify(format!("bad key for project `{id}`")))?;
             trusted.insert(id, VerifyingKey::from_bytes(&bytes).map_err(|_| Error::Verify(format!("bad key for project `{id}`")))?);
         }
-        let (mut proxy_socket, mut agent): (Option<PathBuf>, Option<Vec<PathBuf>>) = (None, None);
+        let mut proxy_socket = None;
         let harness: Box<dyn Harness> = match &self.harness {
             HarnessConfig::Echo { tokens_per_run } => Box::new(EchoHarness { tokens_per_run: *tokens_per_run }),
-            HarnessConfig::Claude { bin, token_file, model, placement, upstream, agent_binary, agent_extra_files, api_key_file } => {
-                if !matches!(self.sandbox, SandboxConfig::Docker { bridge: Some(_), .. }) {
-                    return Err(Error::Policy("the claude harness needs a Docker/Podman sandbox with `bridge` set to the static toto-mcp-exec binary".into()));
+            HarnessConfig::Omnigent { provider, upstream, token_file, api_key_file } => {
+                if !matches!(self.sandbox, SandboxConfig::Docker { relay: Some(_), .. }) {
+                    return Err(Error::Policy("the omnigent harness needs a Docker/Podman sandbox with `relay` set to the static toto-relay binary".into()));
                 }
                 let token_file = token_file.clone().unwrap_or_else(|| self.token_path());
-                let mut h = ClaudeCliHarness::new(&self.state_dir, token_file.clone())?;
-                h.bin = bin.clone();
-                h.model = model.clone();
-                if *placement == PlacementConfig::Container {
-                    // The credential stays with this process: the proxy adds it to model calls.
-                    let proxy = self.start_proxy(ProviderConfig::Anthropic, upstream, &token_file, api_key_file.as_deref())?;
-                    proxy_socket = Some(proxy.socket().to_path_buf());
-                    let exe = agent_binary.clone().or_else(which_claude).ok_or_else(|| Error::Policy("no `claude` binary found for the container; set `agent_binary`".into()))?;
-                    h.agent_name = exe.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                    agent = Some(std::iter::once(exe).chain(agent_extra_files.iter().cloned()).collect::<Vec<_>>());
-                    h = h.in_container(proxy);
-                }
-                Box::new(h)
-            }
-            HarnessConfig::Omnigent { bin, server_url, harness, placement, provider, upstream, token_file, api_key_file, agent_files, model } => {
-                if matches!(self.sandbox, SandboxConfig::Docker { bridge: None, .. }) {
-                    return Err(Error::Policy("the omnigent harness with a container sandbox needs the exec bridge: set `bridge` to the static toto-mcp-exec binary (or use sandbox `dir` or `bwrap`)".into()));
-                }
-                let mut h = OmnigentHarness::new(&self.state_dir)?;
-                h.bin = bin.clone();
-                h.server_url = server_url.clone();
-                h.harness = harness.clone();
-                h.model = model.clone();
-                if *placement == PlacementConfig::Container {
-                    if !matches!(self.sandbox, SandboxConfig::Docker { .. }) {
-                        return Err(Error::Policy("omnigent container placement needs a Docker/Podman sandbox whose image contains `omnigent`".into()));
-                    }
-                    let token_file = token_file.clone().unwrap_or_else(|| self.token_path());
-                    let proxy = self.start_proxy(*provider, upstream.as_deref().unwrap_or(provider.default_upstream()), &token_file, api_key_file.as_deref())?;
-                    proxy_socket = Some(proxy.socket().to_path_buf());
-                    agent = (!agent_files.is_empty()).then(|| agent_files.clone());
-                    h = h.in_container(proxy, provider.provider());
+                let proxy = self.start_proxy(*provider, upstream.as_deref().unwrap_or(provider.default_upstream()), &token_file, api_key_file.as_deref())?;
+                proxy_socket = Some(proxy.socket().to_path_buf());
+                let mut h = OmnigentHarness::new(proxy, provider.provider());
+                for (id, a) in &self.environments {
+                    h.agents.insert(id.clone(), ApprovedAgent { tar: a.agent_tar_bytes()?, harness: a.agent.harness.clone() });
                 }
                 Box::new(h)
             }
@@ -438,7 +343,7 @@ impl Config {
             self.load_or_create_key()?,
             queue,
             harness,
-            self.build_sandbox_with(proxy_socket, agent),
+            self.build_sandbox_with(proxy_socket),
             Box::new(NoReview),
             AuditLog::new(self.state_dir.join("audit.jsonl")),
         ))

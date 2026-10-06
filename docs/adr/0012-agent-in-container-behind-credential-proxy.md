@@ -1,6 +1,6 @@
 # 12. Agent inside the container, behind a credential proxy
 
-- Status: Proposed (prototyped and tested without a real credential; see "Not verified")
+- Status: Superseded by ADR 13 (the credential proxy is kept); was: Proposed (prototyped and tested without a real credential; see "Not verified")
 - Date: 2026-10-04
 - Relates to: ADR 5, 10, 11
 

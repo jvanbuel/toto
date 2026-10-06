@@ -4,13 +4,8 @@
   "kind": "docs-fix",
   "inputs": "0000000000000000000000000000000000000000000000000000000000000000",
   "prompt": "The code sample in docs/quickstart.md imports `acme.client` but the package is now `acme.sdk`. Fix every sample under docs/ and add a changelog entry.",
-  "tool_requirements": ["claude"],
-  "sandbox_profile": {
-    "network_allowlist": ["GET docs.acme.example/**"],
-    "cpu_millis": 1000,
-    "memory_mb": 1024,
-    "timeout_secs": 600
-  },
+  "tool_requirements": ["omnigent"],
+  "sandbox_profile": { "cpu_millis": 1000, "memory_mb": 1024, "timeout_secs": 600 },
   "cost_estimate": 40000,
   "output_schema": { "format": "text", "max_bytes": 4096, "max_artifact_bytes": 262144 },
   "redundancy": 1

@@ -1,10 +1,10 @@
 //! What a contributor can inspect and approve about a project's environment image.
 //!
-//! A tag can be moved after it was approved, so an approval is bound to the image's *digest*: the
-//! runner stores `repo@sha256:...` and always starts tasks from that. What the contributor sees comes
-//! from the image itself (its configuration and layer history, i.e. the commands that built it), not
-//! from labels or files the project asserts. `toto projects update` shows what changed before the
-//! contributor approves a new digest.
+//! A tag can be moved after it was approved, so an approval is bound to the image's content: the
+//! registry digest when it was pulled, or the image id when the contributor's machine built it. The
+//! runner starts exactly that. What the contributor sees comes from the image itself (its
+//! configuration and layer history, i.e. the commands that built it), not from labels or files the
+//! project asserts. `toto projects update` shows what changed before a new one is approved.
 
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -12,8 +12,11 @@ use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageInfo {
-    /// `sha256:<hex>` content digest.
-    pub digest: String,
+    /// Local image id (`sha256:<hex>`): the content, whatever name it carries.
+    pub id: String,
+    /// Registry digest, when the image was pulled.
+    #[serde(default)]
+    pub digest: Option<String>,
     pub user: String,
     pub env: Vec<String>,
     pub entrypoint: Vec<String>,
@@ -23,18 +26,18 @@ pub struct ImageInfo {
     pub history: Vec<String>,
 }
 
-/// What the contributor approved for one project.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EnvApproval {
-    /// The reference the project names (`ghcr.io/acme/env:1.0`).
-    pub image: String,
-    pub info: ImageInfo,
-}
+impl ImageInfo {
+    /// What the runner starts for a repository `repo`: `repo@digest` when pulled, else the id.
+    pub fn pinned(&self, repo: &str) -> String {
+        match &self.digest {
+            Some(d) => format!("{}@{d}", repo_of(repo)),
+            None => self.id.clone(),
+        }
+    }
 
-impl EnvApproval {
-    /// `repo@sha256:...`: what the runner starts.
-    pub fn pinned(&self) -> String {
-        format!("{}@{}", repo_of(&self.image), self.info.digest)
+    /// The short form shown in listings.
+    pub fn short(&self) -> String {
+        self.digest.as_deref().unwrap_or(&self.id).chars().take(19).collect()
     }
 }
 
@@ -58,33 +61,37 @@ fn run(bin: &str, args: &[&str]) -> Result<String> {
 
 /// Reads what an approval needs. With `refresh`, a tag is pulled again first, so the result is what
 /// the project publishes *now* and not a stale local copy of a tag that has since moved (a digest
-/// reference never moves, so it is only pulled if missing).
+/// or id reference never moves, so it is only pulled if missing).
 pub fn inspect(bin: &str, image: &str, refresh: bool) -> Result<ImageInfo> {
-    if (refresh && !image.contains('@')) || run(bin, &["image", "inspect", image]).is_err() {
+    let by_content = image.contains('@') || image.starts_with("sha256:");
+    if (refresh && !by_content) || run(bin, &["image", "inspect", image]).is_err() {
         run(bin, &["pull", "-q", image]).map_err(|e| Error::Sandbox(format!("could not pull `{image}`: {e}")))?;
     }
     let v: serde_json::Value = serde_json::from_str(&run(bin, &["image", "inspect", "--format", "{{json .}}", image])?)?;
     let repo = repo_of(image);
+    let id = v["Id"].as_str().unwrap_or("").to_string();
     let digest = match image.split_once('@') {
-        Some((_, d)) => d.to_string(),
+        Some((_, d)) => Some(d.to_string()),
         None => v["RepoDigests"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|d| d.as_str())
-            .find_map(|d| d.split_once('@').filter(|(r, _)| *r == repo || r.ends_with(&format!("/{repo}"))).map(|x| x.1.to_string()))
-            .ok_or_else(|| Error::Sandbox(format!("`{image}` has no registry digest (was it built locally and never pushed?)")))?,
+            .find_map(|d| d.split_once('@').filter(|(r, _)| *r == repo || r.ends_with(&format!("/{repo}"))).map(|x| x.1.to_string())),
     };
     let strings = |k: &str| -> Vec<String> { v["Config"][k].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect() };
     let history = run(bin, &["history", "--no-trunc", "--format", "{{.CreatedBy}}", image])?.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
-    Ok(ImageInfo { digest, user: v["Config"]["User"].as_str().unwrap_or("").into(), env: strings("Env"), entrypoint: strings("Entrypoint"), cmd: strings("Cmd"), size: v["Size"].as_u64().unwrap_or(0), history })
+    Ok(ImageInfo { id, digest, user: v["Config"]["User"].as_str().unwrap_or("").into(), env: strings("Env"), entrypoint: strings("Entrypoint"), cmd: strings("Cmd"), size: v["Size"].as_u64().unwrap_or(0), history })
 }
 
 /// Human-readable lines for the contributor.
 pub fn describe(image: &str, i: &ImageInfo) -> Vec<String> {
     let mut out = vec![
         format!("image       {image}"),
-        format!("digest      {} (tasks will run exactly this)", i.digest),
+        match &i.digest {
+            Some(d) => format!("digest      {d} (tasks will run exactly this)"),
+            None => format!("image id    {} (built here; tasks will run exactly this)", i.id),
+        },
         format!("size        {:.1} MB", i.size as f64 / 1e6),
         format!("user        {}", if i.user.is_empty() { "root in the image (tasks always run as an unprivileged user)" } else { &i.user }),
         format!("entrypoint  {}", if i.entrypoint.is_empty() { "-".into() } else { i.entrypoint.join(" ") }),
@@ -98,8 +105,8 @@ pub fn describe(image: &str, i: &ImageInfo) -> Vec<String> {
 /// What changed between two approvals, as lines (empty if nothing the contributor can see).
 pub fn diff(old: &ImageInfo, new: &ImageInfo) -> Vec<String> {
     let mut out = vec![];
-    if old.digest != new.digest {
-        out.push(format!("digest      {} -> {}", old.digest, new.digest));
+    if old.id != new.id || old.digest != new.digest {
+        out.push(format!("content     {} -> {}", old.short(), new.short()));
     }
     for (what, a, b) in [("user", old.user.clone(), new.user.clone()), ("entrypoint", old.entrypoint.join(" "), new.entrypoint.join(" "))] {
         if a != b {

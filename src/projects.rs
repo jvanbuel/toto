@@ -1,166 +1,135 @@
-//! Contributors choose which projects they support (`toto projects add|list|remove`).
+//! Contributors choose which projects they support (`toto projects add|inspect|update|list|remove`).
 //!
-//! A project publishes a descriptor, `.toto/project.json`, in its repository: its id, public key, the
-//! task kinds it posts and what its tasks ask for. Adding a project reads that descriptor and changes
-//! the contributor's own config, nothing else: its key becomes trusted, it gets a share, its queue is
-//! added and its kinds are allowed. Anything that widens what a task may do (network rules, project
-//! context, command-based MCP servers, remote MCP hosts) stays off unless the contributor accepts it
-//! by name. The descriptor is only a convenience; every task is still verified against the key the
-//! contributor chose to trust, and the runner's policy decides what runs.
+//! A project is two files in its repository: `.devcontainer/devcontainer.json` (the environment,
+//! with toto's id, key and task kinds under `customizations.toto`) and an Omnigent agent directory
+//! (`.toto/agent`). Adding a project shows both and asks once. The approval records exactly what
+//! was shown: the image by content and the agent directory by hash, at a commit. The runner starts
+//! that image and runs those files, and `update` re-prompts when either changes. Adding also trusts
+//! the project's key, gives it a share, allows its task kinds and adds its queue. Nothing else in the
+//! contributor's config changes.
 
+use crate::agent::{self, AgentSummary};
 use crate::config::{Config, QueueEndpoint};
-use crate::manifest::valid_egress_rule;
+use crate::devcontainer::{self, Devcontainer};
+use crate::image::ImageInfo;
 use crate::{Error, Result};
-use serde::Deserialize;
-use std::collections::BTreeSet;
+use base64::Engine;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-pub const DESCRIPTOR_PATH: &str = ".toto/project.json";
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Needs {
-    /// Egress rules (Omnigent DSL) its tasks may carry.
+/// What the contributor approved for one project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Approval {
+    /// The image reference the project names (or `built:<id>` for a prebuild).
+    pub image: String,
+    pub info: ImageInfo,
+    /// The agent directory as a base64 tar, exactly as approved.
+    pub agent_tar: String,
+    pub agent_hash: String,
+    pub agent: AgentSummary,
+    /// Repository commit the files were read at.
     #[serde(default)]
-    pub network: Vec<String>,
-    /// Tasks carry project context: skills, AGENTS.md/CLAUDE.md, `.mcp.json`.
+    pub commit: Option<String>,
+    /// The image was built on this machine from the project's devcontainer config.
     #[serde(default)]
-    pub context: bool,
-    /// Tasks use MCP servers that run a command in the sandbox.
-    #[serde(default)]
-    pub stdio_mcp: bool,
-    /// Hosts of remote MCP servers its tasks use.
-    #[serde(default)]
-    pub mcp_hosts: Vec<String>,
+    pub prebuilt: bool,
 }
 
-/// Where a project's environment image comes from: named directly, or read from its
-/// `devcontainer.json` (a strict subset, see `devcontainer`). Exactly one of the two.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Environment {
-    #[serde(default)]
-    pub image: Option<String>,
-    #[serde(default)]
-    pub devcontainer: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Descriptor {
-    pub version: u32,
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub description: String,
-    /// Hex Ed25519 public key tasks are signed with.
-    pub public_key: String,
-    pub kinds: Vec<String>,
-    #[serde(default = "no_needs")]
-    pub needs: Needs,
-    /// The image the project's tasks run in. Without one, tasks run in the contributor's default.
-    #[serde(default)]
-    pub environment: Option<Environment>,
-}
-
-fn no_needs() -> Needs {
-    Needs { network: vec![], context: false, stdio_mcp: false, mcp_hosts: vec![] }
-}
-
-fn ident(s: &str) -> bool {
-    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
-}
-
-impl Descriptor {
-    pub fn parse(bytes: &[u8]) -> Result<Self> {
-        let bad = |m: String| Error::Policy(format!("project descriptor: {m}"));
-        if bytes.len() > 64 * 1024 {
-            return Err(bad("too large".into()));
-        }
-        let d: Descriptor = serde_json::from_slice(bytes).map_err(|e| bad(e.to_string()))?;
-        if d.version != 1 {
-            return Err(bad(format!("unsupported version {}", d.version)));
-        }
-        if !ident(&d.id) {
-            return Err(bad(format!("id `{}` must be 1-64 characters of a-z, 0-9, - or _", d.id)));
-        }
-        if hex::decode(&d.public_key).ok().filter(|b| b.len() == 32).is_none() {
-            return Err(bad("public_key must be 32 bytes of hex".into()));
-        }
-        if d.kinds.is_empty() || d.kinds.iter().any(|k| !ident(k)) {
-            return Err(bad("kinds must be a non-empty list of simple names".into()));
-        }
-        if let Some(r) = d.needs.network.iter().find(|r| !valid_egress_rule(r)) {
-            return Err(bad(format!("malformed egress rule `{r}`")));
-        }
-        if let Some(h) = d.needs.mcp_hosts.iter().find(|h| h.is_empty() || !h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')) {
-            return Err(bad(format!("bad MCP host `{h}`")));
-        }
-        match &d.environment {
-            Some(Environment { image: Some(i), devcontainer: None }) if crate::devcontainer::valid_image_ref(i) => {}
-            Some(Environment { image: Some(i), devcontainer: None }) => return Err(bad(format!("environment image `{i}` must be fully qualified with a registry and a tag or digest"))),
-            Some(Environment { image: None, devcontainer: Some(p) }) if crate::archive::valid_path(p) => {}
-            Some(_) => return Err(bad("environment needs exactly one of `image` or `devcontainer` (a relative path)".into())),
-            None => {}
-        }
-        Ok(d)
+impl Approval {
+    pub fn new(image: &str, info: ImageInfo, files: &BTreeMap<String, Vec<u8>>, commit: Option<String>, prebuilt: bool) -> Result<Self> {
+        let summary = agent::summarize(files)?;
+        let tar = agent::pack(files)?;
+        Ok(Self { image: image.into(), info, agent_hash: agent::hash(&tar), agent_tar: base64::engine::general_purpose::STANDARD.encode(&tar), agent: summary, commit, prebuilt })
     }
 
-    /// The environment image and any warnings about ignored `devcontainer.json` keys. `fetch` reads a
-    /// file from the project repository (`None` if absent).
-    pub fn environment_image(&self, fetch: &dyn Fn(&str) -> Result<Option<Vec<u8>>>) -> Result<Option<(String, Vec<String>)>> {
-        Ok(match &self.environment {
-            None => None,
-            Some(Environment { image: Some(i), .. }) => Some((i.clone(), vec![])),
-            Some(Environment { devcontainer: Some(path), .. }) => {
-                let bytes = fetch(path)?.ok_or_else(|| Error::Policy(format!("the project names {path} as its environment, but the file is not there")))?;
-                let parsed = crate::devcontainer::parse(&String::from_utf8_lossy(&bytes))?;
-                Some((parsed.image, parsed.warnings))
-            }
-            Some(_) => None,
-        })
+    /// `repo@digest` or the image id: what the runner starts.
+    pub fn pinned(&self) -> String {
+        self.info.pinned(&self.image)
     }
 
-    /// Short fingerprint of the key, for the contributor to compare with what the project publishes.
-    pub fn fingerprint(&self) -> String {
-        self.public_key.chars().take(16).collect()
+    pub fn agent_tar_bytes(&self) -> Result<Vec<u8>> {
+        base64::engine::general_purpose::STANDARD.decode(&self.agent_tar).map_err(|_| Error::Policy("stored agent directory is not valid base64".into()))
+    }
+
+    /// Everything the contributor is approving, as lines.
+    pub fn describe(&self) -> Vec<String> {
+        let mut out = vec![format!("commit      {}", self.commit.as_deref().unwrap_or("unknown"))];
+        out.extend(crate::image::describe(&self.image, &self.info));
+        out.push(String::new());
+        out.push(format!("agent directory ({} files, hash {}…):", self.agent.skills.len() + 1, &self.agent_hash[..12]));
+        out.extend(self.agent.describe().into_iter().map(|l| format!("  {l}")));
+        out
+    }
+
+    /// What changed between two approvals of the same project.
+    pub fn diff(&self, new: &Approval) -> Vec<String> {
+        let mut out = vec![];
+        if self.image != new.image {
+            out.push(format!("image       {} -> {}", self.image, new.image));
+        }
+        out.extend(crate::image::diff(&self.info, &new.info));
+        if self.agent_hash != new.agent_hash {
+            out.push(format!("agent       changed ({}… -> {}…):", &self.agent_hash[..12], &new.agent_hash[..12]));
+            out.extend(new.agent.describe().into_iter().map(|l| format!("  {l}")));
+        }
+        out
     }
 }
 
-/// What a contributor can accept by name when adding a project.
-pub const ACCEPTABLE: [&str; 4] = ["network", "context", "stdio-mcp", "mcp-hosts"];
+/// The project as read from its repository at one commit.
+#[derive(Debug)]
+pub struct Fetched {
+    pub devcontainer: Devcontainer,
+    pub devcontainer_text: String,
+    pub agent_files: BTreeMap<String, Vec<u8>>,
+    pub agent_dir: String,
+    pub commit: Option<String>,
+}
+
+/// Reads the project's files through `repo` (a GitHub client or a test double).
+pub trait RepoFiles {
+    fn head_commit(&self) -> Result<Option<String>>;
+    fn file(&self, path: &str, commit: Option<&str>) -> Result<Option<Vec<u8>>>;
+    /// All files under `dir`, paths relative to it.
+    fn tree(&self, dir: &str, commit: Option<&str>) -> Result<BTreeMap<String, Vec<u8>>>;
+}
+
+pub fn fetch(repo: &dyn RepoFiles) -> Result<Fetched> {
+    let commit = repo.head_commit()?;
+    let c = commit.as_deref();
+    let (text, _) = [devcontainer::PATH, devcontainer::ALT_PATH]
+        .iter()
+        .find_map(|p| repo.file(p, c).transpose().map(|r| r.map(|b| (b, *p))))
+        .transpose()?
+        .ok_or_else(|| Error::Policy(format!("the repository has no {} (is it a toto project?)", devcontainer::PATH)))?;
+    let text = String::from_utf8(text).map_err(|_| Error::Policy("devcontainer.json is not UTF-8".into()))?;
+    let dc = devcontainer::parse(&text)?;
+    let agent_dir = dc.toto.agent.clone().unwrap_or_else(|| agent::DEFAULT_AGENT_DIR.into());
+    let agent_files = repo.tree(&agent_dir, c)?;
+    if agent_files.is_empty() {
+        return Err(Error::Policy(format!("the repository has no agent directory at {agent_dir} (an Omnigent agent: config.yaml and skills/)")));
+    }
+    Ok(Fetched { devcontainer: dc, devcontainer_text: text, agent_files, agent_dir, commit })
+}
 
 pub struct AddOptions {
     pub share: u32,
-    pub accept: BTreeSet<String>,
     /// File with the contributor's GitHub token (to claim and answer tasks); `None` leaves it unset.
     pub token_file: Option<PathBuf>,
-    /// The environment the contributor reviewed and approved: the image the descriptor names, pinned
-    /// to the digest they were shown (`image::inspect`). `None`: the project names none.
-    pub environment: Option<crate::image::EnvApproval>,
 }
 
-/// Adds the project to `cfg`; returns what was granted and what was left off, for the contributor.
-pub fn add(cfg: &mut Config, repo: &str, d: &Descriptor, o: &AddOptions) -> Result<Vec<String>> {
-    if let Some(a) = o.accept.iter().find(|a| !ACCEPTABLE.contains(&a.as_str())) {
-        return Err(Error::Policy(format!("cannot accept `{a}`; choose from {}", ACCEPTABLE.join(", "))));
-    }
-    if cfg.projects.get(&d.id).is_some_and(|k| *k != d.public_key) {
-        return Err(Error::Policy(format!("project `{}` is already configured with a different key; remove it first if you mean to switch", d.id)));
+/// Adds the project to `cfg` with the approval the contributor confirmed; returns notes for them.
+pub fn add(cfg: &mut Config, repo: &str, dc: &Devcontainer, approval: Approval, o: &AddOptions) -> Result<Vec<String>> {
+    let t = &dc.toto;
+    if cfg.projects.get(&t.id).is_some_and(|k| *k != t.public_key) {
+        return Err(Error::Policy(format!("project `{}` is already configured with a different key; remove it first if you mean to switch", t.id)));
     }
     let mut notes = vec![];
-    cfg.projects.insert(d.id.clone(), d.public_key.clone());
-    cfg.policy.project_shares.insert(d.id.clone(), o.share.max(1));
-    cfg.sources.insert(d.id.clone(), repo.to_string());
-    match &o.environment {
-        Some(env) if crate::devcontainer::valid_image_ref(&env.image) => {
-            cfg.environments.insert(d.id.clone(), env.clone());
-            notes.push(format!("environment {} (pinned to {}: its tasks run exactly this, as an unprivileged user, with no network unless you grant it)", env.image, env.info.digest));
-        }
-        Some(env) => return Err(Error::Policy(format!("environment image `{}` is not a fully qualified reference", env.image))),
-        None => {
-            cfg.environments.remove(&d.id);
-            notes.push("environment: none named; its tasks run in your default sandbox image".into());
-        }
-    }
-    for k in &d.kinds {
+    cfg.projects.insert(t.id.clone(), t.public_key.clone());
+    cfg.policy.project_shares.insert(t.id.clone(), o.share.max(1));
+    cfg.sources.insert(t.id.clone(), repo.to_string());
+    for k in &t.kinds {
         if !cfg.policy.allowed_kinds.contains(k) {
             cfg.policy.allowed_kinds.push(k.clone());
         }
@@ -168,42 +137,26 @@ pub fn add(cfg: &mut Config, repo: &str, d: &Descriptor, o: &AddOptions) -> Resu
     if !cfg.queues.iter().any(|q| matches!(q, QueueEndpoint::Github { repo: r, .. } if r == repo)) {
         cfg.queues.push(QueueEndpoint::Github { repo: repo.into(), token_file: o.token_file.clone(), label: crate::github_queue::DEFAULT_LABEL.into(), api_url: crate::github_queue::DEFAULT_API.into() });
     }
-    let on = |what: &str| o.accept.contains(what);
-    let mut gate = |wanted: bool, what: &str, label: String, apply: &mut dyn FnMut(&mut Config)| {
-        if !wanted {
-            return;
-        }
-        if on(what) {
-            apply(cfg);
-            notes.push(format!("granted   {label}"));
-        } else {
-            notes.push(format!("NOT granted {label} (add `--accept {what}` to allow it); tasks needing it will be refused"));
-        }
-    };
-    gate(!d.needs.network.is_empty(), "network", format!("network access: {}", d.needs.network.join(", ")), &mut |c| {
-        for r in &d.needs.network {
-            if !c.policy.max_profile.network_allowlist.contains(r) {
-                c.policy.max_profile.network_allowlist.push(r.clone());
-            }
-        }
-    });
-    gate(d.needs.context, "context", "project context (skills, instructions, MCP config)".into(), &mut |c| c.policy.allow_context = true);
-    gate(d.needs.stdio_mcp, "stdio-mcp", "MCP servers that run a command in the sandbox".into(), &mut |c| c.policy.allow_stdio_mcp = true);
-    gate(!d.needs.mcp_hosts.is_empty(), "mcp-hosts", format!("remote MCP hosts: {}", d.needs.mcp_hosts.join(", ")), &mut |c| {
-        for h in &d.needs.mcp_hosts {
-            if !c.policy.allowed_mcp_hosts.contains(h) {
-                c.policy.allowed_mcp_hosts.push(h.clone());
-            }
-        }
-    });
+    if approval.agent.needs_network && cfg.sandbox_network().is_none() {
+        notes.push("this project's tasks need a network: run `toto net-setup --apply` and set `network` in the sandbox config, or its tasks will be refused".into());
+    }
+    if approval.agent.needs_nested_sandbox() && !cfg.sandbox_nested_userns() {
+        notes.push("this project's agent uses Omnigent's own sandbox inside the container: set `nested_userns: true` in the sandbox config, or its tools will fail".into());
+    }
+    if let Some(p) = approval.agent.provider()
+        && cfg.harness_provider().is_some_and(|mine| mine != p)
+    {
+        notes.push(format!("this project's harness `{}` needs {p:?} credentials; your harness is configured for {:?}, so its tasks will be refused", approval.agent.harness, cfg.harness_provider().unwrap()));
+    }
+    cfg.environments.insert(t.id.clone(), approval);
     if cfg.queues.iter().any(|q| matches!(q, QueueEndpoint::Github { repo: r, token_file: None, .. } if r == repo)) {
         notes.push("no GitHub token configured for this queue: set `token_file` (a token that may comment on issues) so your runner can claim and answer tasks".into());
     }
     Ok(notes)
 }
 
-/// Stops supporting a project: its key, share, source and queue entry go. Kinds and accepted
-/// permissions stay in the policy (other projects may use them); the note says so.
+/// Stops supporting a project: its key, share, source, approval and queue entry go. Kinds stay in
+/// the policy (other projects may use them).
 pub fn remove(cfg: &mut Config, id: &str) -> Result<String> {
     if cfg.projects.remove(id).is_none() {
         return Err(Error::Policy(format!("project `{id}` is not configured")));
@@ -214,7 +167,7 @@ pub fn remove(cfg: &mut Config, id: &str) -> Result<String> {
     if let Some(repo) = repo.filter(|r| !cfg.sources.values().any(|o| o == r)) {
         cfg.queues.retain(|q| !matches!(q, QueueEndpoint::Github { repo: r, .. } if *r == repo));
     }
-    Ok("removed; allowed kinds and any permissions you accepted were left in your policy".into())
+    Ok("removed; allowed kinds were left in your policy".into())
 }
 
 pub fn list(cfg: &Config) -> Vec<String> {
@@ -223,7 +176,8 @@ pub fn list(cfg: &Config) -> Vec<String> {
         .map(|(id, key)| {
             let share = cfg.policy.project_shares.get(id).copied().unwrap_or(0);
             let from = cfg.sources.get(id).map_or(String::new(), |r| format!("  github:{r}"));
-            format!("{id}  key {}…  share {share}{from}", key.chars().take(16).collect::<String>())
+            let env = cfg.environments.get(id).map_or("  (no approved environment)".to_string(), |a| format!("  {} {}  agent {}…  {}", a.image, a.info.short(), &a.agent_hash[..8], a.agent.harness));
+            format!("{id}  key {}…  share {share}{from}{env}", key.chars().take(16).collect::<String>())
         })
         .collect()
 }

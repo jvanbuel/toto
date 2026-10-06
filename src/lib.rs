@@ -4,11 +4,10 @@
 //! external systems (queue server, Docker, Omnigent) sit behind traits so the full task
 //! lifecycle runs and is tested offline.
 
+pub mod agent;
 pub mod archive;
 pub mod audit;
-pub mod claude_cli;
 pub mod config;
-pub mod context;
 pub mod daemon;
 pub mod doctor;
 pub mod devcontainer;
@@ -16,12 +15,12 @@ pub mod dsse;
 pub mod github_queue;
 pub mod harness;
 pub mod manifest;
-pub mod http_queue;
 pub mod image;
 pub mod meter;
 pub mod netfence;
 pub mod omnigent;
 pub mod policy;
+pub mod prebuild;
 pub mod pr_flow;
 pub mod projects;
 pub mod proxy;
@@ -29,6 +28,7 @@ pub mod queue;
 pub mod result;
 pub mod runner;
 pub mod sandbox;
+pub mod secrets;
 pub mod service;
 
 use thiserror::Error;

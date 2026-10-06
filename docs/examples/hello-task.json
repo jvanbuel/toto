@@ -5,7 +5,7 @@
   "inputs": "0000000000000000000000000000000000000000000000000000000000000000",
   "prompt": "Using your tools, write a file /workspace/hello.txt containing the single line 'hello from the sandbox'. Then read it back, run `id -u` and `ls /home`, and tell me exactly what each command printed.",
   "tool_requirements": [
-    "claude"
+    "omnigent"
   ],
   "sandbox_profile": {
     "cpu_millis": 1000,

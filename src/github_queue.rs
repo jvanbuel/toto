@@ -366,12 +366,32 @@ impl GitHubQueue {
         Ok(out)
     }
 
-    /// A file from the repository's default branch (`None` if it does not exist).
-    pub fn file(&self, path: &str) -> Result<Option<Vec<u8>>> {
-        let (status, body, _) = self.request("GET", &self.api_url(&format!("/contents/{path}")), None, "application/json", "application/vnd.github.raw+json", None)?;
+    /// A file from the repository (`None` if it does not exist), at `commit` or the default branch.
+    pub fn file_at(&self, path: &str, commit: Option<&str>) -> Result<Option<Vec<u8>>> {
+        let q = commit.map_or(String::new(), |c| format!("?ref={c}"));
+        let (status, body, _) = self.request("GET", &self.api_url(&format!("/contents/{path}{q}")), None, "application/json", "application/vnd.github.raw+json", None)?;
         match status {
             200 => Ok(Some(body)),
             404 => Ok(None),
+            _ => Err(Self::fail(status, "GET", &body)),
+        }
+    }
+
+    /// A file from the repository's default branch (`None` if it does not exist).
+    pub fn file(&self, path: &str) -> Result<Option<Vec<u8>>> {
+        self.file_at(path, None)
+    }
+
+    /// Entries of a directory: `(path, type)` with type `file` or `dir`.
+    fn list_dir(&self, dir: &str, commit: Option<&str>) -> Result<Vec<(String, String)>> {
+        let q = commit.map_or(String::new(), |c| format!("?ref={c}"));
+        let (status, body, _) = self.request("GET", &self.api_url(&format!("/contents/{dir}{q}")), None, "application/json", "application/vnd.github+json", None)?;
+        match status {
+            200 => {
+                let v: serde_json::Value = serde_json::from_slice(&body)?;
+                Ok(v.as_array().into_iter().flatten().filter_map(|e| Some((e["path"].as_str()?.to_string(), e["type"].as_str()?.to_string()))).collect())
+            }
+            404 => Ok(vec![]),
             _ => Err(Self::fail(status, "GET", &body)),
         }
     }
@@ -506,5 +526,44 @@ impl QueueClient for GitHubQueue {
             404 => Ok(None),
             _ => Err(Self::fail(status, "asset download", &body)),
         }
+    }
+}
+
+impl crate::projects::RepoFiles for GitHubQueue {
+    fn head_commit(&self) -> Result<Option<String>> {
+        let (status, body, _) = self.request("GET", &self.api_url("/commits/HEAD"), None, "application/json", "application/vnd.github+json", None)?;
+        match status {
+            200 => Ok(serde_json::from_slice::<serde_json::Value>(&body)?["sha"].as_str().map(String::from)),
+            404 | 409 => Ok(None), // empty repository
+            _ => Err(Self::fail(status, "GET", &body)),
+        }
+    }
+
+    fn file(&self, path: &str, commit: Option<&str>) -> Result<Option<Vec<u8>>> {
+        self.file_at(path, commit)
+    }
+
+    fn tree(&self, dir: &str, commit: Option<&str>) -> Result<std::collections::BTreeMap<String, Vec<u8>>> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut dirs = vec![dir.trim_end_matches('/').to_string()];
+        let root = dirs[0].clone();
+        while let Some(d) = dirs.pop() {
+            for (path, kind) in self.list_dir(&d, commit)? {
+                match kind.as_str() {
+                    "dir" => dirs.push(path),
+                    "file" => {
+                        if out.len() >= crate::agent::MAX_FILES {
+                            return Err(qerr(format!("{root} has more than {} files", crate::agent::MAX_FILES)));
+                        }
+                        let rel = path.strip_prefix(&format!("{root}/")).unwrap_or(&path).to_string();
+                        if let Some(bytes) = self.file_at(&path, commit)? {
+                            out.insert(rel, bytes);
+                        }
+                    }
+                    _ => {} // symlinks and submodules are not carried
+                }
+            }
+        }
+        Ok(out)
     }
 }

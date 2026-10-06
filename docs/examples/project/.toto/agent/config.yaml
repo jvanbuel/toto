@@ -1,0 +1,36 @@
+# The agent that runs your tasks: an ordinary Omnigent agent directory, in Omnigent's own format.
+# toto never edits it; contributors see it when they add your project and approve it as is.
+spec_version: 1
+name: acme-docs
+description: Fixes documentation in the Acme repository.
+
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk        # or codex; decides which credential a contributor needs
+  model: claude-sonnet-4-5     # set one: the credential proxy does not offer model discovery
+
+prompt: |
+  You fix documentation in the current directory. Change only Markdown files under docs/.
+  Do not run installers or fetch anything except from hosts you were told you may reach.
+  Reply with a two-line summary of what you changed.
+
+# Tools your tasks may use. A command runs inside the environment image; a URL needs a network.
+tools:
+  docs-search:
+    type: mcp
+    command: python
+    args: ["-m", "acme_docs_mcp"]
+
+# Omnigent's own sandbox around the agent's tools, inside the container. Only with it do
+# egress_rules apply. Needs bubblewrap in the image and `nested_userns` on the contributor's side.
+os_env:
+  type: caller_process
+  cwd: "."
+  sandbox:
+    type: linux_bwrap
+    write_paths: ["."]
+    allow_network: true
+    egress_rules:
+      - "GET docs.acme.example/**"
+      - "GET api.github.com/repos/acme/**"

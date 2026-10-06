@@ -1,5 +1,6 @@
 //! Queue client (ADR 1: runners pull leases; ADR 8: an open protocol, many endpoints).
 
+use std::sync::Arc;
 use crate::dsse::Envelope;
 use crate::manifest::peek_manifest;
 use crate::result::SignedResult;
@@ -283,5 +284,70 @@ impl QueueClient for DirQueue {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+/// Several queues behind one `QueueClient`. Tasks remember where they came from, so claims,
+/// heartbeats and results go back to that endpoint. A queue that is down is skipped.
+pub struct MultiQueue {
+    endpoints: Vec<Arc<dyn QueueClient>>,
+    origin: Mutex<HashMap<String, usize>>,
+}
+
+impl MultiQueue {
+    pub fn new(endpoints: Vec<Arc<dyn QueueClient>>) -> Self {
+        Self { endpoints, origin: Default::default() }
+    }
+
+    fn home(&self, task_id: &str) -> Result<&Arc<dyn QueueClient>> {
+        let i = *self.origin.lock().unwrap().get(task_id).ok_or_else(|| Error::Queue(format!("task `{task_id}` was not seen on any queue")))?;
+        Ok(&self.endpoints[i])
+    }
+}
+
+impl QueueClient for MultiQueue {
+    fn available(&self) -> Result<Vec<Envelope>> {
+        let (mut all, mut last_err, mut ok) = (vec![], None, false);
+        for (i, q) in self.endpoints.iter().enumerate() {
+            match q.available() {
+                Ok(tasks) => {
+                    ok = true;
+                    let mut origin = self.origin.lock().unwrap();
+                    for t in tasks {
+                        if let Ok(m) = peek_manifest(&t) {
+                            origin.entry(m.id).or_insert(i);
+                        }
+                        all.push(t);
+                    }
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        match (ok, last_err) {
+            (false, Some(e)) => Err(e),
+            _ => Ok(all),
+        }
+    }
+    fn claim(&self, task_id: &str, runner_id: &str, lease: Duration) -> Result<()> {
+        self.home(task_id)?.claim(task_id, runner_id, lease)
+    }
+    fn heartbeat(&self, task_id: &str, runner_id: &str, lease: Duration) -> Result<()> {
+        self.home(task_id)?.heartbeat(task_id, runner_id, lease)
+    }
+    fn release(&self, task_id: &str, runner_id: &str) -> Result<()> {
+        self.home(task_id)?.release(task_id, runner_id)
+    }
+    fn submit(&self, result: &SignedResult) -> Result<()> {
+        let id = result.open()?.task_id;
+        self.home(&id)?.submit(result)
+    }
+    fn bundle(&self, hash: &str) -> Result<Option<Vec<u8>>> {
+        // Bundles are addressed by hash and the runner checks the hash, so any endpoint may answer.
+        for q in &self.endpoints {
+            if let Ok(Some(b)) = q.bundle(hash) {
+                return Ok(Some(b));
+            }
+        }
+        Ok(None)
     }
 }

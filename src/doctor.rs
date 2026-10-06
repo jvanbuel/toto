@@ -50,9 +50,9 @@ pub fn run_all(cfg: &Config) -> Vec<Check> {
         Err(_) => c.push(Check::new(Level::Warn, "runner key", "not created yet (the daemon creates it on first start)")),
     }
     if cfg.projects.is_empty() {
-        c.push(Check::new(Level::Warn, "projects", "no trusted project keys: nothing will run"));
+        c.push(Check::new(Level::Warn, "projects", "none: nothing will run (`toto projects add owner/name`)"));
     } else {
-        c.push(Check::new(Level::Ok, "projects", format!("{} trusted", cfg.projects.len())));
+        c.push(Check::new(Level::Ok, "projects", format!("{} supported", cfg.projects.len())));
     }
     if cfg.policy.allowed_kinds.is_empty() || cfg.policy.project_shares.is_empty() {
         c.push(Check::new(Level::Warn, "policy", "no allowed kinds or project shares: every task will be refused"));
@@ -61,9 +61,7 @@ pub fn run_all(cfg: &Config) -> Vec<Check> {
     }
     for e in &cfg.queues {
         let name = e.describe();
-        let plain = matches!(e, QueueEndpoint::Http { url, .. } if url.starts_with("http://") && !url.contains("//127.") && !url.contains("//localhost"));
         c.push(match e.build().and_then(|q| q.available()) {
-            Ok(tasks) if plain => Check::new(Level::Warn, "queue", format!("{name} reachable ({} tasks) but uses plain http; tasks and results cross the network unencrypted", tasks.len())),
             Ok(tasks) => Check::new(Level::Ok, "queue", format!("{name} reachable, {} tasks available", tasks.len())),
             Err(err) => Check::new(Level::Fail, "queue", format!("{name}: {err}")),
         });
@@ -72,23 +70,58 @@ pub fn run_all(cfg: &Config) -> Vec<Check> {
         }
     }
     if cfg.queues.is_empty() {
-        c.push(if cfg.queue_dir.is_dir() { Check::new(Level::Ok, "queue", cfg.queue_dir.display().to_string()) } else { Check::new(Level::Warn, "queue", format!("{} does not exist yet", cfg.queue_dir.display())) });
+        c.push(if cfg.queue_dir.is_dir() { Check::new(Level::Ok, "queue", format!("{} (spool directory)", cfg.queue_dir.display())) } else { Check::new(Level::Warn, "queue", format!("{} does not exist yet", cfg.queue_dir.display())) });
     }
 
     match &cfg.sandbox {
         SandboxConfig::Dir => c.push(Check::new(Level::Warn, "sandbox", "`dir` gives no isolation (development only)")),
-        SandboxConfig::Bwrap => c.push(match cfg.build_sandbox().probe() {
-            Ok(()) => Check::new(Level::Ok, "sandbox", "bubblewrap"),
-            Err(e) => Check::new(Level::Fail, "sandbox", e.to_string()),
-        }),
-        SandboxConfig::Docker { bin, image, runtime, nested_userns, network, .. } => {
-            docker_checks(&mut c, cfg, bin, image, runtime.as_deref(), *nested_userns, network.as_deref());
+        SandboxConfig::Docker { bin, runtime, nested_userns, network, relay } => {
+            // `probe` covers the daemon, every approved image, the relay binary and the network fence.
+            match cfg.build_sandbox().probe() {
+                Ok(()) => c.push(Check::new(Level::Ok, "sandbox", format!("{bin}{}", runtime.as_deref().map_or(String::new(), |r| format!(" (runtime {r})"))))),
+                Err(e) => c.push(Check::new(Level::Fail, "sandbox", e.to_string())),
+            }
+            if relay.is_none() {
+                c.push(Check::new(Level::Fail, "sandbox", "`relay` is not set: build the static toto-relay binary and point the sandbox config at it"));
+            }
+            match network {
+                Some(net) => c.push(Check::new(Level::Ok, "network", format!("`{net}` is the fenced network for agents that need one"))),
+                None => c.push(Check::new(Level::Warn, "network", "none configured: projects whose agents need a network are refused (`toto net-setup`)")),
+            }
+            if *nested_userns && runtime.as_deref().is_some_and(|r| r.contains("runsc")) {
+                c.push(Check::new(Level::Fail, "nested sandbox", "gVisor (runsc) cannot run a nested bubblewrap"));
+            }
+            if run(bin, &["info", "--format", "{{.SecurityOptions}}"]).is_some_and(|s| s.contains("apparmor")) && *nested_userns {
+                c.push(Check::new(Level::Warn, "apparmor", "AppArmor is active; the nested sandbox is untested with `docker-default`"));
+            }
+            for (id, a) in &cfg.environments {
+                let mut notes = vec![];
+                if a.agent.needs_network && network.is_none() {
+                    notes.push("needs a network, none configured");
+                }
+                if a.agent.needs_nested_sandbox() && !nested_userns {
+                    notes.push("uses Omnigent's sandbox, needs `nested_userns: true`");
+                }
+                let tools = run(bin, &["run", "--rm", "--network", "none", "--entrypoint", "sh", &a.pinned(), "-c", "command -v omnigent >/dev/null && echo omnigent; command -v tar >/dev/null && echo tar; command -v bwrap >/dev/null && echo bwrap"]).unwrap_or_default();
+                if !tools.contains("omnigent") {
+                    notes.push("image has no `omnigent`");
+                }
+                if !tools.contains("tar") {
+                    notes.push("image has no `tar`");
+                }
+                if a.agent.needs_nested_sandbox() && !tools.contains("bwrap") {
+                    notes.push("image has no `bwrap` for Omnigent's sandbox");
+                }
+                let level = if notes.is_empty() { Level::Ok } else { Level::Fail };
+                c.push(Check::new(level, "environment", format!("{id}: {} ({}, {}){}", a.image, a.info.short(), a.agent.harness, if notes.is_empty() { String::new() } else { format!(": {}", notes.join("; ")) })));
+            }
+            match crate::prebuild::cli_version(crate::prebuild::DEFAULT_CLI) {
+                Some(v) => c.push(Check::new(Level::Ok, "prebuild", format!("dev container CLI {v}: projects without a published image can be added"))),
+                None => c.push(Check::new(Level::Warn, "prebuild", "dev container CLI not found: only projects with a published image can be added (`npm i -g @devcontainers/cli`)")),
+            }
         }
     }
 
-    for (id, env) in &cfg.environments {
-        c.push(Check::new(Level::Ok, "environment", format!("{id}: {} (approved, tasks run exactly this digest; `toto projects update {id}` checks for a new one)", env.pinned())));
-    }
     // Building the runner also validates the harness settings and reads the credential files.
     match cfg.build() {
         Err(e) => c.push(Check::new(Level::Fail, "harness", e.to_string())),
@@ -100,6 +133,13 @@ pub fn run_all(cfg: &Config) -> Vec<Check> {
             if matches!(&cfg.harness, HarnessConfig::Echo { .. }) {
                 c.push(Check::new(Level::Warn, "harness", "`echo` does not use a model (placeholder)"));
             }
+            if let Some(mine) = cfg.harness_provider() {
+                for (id, a) in &cfg.environments {
+                    if a.agent.provider().is_some_and(|p| p != mine) {
+                        c.push(Check::new(Level::Fail, "harness", format!("{id} uses `{}`, which needs {:?} credentials; this runner has {mine:?}", a.agent.harness, a.agent.provider().unwrap())));
+                    }
+                }
+            }
         }
     }
     c
@@ -108,37 +148,7 @@ pub fn run_all(cfg: &Config) -> Vec<Check> {
 fn harness_name(h: &HarnessConfig) -> String {
     match h {
         HarnessConfig::Echo { .. } => "echo".into(),
-        HarnessConfig::Claude { .. } => "claude CLI".into(),
-        HarnessConfig::Omnigent { harness, .. } => format!("omnigent ({harness})"),
-    }
-}
-
-fn docker_checks(c: &mut Vec<Check>, cfg: &Config, bin: &str, image: &str, runtime: Option<&str>, nested: bool, network: Option<&str>) {
-    // `build_sandbox().probe()` covers the daemon, the image, the agent binary and the network fence.
-    match cfg.build_sandbox().probe() {
-        Ok(()) => c.push(Check::new(Level::Ok, "sandbox", format!("{bin}, image `{image}`"))),
-        Err(e) => {
-            c.push(Check::new(Level::Fail, "sandbox", e.to_string()));
-            return;
-        }
-    }
-    if let Some(net) = network {
-        // The probe above already refused an unfenced network, so reaching here means it held.
-        c.push(Check::new(Level::Ok, "network", format!("`{net}` is fenced (a container could not reach this host)")));
-    }
-    if nested {
-        if runtime.is_some_and(|r| r.contains("runsc")) {
-            c.push(Check::new(Level::Fail, "nested sandbox", "gVisor (runsc) cannot run a nested bubblewrap"));
-        } else {
-            let tools = run(bin, &["run", "--rm", "--network", "none", image, "sh", "-c", "command -v bwrap >/dev/null && echo bwrap; test -d /run/lakebox && echo marker"]).unwrap_or_default();
-            c.push(if tools.contains("bwrap") { Check::new(Level::Ok, "nested sandbox", "bubblewrap is in the image") } else { Check::new(Level::Fail, "nested sandbox", "bubblewrap is missing from the image (apt-get install bubblewrap)") });
-            if !tools.contains("marker") {
-                c.push(Check::new(Level::Warn, "nested sandbox", "image lacks /run/lakebox: Omnigent cannot mount /proc in the nested sandbox (see the example Dockerfile)"));
-            }
-        }
-        if run(bin, &["info", "--format", "{{.SecurityOptions}}"]).is_some_and(|s| s.contains("apparmor")) {
-            c.push(Check::new(Level::Warn, "apparmor", "AppArmor is active; the nested sandbox is untested with `docker-default` (check `toto doctor` on a real task)"));
-        }
+        HarnessConfig::Omnigent { provider, .. } => format!("omnigent in the project's image, {provider:?} credential"),
     }
 }
 

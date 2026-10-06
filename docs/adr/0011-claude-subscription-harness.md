@@ -1,6 +1,6 @@
 # 11. Run tasks with the official Claude CLI on the contributor's subscription
 
-- Status: Proposed (unit-tested against a fake CLI; not yet run against a real login)
+- Status: Superseded by ADR 13 (the terms section still applies); was: Proposed (unit-tested against a fake CLI; not yet run against a real login)
 - Date: 2026-10-04
 - Builds on: ADR 5, ADR 10
 

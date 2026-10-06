@@ -1,6 +1,5 @@
 //! Policy engine: the contributor's consent (ADR 4: source of truth for caps and shares).
 
-use crate::context::ProjectContext;
 use crate::manifest::{SandboxProfile, TaskManifest};
 use crate::{Error, Result};
 use chrono::{DateTime, Local, Timelike};
@@ -28,18 +27,6 @@ pub struct Policy {
     pub abort_margin_pct: u64,
     /// Tools this runner can drive (e.g. `claude-code`, `api-key`).
     pub available_tools: Vec<String>,
-    /// Accept project-supplied context: skills, AGENTS.md/CLAUDE.md and MCP servers (ADR 9).
-    #[serde(default, alias = "allow_skills")]
-    pub allow_context: bool,
-    /// Also accept MCP servers that run a command inside the sandbox container.
-    #[serde(default)]
-    pub allow_stdio_mcp: bool,
-    /// Hosts whose remote MCP servers tasks may use (the host connects to them, so each is an
-    /// explicit opt-in); empty allows none.
-    #[serde(default)]
-    pub allowed_mcp_hosts: Vec<String>,
-    #[serde(default = "default_context_bytes")]
-    pub max_context_bytes: u64,
     /// Largest input bundle this runner will unpack into a task workspace.
     #[serde(default = "default_input_bytes")]
     pub max_input_bytes: u64,
@@ -47,10 +34,6 @@ pub struct Policy {
 
 fn default_input_bytes() -> u64 {
     64 * 1024 * 1024
-}
-
-fn default_context_bytes() -> u64 {
-    64 * 1024
 }
 
 fn default_margin() -> u64 {
@@ -87,37 +70,8 @@ impl Policy {
             return deny("would exceed daily cap".into());
         }
         let (p, max) = (&m.sandbox_profile, &self.max_profile);
-        if let Some(r) = p.network_allowlist.iter().find(|r| !crate::manifest::valid_egress_rule(r)) {
-            return deny(format!("malformed egress rule `{r}`"));
-        }
-        if let Some(h) = p.network_allowlist.iter().find(|h| !max.network_allowlist.contains(h)) {
-            return deny(format!("egress rule `{h}` outside policy"));
-        }
         if p.cpu_millis > max.cpu_millis || p.memory_mb > max.memory_mb || p.timeout_secs > max.timeout_secs {
             return deny("sandbox profile exceeds policy limits".into());
-        }
-        Ok(())
-    }
-
-    /// Checks a parsed project context against what this contributor allows (deny by default).
-    pub fn admit_context(&self, c: &ProjectContext) -> Result<()> {
-        if c.is_empty() {
-            return Ok(());
-        }
-        if !self.allow_context {
-            return Err(Error::Policy("project context (skills, instructions, MCP servers) is not allowed".into()));
-        }
-        if c.bytes() > self.max_context_bytes {
-            return Err(Error::Policy(format!("context is {} bytes, limit {}", c.bytes(), self.max_context_bytes)));
-        }
-        if c.has_stdio_mcp() && !self.allow_stdio_mcp {
-            return Err(Error::Policy("MCP servers that run commands inside the sandbox are not allowed".into()));
-        }
-        for m in &c.mcp {
-            if let Some(host) = m.remote_host()
-                && !self.allowed_mcp_hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
-                    return Err(Error::Policy(format!("mcp host `{host}` not allowed")));
-                }
         }
         Ok(())
     }

@@ -1,44 +1,49 @@
-//! A strict subset of the dev container spec (<https://containers.dev>): how a project names its
-//! environment. Projects already have a `devcontainer.json` for their own developers; toto reads the
-//! prebuilt `image` from it and nothing else that acts.
+//! The project's `.devcontainer/devcontainer.json` (<https://containers.dev>): the same file its
+//! developers use, with toto's bits under `customizations.toto`, the extension point the spec
+//! reserves for tools.
 //!
-//! Much of the spec acts on the machine that runs it (`initializeCommand` runs on the host, `mounts`
-//! bind host paths, `runArgs` passes arbitrary docker flags, `privileged` and `capAdd` weaken the
-//! sandbox). Other keys make the contributor's machine *build* the environment (`build`,
-//! `dockerFile`, `features`): the steps run in a build container with network, which is contained but
-//! is a stranger's code running before the contributor has approved anything, and the result is
-//! not something that can be inspected and pinned like a published image. So all of these are
-//! *refused* with a message instead of being silently dropped: the project builds its image in its
-//! own CI and publishes it, and the contributor inspects and approves that image (`image`).
-//! Keys that only matter in an editor or at dev time are ignored with a warning.
+//! toto never runs `devcontainer up` on a stranger's file. It reads two things: the published
+//! image (`customizations.toto.image`, or the top-level `image`), and `customizations.toto` (id,
+//! key, kinds, agent directory). Keys that act on the host (`runArgs`, `mounts`, `privileged`,
+//! ...) are simply not applied, because toto only ever starts the image under its own flags. When
+//! the file builds its image (`build`, `dockerFile`, `features`) and names no published one, the
+//! contributor's machine can prebuild it (`prebuild`): the spec's own prebuild phase, build +
+//! `onCreateCommand` + `updateContentCommand`, snapshotted. `postCreateCommand` and later never
+//! run: tasks start offline from the snapshot, as Codespaces prebuilds define it.
 
 use crate::{Error, Result};
+use serde::Deserialize;
 
-/// Keys that would act on the host or build on it: the file is refused.
-const REFUSED: [(&str, &str); 13] = [
-    ("build", "builds an image on the contributor's machine"),
-    ("dockerFile", "builds an image on the contributor's machine"),
-    ("dockerComposeFile", "starts other services on the contributor's machine"),
-    ("service", "starts other services on the contributor's machine"),
-    ("features", "runs install scripts on the contributor's machine"),
-    ("mounts", "mounts host paths into the container"),
-    ("workspaceMount", "mounts host paths into the container"),
-    ("runArgs", "passes arbitrary flags to docker"),
-    ("privileged", "removes the container's isolation"),
-    ("capAdd", "adds capabilities to the container"),
-    ("securityOpt", "changes the container's security settings"),
-    ("initializeCommand", "runs a command on the contributor's machine"),
-    ("init", "changes how the container starts"),
-];
+pub const PATH: &str = ".devcontainer/devcontainer.json";
+pub const ALT_PATH: &str = ".devcontainer.json";
 
-/// Keys read or harmless: no warning.
-const QUIET: [&str; 4] = ["$schema", "name", "image", "customizations"];
+/// `customizations.toto`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct Toto {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Hex Ed25519 public key tasks are signed with.
+    pub public_key: String,
+    pub kinds: Vec<String>,
+    /// The published image tasks run in, when the file itself builds (`build`/`features`).
+    #[serde(default)]
+    pub image: Option<String>,
+    /// Omnigent agent directory in the repository; default `.toto/agent`.
+    #[serde(default)]
+    pub agent: Option<String>,
+}
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct Parsed {
-    pub image: String,
-    /// What was ignored and why, for the project and the contributor to see.
-    pub warnings: Vec<String>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Devcontainer {
+    pub toto: Toto,
+    /// The published image to run, if any.
+    pub image: Option<String>,
+    /// The file builds its own image (`build`, `dockerFile` or `features`).
+    pub builds: bool,
+    /// What a prebuild would run, and what is ignored; shown to the contributor.
+    pub notes: Vec<String>,
 }
 
 /// Removes `//` and `/* */` comments and trailing commas (dev container files are JSONC).
@@ -92,33 +97,76 @@ pub fn valid_image_ref(r: &str) -> bool {
     r.len() <= 256 && tagged && name_ok(path) && !host_name.is_empty() && (host.contains('.') || host.contains(':') || host == "localhost") && host_name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
 }
 
-pub fn parse(text: &str) -> Result<Parsed> {
+fn ident(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+/// Keys that `devcontainer up` would apply to the host; a prebuild drops them from the override
+/// config it hands the CLI, and tasks never see them.
+pub const HOST_KEYS: [&str; 9] = ["runArgs", "mounts", "workspaceMount", "privileged", "capAdd", "securityOpt", "initializeCommand", "dockerComposeFile", "service"];
+
+pub fn parse(text: &str) -> Result<Devcontainer> {
     let bad = |m: String| Error::Policy(format!("devcontainer.json: {m}"));
     if text.len() > 256 * 1024 {
         return Err(bad("too large".into()));
     }
     let v: serde_json::Value = serde_json::from_str(&strip_jsonc(text)).map_err(|e| bad(e.to_string()))?;
     let obj = v.as_object().ok_or_else(|| bad("not an object".into()))?;
-    let refused: Vec<String> = REFUSED.iter().filter(|(k, _)| obj.contains_key(*k)).map(|(k, why)| format!("`{k}` {why}")).collect();
-    if !refused.is_empty() {
-        return Err(bad(format!(
-            "{}. toto runs a published image only: build it in your CI (for example with the dev container CLI), push it, and name it in `image`",
-            refused.join("; ")
-        )));
+    let toto: Toto = serde_json::from_value(obj.get("customizations").and_then(|c| c.get("toto")).cloned().ok_or_else(|| bad("no customizations.toto (is this a toto project?)".into()))?).map_err(|e| bad(format!("customizations.toto: {e}")))?;
+    if !ident(&toto.id) {
+        return Err(bad(format!("customizations.toto.id `{}` must be 1-64 characters of a-z, 0-9, - or _", toto.id)));
     }
-    let image = obj.get("image").and_then(|i| i.as_str()).ok_or_else(|| bad("no `image`: name a published image (registry/path:tag)".into()))?;
-    if !valid_image_ref(image) {
-        return Err(bad(format!("image `{image}` must be fully qualified with a registry and a tag or digest, e.g. ghcr.io/acme/env:1.2")));
+    if hex::decode(&toto.public_key).ok().filter(|b| b.len() == 32).is_none() {
+        return Err(bad("customizations.toto.public_key must be 32 bytes of hex".into()));
     }
-    let warnings = obj
-        .keys()
-        .filter(|k| !QUIET.contains(&k.as_str()))
-        .map(|k| match k.as_str() {
-            "containerEnv" | "remoteEnv" => format!("`{k}` is ignored: bake variables into the image with ENV"),
-            "onCreateCommand" | "updateContentCommand" | "postCreateCommand" | "postStartCommand" | "postAttachCommand" => format!("`{k}` is ignored: toto does not run setup commands; put the setup in the image"),
-            "remoteUser" | "containerUser" | "updateRemoteUserUID" => format!("`{k}` is ignored: tasks always run as an unprivileged user"),
-            other => format!("`{other}` is ignored"),
-        })
-        .collect();
-    Ok(Parsed { image: image.to_string(), warnings })
+    if toto.kinds.is_empty() || toto.kinds.iter().any(|k| !ident(k)) {
+        return Err(bad("customizations.toto.kinds must be a non-empty list of simple names".into()));
+    }
+    if let Some(a) = &toto.agent
+        && !crate::archive::valid_path(a)
+    {
+        return Err(bad(format!("customizations.toto.agent `{a}` must be a relative path")));
+    }
+    let builds = ["build", "dockerFile", "features"].iter().any(|k| obj.contains_key(*k));
+    let image = match (toto.image.as_deref(), obj.get("image").and_then(|i| i.as_str())) {
+        (Some(i), _) | (None, Some(i)) => {
+            if !valid_image_ref(i) {
+                return Err(bad(format!("image `{i}` must be fully qualified with a registry and a tag or digest, e.g. ghcr.io/acme/env:1.2")));
+            }
+            Some(i.to_string())
+        }
+        (None, None) => None,
+    };
+    if image.is_none() && !builds {
+        return Err(bad("names no image and builds none: set `image`, or `build`/`features` (then a contributor prebuilds it), or customizations.toto.image".into()));
+    }
+    let mut notes = vec![];
+    if image.is_some() && builds {
+        notes.push(format!("the file builds its own image for developers; tasks run the published one ({})", image.as_deref().unwrap_or("")));
+    } else if builds {
+        notes.push("no published image: your machine prebuilds it (build, onCreateCommand, updateContentCommand), then tasks run the snapshot offline".into());
+    }
+    for k in ["onCreateCommand", "updateContentCommand"] {
+        if obj.contains_key(k) {
+            notes.push(format!("`{k}` runs at prebuild{}", if image.is_some() { " only if your machine builds; the published image is used as is" } else { "" }));
+        }
+    }
+    for k in ["postCreateCommand", "postStartCommand", "postAttachCommand"] {
+        if obj.contains_key(k) {
+            notes.push(format!("`{k}` never runs: tasks start offline from the snapshot (as Codespaces prebuilds define it)"));
+        }
+    }
+    let dropped: Vec<&str> = HOST_KEYS.iter().copied().filter(|k| obj.contains_key(*k)).collect();
+    if !dropped.is_empty() {
+        notes.push(format!("not applied (toto starts the image under its own flags): {}", dropped.join(", ")));
+    }
+    for k in ["containerEnv", "remoteEnv"] {
+        if obj.contains_key(k) {
+            notes.push(format!("`{k}` is not applied: bake variables into the image with ENV"));
+        }
+    }
+    if obj.get("remoteUser").is_some() || obj.get("containerUser").is_some() {
+        notes.push("`remoteUser`/`containerUser` are not applied: tasks always run as an unprivileged user".into());
+    }
+    Ok(Devcontainer { toto, image, builds, notes })
 }

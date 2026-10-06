@@ -10,7 +10,7 @@ use toto::runner::{Runner, Tick};
 use toto::sandbox::DirSandbox;
 
 #[derive(Parser)]
-#[command(version, about = "Local runner for Tokens of Gratitude")]
+#[command(version, about = "toto: donate unused AI capacity to projects you choose")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -35,9 +35,53 @@ enum Cmd {
         #[arg(long)]
         once: bool,
     },
-    /// Generate a project signing key (hex seed, mode 0600) and print its public key.
+    /// Choose which projects your runner supports: add, inspect, update, list or remove.
+    Projects {
+        #[command(subcommand)]
+        cmd: ProjectsCmd,
+        #[arg(long, global = true)]
+        config: Option<PathBuf>,
+    },
+    /// Check the whole setup (sandbox, network fence, approved environments, credentials, harness)
+    /// and report what works, what is risky and what is missing. Exits 1 if anything failed.
+    Doctor {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Create (and with --apply, install) the firewalled docker network that agents needing a
+    /// network run on: no route to private ranges, other containers or this host. Needs root.
+    NetSetup {
+        #[arg(long, default_value = toto::netfence::DEFAULT_NETWORK)]
+        name: String,
+        #[arg(long, default_value = toto::netfence::DEFAULT_SUBNET)]
+        subnet: String,
+        #[arg(long, default_value = "docker")]
+        bin: String,
+        /// Run the script instead of printing it.
+        #[arg(long)]
+        apply: bool,
+        /// Remove the rules and the network.
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Sign in the daemon's Claude subscription: runs `claude setup-token`, then stores the token.
+    Login {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Show daemon status from the state directory.
+    Status {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Write a systemd (Linux) or launchd (macOS) user unit for the daemon.
+    InstallService {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Project side: generate a project signing key (hex seed, mode 0600) and print its public key.
     ProjectKey { out: PathBuf },
-    /// Sign a task manifest (JSON, no signature) with a project key and put it in the queue dir.
+    /// Project side: sign a task manifest (JSON, no signature) with a project key and post it.
     PostTask {
         #[arg(long)]
         key: PathBuf,
@@ -46,10 +90,6 @@ enum Cmd {
         /// Directory to pack as the task's input bundle (sets `inputs` to its hash).
         #[arg(long)]
         bundle: Option<PathBuf>,
-        /// Directory laid out like a project root with `.mcp.json`, `.claude/skills/` and/or
-        /// `AGENTS.md`; packed as the task's context (anything else in it is rejected).
-        #[arg(long)]
-        context: Option<PathBuf>,
         task: PathBuf,
         /// Post to GitHub issues in this repository (`owner/name`) instead of the spool directory.
         /// The token needs to create issues and labels, and to upload release assets for bundles.
@@ -59,13 +99,6 @@ enum Cmd {
         github_token_file: Option<PathBuf>,
         #[arg(long, default_value = toto::github_queue::DEFAULT_API)]
         github_api: String,
-    },
-    /// Choose which projects your runner supports: add, list or remove.
-    Projects {
-        #[command(subcommand)]
-        cmd: ProjectsCmd,
-        #[arg(long, global = true)]
-        config: Option<PathBuf>,
     },
     /// Project side: open a pull request for every finished task's result (run it on a schedule,
     /// e.g. from a GitHub Action in the project repository; see docs/github-queue.md).
@@ -94,8 +127,8 @@ enum Cmd {
         #[arg(long = "protect")]
         protect: Vec<String>,
     },
-    /// Download the verified results found on a GitHub queue's issues, one file per result, ready
-    /// for `extract-result`.
+    /// Project side: download the verified results found on a GitHub queue's issues, one file per
+    /// result, ready for `extract-result`.
     GithubResults {
         /// `owner/name`
         repo: String,
@@ -108,58 +141,10 @@ enum Cmd {
     },
     /// Write a result's artifacts (changed files) into a new directory and list deletions.
     ExtractResult {
-        /// A result file from `<queue_dir>/results/`.
+        /// A result file.
         result: PathBuf,
         /// Directory to create.
         out: PathBuf,
-    },
-    /// Sign in the daemon's Claude subscription: runs `claude setup-token`, then stores the token.
-    Login {
-        #[arg(long)]
-        config: Option<PathBuf>,
-    },
-    /// Show daemon status from the state directory.
-    Status {
-        #[arg(long)]
-        config: Option<PathBuf>,
-    },
-    /// Write a systemd (Linux) or launchd (macOS) user unit for the daemon.
-    InstallService {
-        #[arg(long)]
-        config: Option<PathBuf>,
-    },
-    /// Check the whole setup (sandbox, network fence, nested sandbox, credentials, harness) and
-    /// report what works, what is risky and what is missing. Exits 1 if anything failed.
-    Doctor {
-        #[arg(long)]
-        config: Option<PathBuf>,
-    },
-    /// Create (and with --apply, install) the firewalled docker network that tasks with egress
-    /// rules run on: no route to private ranges, other containers or this host. Needs root.
-    NetSetup {
-        #[arg(long, default_value = toto::netfence::DEFAULT_NETWORK)]
-        name: String,
-        #[arg(long, default_value = toto::netfence::DEFAULT_SUBNET)]
-        subnet: String,
-        #[arg(long, default_value = "docker")]
-        bin: String,
-        /// Run the script instead of printing it.
-        #[arg(long)]
-        apply: bool,
-        /// Remove the rules and the network.
-        #[arg(long)]
-        remove: bool,
-    },
-    /// Serve a spool directory over the queue protocol (reference coordinator for pilots).
-    ServeQueue {
-        /// Spool directory (the same layout `post-task` writes to).
-        #[arg(long)]
-        dir: PathBuf,
-        #[arg(long, default_value = "127.0.0.1:8787")]
-        addr: String,
-        /// File holding the bearer token clients must send. Without it the server is open.
-        #[arg(long)]
-        token_file: Option<PathBuf>,
     },
     /// Run one signed task end to end against an in-memory queue and an echo harness.
     Demo,
@@ -167,18 +152,15 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ProjectsCmd {
-    /// Support a project: reads its `.toto/project.json` from GitHub, shows what it asks for and,
-    /// after you confirm, trusts its key, gives it a share and adds its queue to your config. Anything
-    /// that widens what a task may do stays off unless you accept it with `--accept`.
+    /// Support a project: reads its `.devcontainer/devcontainer.json` and agent directory from
+    /// GitHub, pulls or prebuilds its environment, shows everything you are approving and, after
+    /// you confirm, trusts its key, gives it a share and adds its queue to your config.
     Add {
         /// `owner/name` of the project's repository
         repo: String,
         /// Relative weight against your other projects.
         #[arg(long, default_value_t = 1)]
         share: u32,
-        /// Permissions to grant: network, context, stdio-mcp, mcp-hosts (repeatable).
-        #[arg(long = "accept")]
-        accept: Vec<String>,
         /// File with your GitHub token (it only needs to comment on issues).
         #[arg(long)]
         token_file: Option<PathBuf>,
@@ -188,9 +170,7 @@ enum ProjectsCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Read everything a project asks you to approve, without changing anything: its descriptor, the
-    /// `devcontainer.json` that names its environment, and (after pulling it) the image itself: user,
-    /// environment, size and the build steps of every layer.
+    /// Read everything a project asks you to approve, without changing anything.
     Inspect {
         /// `owner/name`
         repo: String,
@@ -199,9 +179,8 @@ enum ProjectsCmd {
         #[arg(long, default_value = toto::github_queue::DEFAULT_API)]
         api: String,
     },
-    /// Re-check a project's environment image: if its tag now points to a different digest, show
-    /// what changed and, after you confirm, approve and pin the new one. Until then tasks keep
-    /// running the image you approved.
+    /// Re-check a project: if its environment or agent directory changed, show what changed and,
+    /// after you confirm, approve the new version. Until then tasks keep running what you approved.
     Update {
         id: String,
         #[arg(long)]
@@ -224,13 +203,6 @@ fn save_config(path: &std::path::Path, cfg: &toto::config::Config) -> Result<(),
     Ok(())
 }
 
-fn docker_bin(cfg: &toto::config::Config) -> Result<String, Box<dyn std::error::Error>> {
-    match &cfg.sandbox {
-        toto::config::SandboxConfig::Docker { bin, .. } => Ok(bin.clone()),
-        _ => Err("project environments are container images: configure a docker or podman sandbox first".into()),
-    }
-}
-
 /// Asks the contributor; `yes` answers for them, and without a terminal there is nobody to ask.
 fn confirm(question: &str, yes: bool) -> Result<bool, Box<dyn std::error::Error>> {
     use std::io::{BufRead, IsTerminal, Write};
@@ -247,20 +219,25 @@ fn confirm(question: &str, yes: bool) -> Result<bool, Box<dyn std::error::Error>
     Ok(answer.trim().eq_ignore_ascii_case("y"))
 }
 
-/// A project's descriptor and the environment image it names (with warnings about ignored keys).
-struct Fetched {
-    gh: toto::github_queue::GitHubQueue,
-    d: toto::projects::Descriptor,
-    env: Option<(String, Vec<String>)>,
+fn github(api: &str, repo: &str, token_file: Option<&std::path::Path>) -> Result<toto::github_queue::GitHubQueue, Box<dyn std::error::Error>> {
+    let token = token_file.map(toto::secrets::read_secret).transpose()?;
+    Ok(toto::github_queue::GitHubQueue::new(api, repo, toto::github_queue::DEFAULT_LABEL, token))
 }
 
-fn fetch_project(api: &str, repo: &str, token_file: Option<&std::path::Path>) -> Result<Fetched, Box<dyn std::error::Error>> {
-    let token = token_file.map(toto::claude_cli::read_secret).transpose()?;
-    let gh = toto::github_queue::GitHubQueue::new(api, repo, toto::github_queue::DEFAULT_LABEL, token);
-    let bytes = gh.file(toto::projects::DESCRIPTOR_PATH)?.ok_or_else(|| format!("{repo} has no {} (is it a toto project?)", toto::projects::DESCRIPTOR_PATH))?;
-    let d = toto::projects::Descriptor::parse(&bytes)?;
-    let env = d.environment_image(&|path| gh.file(path))?;
-    Ok(Fetched { gh, d, env })
+/// Pulls or prebuilds the project's environment and assembles the approval the contributor is shown.
+fn approval_for(cfg: &toto::config::Config, repo: &str, f: &toto::projects::Fetched) -> Result<toto::projects::Approval, Box<dyn std::error::Error>> {
+    let bin = cfg.docker_bin().ok_or("project environments are container images: configure a docker or podman sandbox first")?;
+    let (image, info, prebuilt) = match &f.devcontainer.image {
+        Some(image) => (image.clone(), toto::image::inspect(bin, image, true)?, false),
+        None => {
+            let network = cfg.sandbox_network().ok_or("this project publishes no image, so it has to be prebuilt here, and a prebuild needs the fenced network: run `toto net-setup --apply` and set `network` in the sandbox config")?;
+            let pb = toto::prebuild::Prebuild { bin: bin.into(), cli: toto::prebuild::DEFAULT_CLI.into(), network: network.into(), work_dir: cfg.state_dir.join("prebuild") };
+            println!("prebuilding {repo} (build, onCreateCommand, updateContentCommand); this can take a while...");
+            let (tag, info) = pb.build(&format!("https://github.com/{repo}.git"), f.commit.as_deref(), &f.devcontainer.toto.id, &f.devcontainer_text, toto::devcontainer::PATH)?;
+            (tag, info, true)
+        }
+    };
+    Ok(toto::projects::Approval::new(&image, info, &f.agent_files, f.commit.clone(), prebuilt)?)
 }
 
 fn home() -> PathBuf {
@@ -297,7 +274,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cfg = toto::config::Config::starter(&dir);
             let id = hex::encode(cfg.load_or_create_key()?.verifying_key().to_bytes());
             fs::write(&path, serde_json::to_string_pretty(&cfg)?)?;
-            println!("wrote {}\nrunner id: {id}\nNothing will run until you add a trusted project, allowed kinds and a share to the config.", path.display());
+            println!("wrote {}\nrunner id: {id}\nNext: build the relay (`relay` in the sandbox config), `toto login`, `toto projects add owner/name`, `toto doctor`.", path.display());
         }
         Cmd::Run { config, once: false } => {
             let cfg = toto::config::Config::load(&config_path(config))?;
@@ -340,16 +317,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("done; set \"network\": \"{name}\" in the docker sandbox config, then run `toto doctor`");
             }
         }
-        Cmd::ServeQueue { dir, addr, token_file } => {
-            let token = token_file.as_deref().map(toto::claude_cli::read_secret).transpose()?;
-            if token.is_none() && !addr.starts_with("127.") {
-                eprintln!("warning: serving without a token on {addr}; anyone who can reach it can claim tasks and read bundles");
-            }
-            let server = toto::http_queue::serve(std::sync::Arc::new(toto::queue::DirQueue::new(dir)?), &addr, token)?;
-            println!("serving the queue protocol on http://{}", server.addr);
-            shutdown_signal().await;
-            server.stop();
-        }
         Cmd::ProjectKey { out } => {
             let key = toto::manifest::generate_key();
             fs::write(&out, hex::encode(key.to_bytes()))?;
@@ -390,97 +357,99 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     save_config(&path, &cfg)?;
                 }
                 ProjectsCmd::Inspect { repo, token_file, api } => {
-                    let f = fetch_project(&api, &repo, token_file.as_deref())?;
-                    println!("{} ({}), from github:{repo}\n{}\n", f.d.name, f.d.id, f.d.description);
-                    println!("descriptor  {}\n  key fingerprint {}, kinds {}", toto::projects::DESCRIPTOR_PATH, f.d.fingerprint(), f.d.kinds.join(", "));
-                    println!("  needs: network {:?}, context {}, stdio MCP {}, MCP hosts {:?}", f.d.needs.network, f.d.needs.context, f.d.needs.stdio_mcp, f.d.needs.mcp_hosts);
-                    match (&f.d.environment, &f.env) {
-                        (Some(toto::projects::Environment { devcontainer: Some(path), .. }), Some((image, warnings))) => {
-                            println!("\n{path}:\n{}", String::from_utf8_lossy(&f.gh.file(path)?.unwrap_or_default()));
-                            for w in warnings {
-                                println!("  note: {w}");
+                    let gh = github(&api, &repo, token_file.as_deref())?;
+                    let f = toto::projects::fetch(&gh)?;
+                    let t = &f.devcontainer.toto;
+                    println!("{} ({}), from github:{repo} at {}\n{}\n", t.name, t.id, f.commit.as_deref().unwrap_or("?"), t.description);
+                    println!("key fingerprint {}, kinds {}\n", t.public_key.chars().take(16).collect::<String>(), t.kinds.join(", "));
+                    println!("{}:\n{}", toto::devcontainer::PATH, f.devcontainer_text.trim_end());
+                    for n in &f.devcontainer.notes {
+                        println!("  note: {n}");
+                    }
+                    println!("\nagent directory {} ({} files):", f.agent_dir, f.agent_files.len());
+                    match toto::agent::summarize(&f.agent_files) {
+                        Ok(s) => {
+                            for l in s.describe() {
+                                println!("  {l}");
                             }
-                            let info = toto::image::inspect(&docker_bin(&cfg)?, image, true)?;
+                        }
+                        Err(e) => println!("  cannot be run: {e}"),
+                    }
+                    if let Some(text) = f.agent_files.get("config.yaml") {
+                        println!("\nconfig.yaml:\n{}", String::from_utf8_lossy(text).trim_end());
+                    }
+                    match &f.devcontainer.image {
+                        Some(image) => {
+                            let bin = cfg.docker_bin().ok_or("configure a docker or podman sandbox first")?;
+                            let info = toto::image::inspect(bin, image, true)?;
                             println!("\nthe image itself:");
                             for l in toto::image::describe(image, &info) {
                                 println!("  {l}");
                             }
                         }
-                        (_, Some((image, _))) => {
-                            let info = toto::image::inspect(&docker_bin(&cfg)?, image, true)?;
-                            println!("\nthe image itself:");
-                            for l in toto::image::describe(image, &info) {
-                                println!("  {l}");
-                            }
-                        }
-                        _ => println!("\nno environment named: its tasks would run in your default sandbox image"),
+                        None => println!("\nno published image: `toto projects add` prebuilds it here from the devcontainer config above"),
                     }
                 }
                 ProjectsCmd::Update { id, token_file, api, yes } => {
                     let repo = cfg.sources.get(&id).cloned().ok_or_else(|| format!("project `{id}` was not added with `toto projects add`"))?;
-                    let f = fetch_project(&api, &repo, token_file.as_deref())?;
-                    if cfg.projects.get(&id) != Some(&f.d.public_key) {
+                    let gh = github(&api, &repo, token_file.as_deref())?;
+                    let f = toto::projects::fetch(&gh)?;
+                    if cfg.projects.get(&id) != Some(&f.devcontainer.toto.public_key) {
                         return Err(format!("{repo} now publishes a different key for `{id}`: if you trust the change, `toto projects remove {id}` and add it again").into());
                     }
-                    let Some((image, _)) = f.env else { return Err("the project names no environment any more".into()) };
-                    let info = toto::image::inspect(&docker_bin(&cfg)?, &image, true)?;
-                    let new = toto::image::EnvApproval { image, info };
-                    match cfg.environments.get(&id) {
-                        Some(old) if old.info.digest == new.info.digest && old.image == new.image => println!("{id}: up to date ({})", old.info.digest),
+                    let old = cfg.environments.get(&id).cloned();
+                    if let Some(old) = &old
+                        && old.prebuilt && old.commit.is_some() && old.commit == f.commit
+                    {
+                        println!("{id}: up to date (commit {})", old.commit.as_deref().unwrap_or(""));
+                        return Ok(());
+                    }
+                    let new = approval_for(&cfg, &repo, &f)?;
+                    match old {
+                        Some(old) if old.info.id == new.info.id && old.agent_hash == new.agent_hash => println!("{id}: up to date ({})", new.info.short()),
                         old => {
-                            println!("{id}: the environment changed since you approved it");
-                            match old {
-                                Some(old) => {
-                                    if old.image != new.image {
-                                        println!("  image {} -> {}", old.image, new.image);
-                                    }
-                                    for l in toto::image::diff(&old.info, &new.info) {
-                                        println!("  {l}");
-                                    }
-                                }
-                                None => {
-                                    for l in toto::image::describe(&new.image, &new.info) {
-                                        println!("  {l}");
-                                    }
-                                }
+                            println!("{id}: changed since you approved it");
+                            let lines = match &old {
+                                Some(old) => old.diff(&new),
+                                None => new.describe(),
+                            };
+                            for l in lines {
+                                println!("  {l}");
                             }
-                            if !confirm(&format!("Approve and pin {}?", new.info.digest), yes)? {
-                                println!("nothing changed; tasks keep running the image you approved");
+                            if !confirm("Approve this version?", yes)? {
+                                println!("nothing changed; tasks keep running what you approved");
                                 return Ok(());
                             }
                             cfg.environments.insert(id.clone(), new);
                             save_config(&path, &cfg)?;
-                            println!("pinned");
+                            println!("approved");
                         }
                     }
                 }
-                ProjectsCmd::Add { repo, share, accept, token_file, api, yes } => {
-                    let f = fetch_project(&api, &repo, token_file.as_deref())?;
-                    let environment = match &f.env {
-                        Some((image, _)) => Some(toto::image::EnvApproval { image: image.clone(), info: toto::image::inspect(&docker_bin(&cfg)?, image, true)? }),
-                        None => None,
-                    };
-                    let opts = toto::projects::AddOptions { share, accept: accept.into_iter().collect(), token_file, environment: environment.clone() };
-                    let mut updated = cfg.clone();
-                    let notes = toto::projects::add(&mut updated, &repo, &f.d, &opts)?;
-                    println!("{} ({}), from github:{repo}\n{}\n", f.d.name, f.d.id, f.d.description);
-                    println!("  key fingerprint  {} (compare it with what the project publishes)", f.d.fingerprint());
-                    println!("  task kinds       {}", f.d.kinds.join(", "));
+                ProjectsCmd::Add { repo, share, token_file, api, yes } => {
+                    let gh = github(&api, &repo, token_file.as_deref())?;
+                    let f = toto::projects::fetch(&gh)?;
+                    let t = &f.devcontainer.toto;
+                    println!("{} ({}), from github:{repo}\n{}\n", t.name, t.id, t.description);
+                    println!("  key fingerprint  {} (compare it with what the project publishes)", t.public_key.chars().take(16).collect::<String>());
+                    println!("  task kinds       {}", t.kinds.join(", "));
                     println!("  share            {}", share.max(1));
+                    for n in &f.devcontainer.notes {
+                        println!("  note: {n}");
+                    }
+                    let approval = approval_for(&cfg, &repo, &f)?;
+                    let opts = toto::projects::AddOptions { share, token_file };
+                    let mut updated = cfg.clone();
+                    let notes = toto::projects::add(&mut updated, &repo, &f.devcontainer, approval.clone(), &opts)?;
+                    println!("\nwhat you are approving:");
+                    for l in approval.describe() {
+                        println!("  {l}");
+                    }
                     for n in &notes {
                         println!("  {n}");
                     }
-                    for w in f.env.iter().flat_map(|e| &e.1) {
-                        println!("  note: devcontainer.json {w}");
-                    }
-                    if let Some(env) = &environment {
-                        println!("\nthe environment you are approving:");
-                        for l in toto::image::describe(&env.image, &env.info) {
-                            println!("  {l}");
-                        }
-                        println!("\n(`toto projects inspect {repo}` also shows the project's devcontainer.json)");
-                    }
-                    if !confirm("Support this project and approve this environment?", yes)? {
+                    println!("\n(`toto projects inspect {repo}` shows the files themselves)");
+                    if !confirm("Support this project and approve this environment and agent?", yes)? {
                         println!("nothing changed");
                         return Ok(());
                     }
@@ -491,7 +460,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Cmd::ResultsToPr { repo, repo_dir, base, projects, token_file, api, max_open, protect } => {
             let token = match &token_file {
-                Some(f) => toto::claude_cli::read_secret(f)?,
+                Some(f) => toto::secrets::read_secret(f)?,
                 None => std::env::var("GITHUB_TOKEN").map_err(|_| "no token: pass --token-file or set GITHUB_TOKEN")?,
             };
             let mut trusted = toto::manifest::TrustedProjects::default();
@@ -509,8 +478,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Cmd::GithubResults { repo, token_file, api, out } => {
-            let token = token_file.as_deref().map(toto::claude_cli::read_secret).transpose()?;
-            let q = toto::github_queue::GitHubQueue::new(&api, &repo, toto::github_queue::DEFAULT_LABEL, token);
+            let q = github(&api, &repo, token_file.as_deref())?;
             fs::create_dir_all(&out)?;
             let results = q.results()?;
             for r in &results {
@@ -521,39 +489,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             println!("{} results", results.len());
         }
-        Cmd::PostTask { key, config, bundle, context, task, github, github_token_file, github_api } => {
+        Cmd::PostTask { key, config, bundle, task, github: gh_repo, github_token_file, github_api } => {
             let cfg = toto::config::Config::load(&config_path(config))?;
             let seed: [u8; 32] = hex::decode(fs::read_to_string(&key)?.trim()).ok().and_then(|b| b.try_into().ok()).ok_or("project key must be a 32-byte hex seed")?;
             let mut manifest: TaskManifest = serde_json::from_slice(&fs::read(&task)?)?;
-            // Where the task and its bundles go: the spool directory, or GitHub issues.
-            let gh = match &github {
-                Some(repo) => {
-                    let token = github_token_file.as_deref().map(toto::claude_cli::read_secret).transpose()?;
-                    Some(toto::github_queue::GitHubQueue::new(&github_api, repo, toto::github_queue::DEFAULT_LABEL, token))
-                }
+            let gh = match &gh_repo {
+                Some(repo) => Some(github(&github_api, repo, github_token_file.as_deref())?),
                 None => None,
             };
             let spool = toto::queue::DirQueue::new(&cfg.queue_dir)?;
-            let store = |bytes: &[u8]| -> Result<String, toto::Error> {
-                match &gh {
-                    Some(g) => g.upload_bundle(bytes),
-                    None => spool.post_bundle(bytes),
-                }
-            };
             if let Some(dir) = bundle {
                 let records = toto::archive::pack_dir(&dir, toto::archive::Limits::new(cfg.policy.max_input_bytes))?;
-                manifest.inputs = store(&toto::archive::to_bytes(&records)?)?;
+                let bytes = toto::archive::to_bytes(&records)?;
+                manifest.inputs = match &gh {
+                    Some(g) => g.upload_bundle(&bytes)?,
+                    None => spool.post_bundle(&bytes)?,
+                };
                 println!("bundled {} files from {} as {}", records.len(), dir.display(), manifest.inputs);
             }
-            if let Some(dir) = context {
-                let limits = toto::archive::Limits::new(cfg.policy.max_context_bytes.max(1 << 20));
-                let bytes = toto::archive::to_bytes(&toto::archive::pack_dir(&dir, limits)?)?;
-                let ctx = toto::context::ProjectContext::parse(&bytes, limits)?; // same checks the runner applies
-                manifest.context = Some(store(&bytes)?);
-                println!("context from {}: {}", dir.display(), ctx.summary());
-            }
             let signed = manifest.sign(&ed25519_dalek::SigningKey::from_bytes(&seed))?;
-            match (&gh, &github) {
+            match (&gh, &gh_repo) {
                 (Some(g), Some(repo)) => println!("posted {} as issue #{} in {repo}", manifest.id, g.post_task(&signed)?),
                 _ => {
                     spool.post(&signed)?;
@@ -564,8 +519,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Login { config } => {
             let cfg = toto::config::Config::load(&config_path(config))?;
             let token_file = match &cfg.harness {
-                toto::config::HarnessConfig::Claude { token_file, .. } => token_file.clone().unwrap_or_else(|| cfg.token_path()),
-                _ => return Err("config.harness.kind is not `claude`".into()),
+                toto::config::HarnessConfig::Omnigent { provider: toto::config::ProviderConfig::Anthropic, token_file, .. } => token_file.clone().unwrap_or_else(|| cfg.token_path()),
+                _ => return Err("login is for the Anthropic subscription; set harness.provider to anthropic (for openai, point api_key_file at a key file)".into()),
             };
             fs::create_dir_all(&cfg.state_dir)?;
             println!("Running `claude setup-token`. Complete the browser sign-in, then paste the token it prints.");
@@ -574,7 +529,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if token.trim().is_empty() {
                 return Err("no token entered".into());
             }
-            toto::claude_cli::save_token(&token_file, &token)?;
+            toto::secrets::save_token(&token_file, &token)?;
             println!("saved to {} (mode 600). It never leaves this machine.", token_file.display());
         }
         Cmd::Status { config } => {
@@ -622,11 +577,7 @@ fn demo() -> Result<(), Box<dyn std::error::Error>> {
         max_profile: SandboxProfile::default(),
         abort_margin_pct: 25,
         available_tools: vec!["echo".into()],
-        allow_context: false,
-                allow_stdio_mcp: false,
-        allowed_mcp_hosts: vec![],
-        max_context_bytes: 64 * 1024,
-                max_input_bytes: 64 * 1024 * 1024,
+        max_input_bytes: 64 * 1024 * 1024,
     };
     let queue = InMemoryQueue::default();
     queue.post(
@@ -641,7 +592,6 @@ fn demo() -> Result<(), Box<dyn std::error::Error>> {
             cost_estimate: 500,
             output_schema: OutputSchema { format: "text".into(), max_bytes: 4096, max_artifact_bytes: 0 },
             redundancy: 1,
-            context: Default::default(),
         }
         .sign(&project_key)?,
     );

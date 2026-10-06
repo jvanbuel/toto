@@ -2,22 +2,21 @@
 
 use crate::manifest::{SandboxProfile, TaskManifest};
 use crate::{Error, Result};
-use std::path::PathBuf;
 use std::io::Read as _;
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-/// Where the MCP exec bridge appears inside a container sandbox.
-pub const BRIDGE_PATH: &str = "/toto/mcp-exec";
-/// Where the credential proxy's unix socket and the agent binary appear inside the container.
+/// Where the static relay binary appears inside a container.
+pub const RELAY_PATH: &str = "/toto/relay";
+/// Where the credential proxy's unix socket appears inside the container.
 pub const PROXY_SOCKET_PATH: &str = "/toto/proxy.sock";
-pub const AGENT_DIR: &str = "/toto/agent";
 /// Loopback address the in-container relay serves; the agent's API base URL points here.
 pub const PROXY_ADDR: &str = "127.0.0.1:8080";
 
 /// An isolated workspace for one task. Dropping it must destroy the environment.
 pub trait Sandbox: Send {
-    /// Checks at daemon start that this backend works here (binary present, image pulled...).
+    /// Checks at daemon start that this backend works here (binary present, images pulled...).
     fn probe(&self) -> Result<()> {
         Ok(())
     }
@@ -31,8 +30,8 @@ pub trait Sandbox: Send {
         host_put_inputs(ws, bundle, max_bytes)
     }
 
-    /// Archive (toto format) of files changed, added or deleted since `put_inputs`, at most
-    /// `max_bytes` of content.
+    /// Archive (tar) of files changed, added or deleted since `put_inputs`, at most `max_bytes`
+    /// of content.
     fn collect_outputs(&self, ws: &Workspace, max_bytes: u64) -> Result<Vec<u8>> {
         host_collect_outputs(ws, max_bytes)
     }
@@ -46,7 +45,6 @@ fn baseline_path(ws: &Workspace) -> Result<PathBuf> {
 fn host_put_inputs(ws: &Workspace, bundle: &[u8], max_bytes: u64) -> Result<()> {
     let records = crate::archive::from_bytes(bundle, crate::archive::Limits::new(max_bytes)).map_err(Error::Sandbox)?;
     crate::archive::unpack_to(&ws.path, &records).map_err(Error::Sandbox)?;
-    // Merge with any earlier baseline (inputs, then context).
     let mut base: std::collections::BTreeMap<String, String> = std::fs::read(baseline_path(ws)?).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     base.extend(crate::archive::baseline_of(&records));
     std::fs::write(baseline_path(ws)?, serde_json::to_vec(&base)?)?;
@@ -80,33 +78,19 @@ impl<T: Sandbox + ?Sized> Sandbox for Box<T> {
     }
 }
 
-impl Workspace {
-    /// Command that starts the MCP exec bridge inside this sandbox (container sandboxes with a
-    /// bridge only). The runner generates it; projects can never influence it.
-    pub fn bridge_argv(&self) -> Option<Vec<String>> {
-        let mut v = self.exec_prefix.clone();
-        (self.bridge && !v.is_empty()).then(|| {
-            v.push(BRIDGE_PATH.into());
-            v
-        })
-    }
-}
-
 #[derive(Debug)]
 pub struct Workspace {
     pub task_id: String,
     /// Host-visible directory (only `DirSandbox`; empty for container sandboxes, which hold
     /// no host filesystem).
     pub path: PathBuf,
-    /// Command prefix the harness uses to run a command *inside* the sandbox (ADR 5), e.g.
-    /// `docker exec -i <container> <cmd>`. Empty for `DirSandbox`.
+    /// Command prefix the harness uses to run a command *inside* the sandbox, e.g.
+    /// `docker exec -i <container>`. Empty for `DirSandbox`.
     pub exec_prefix: Vec<String>,
-    /// True when the bridge binary is mounted at `BRIDGE_PATH`.
-    pub bridge: bool,
 }
 
-/// **Not isolating.** A plain temp directory for the spike and tests; it enforces none of the
-/// profile. The Docker/microVM implementation (milestone 1) replaces it for real use.
+/// **Not isolating.** A plain temp directory for the demo and tests; it enforces none of the
+/// profile.
 pub struct DirSandbox {
     pub root: PathBuf,
 }
@@ -115,7 +99,7 @@ impl Sandbox for DirSandbox {
     fn create(&self, task: &TaskManifest, _profile: &SandboxProfile) -> Result<Workspace> {
         let path = self.root.join(&task.id);
         std::fs::create_dir_all(&path)?;
-        Ok(Workspace { task_id: task.id.clone(), path, exec_prefix: vec![], bridge: false })
+        Ok(Workspace { task_id: task.id.clone(), path, exec_prefix: vec![] })
     }
 
     fn destroy(&self, ws: Workspace) -> Result<()> {
@@ -127,11 +111,19 @@ impl Sandbox for DirSandbox {
     }
 }
 
-/// Hardened Docker/Podman sandbox: one throwaway container per task.
+/// The approved environment a project's tasks run in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Environment {
+    /// Pinned image reference: `repo@sha256:...` or an image id.
+    pub image: String,
+    /// Tasks get the fenced network (the approved agent needs one).
+    pub network: bool,
+}
+
+/// Hardened Docker/Podman sandbox: one throwaway container per task, in the project's approved image.
 ///
-/// - no network (`--network none`) unless the contributor named a fenced `network` (`netfence`) *and*
-///   the task has egress rules; the rules are enforced by Omnigent inside the container. Without
-///   `network`, tasks asking for rules are refused (fail closed); `probe` checks the fence;
+/// - no network (`--network none`) unless the approved agent needs one, and then only the fenced
+///   bridge the contributor named (`netfence`); without one such tasks are refused (fail closed);
 /// - read-only root, all capabilities dropped, `no-new-privileges`, non-root user;
 /// - no host mounts: the workspace is a size-limited tmpfs inside the container;
 /// - CPU, memory and pids limits from the profile;
@@ -141,34 +133,28 @@ impl Sandbox for DirSandbox {
 pub struct DockerSandbox {
     /// `docker` or `podman`.
     pub bin: String,
-    /// The image for tasks of projects without their own.
-    pub image: String,
-    /// The environment image each project names (project id to image); see `devcontainer`.
-    pub images: std::collections::HashMap<String, String>,
     pub runtime: Option<String>,
     pub workspace_mb: u32,
-    /// Static `toto-mcp-exec` binary to mount read-only at `BRIDGE_PATH`: the only host path a
-    /// task container can see.
-    pub bridge: Option<PathBuf>,
+    /// The approved environment per project id. A task from a project without one is refused.
+    pub environments: std::collections::HashMap<String, Environment>,
+    /// Static `toto-relay` binary mounted read-only at `RELAY_PATH`: the only host path a task
+    /// container can see. Needed when `proxy_socket` is set.
+    pub relay: Option<PathBuf>,
     /// Credential proxy socket (host side), bind-mounted at `PROXY_SOCKET_PATH`. When set, a
-    /// loopback relay to it is started inside the container at `PROXY_ADDR` (ADR 12).
+    /// loopback relay to it is started inside the container at `PROXY_ADDR`.
     pub proxy_socket: Option<PathBuf>,
-    /// Seccomp profile file. `None` keeps Docker's default; `toto`'s opt-in profile allows a nested
+    /// Seccomp profile file. `None` keeps Docker's default; toto's opt-in profile allows a nested
     /// bubblewrap (see `profiles/README.md`).
     pub seccomp_profile: Option<PathBuf>,
-    /// Name of a fenced user-defined docker network (see `netfence`) for tasks that carry egress
-    /// rules. `None` (the default): such tasks are refused.
+    /// Name of a fenced user-defined docker network (see `netfence`) for agents that need one.
     pub network: Option<String>,
-    /// Agent CLI files mounted read-only under `AGENT_DIR`, each under its own file name. The
-    /// first is the executable; companions (e.g. Codex's `codex-code-mode-host`) must sit next to it.
-    pub agent_files: Vec<PathBuf>,
     /// Content baselines of unpacked inputs, by task id (kept on the host, never in the container).
     baselines: std::sync::Mutex<std::collections::HashMap<String, std::collections::BTreeMap<String, String>>>,
 }
 
 impl DockerSandbox {
-    pub fn new(image: impl Into<String>) -> Self {
-        Self { bin: "docker".into(), image: image.into(), images: Default::default(), runtime: None, workspace_mb: 512, bridge: None, proxy_socket: None, seccomp_profile: None, network: None, agent_files: vec![], baselines: Default::default() }
+    pub fn new() -> Self {
+        Self { bin: "docker".into(), runtime: None, workspace_mb: 512, environments: Default::default(), relay: None, proxy_socket: None, seccomp_profile: None, network: None, baselines: Default::default() }
     }
 
     pub fn container_name(task_id: &str) -> String {
@@ -176,39 +162,24 @@ impl DockerSandbox {
         format!("toto-{safe}")
     }
 
-    /// The image a project's tasks run in: the one it names, else the runner's default.
-    pub fn image_for(&self, project: &str) -> &str {
-        self.images.get(project).map_or(self.image.as_str(), String::as_str)
-    }
-
-    /// Every distinct image this sandbox may start.
-    fn all_images(&self) -> Vec<&str> {
-        let mut v = vec![self.image.as_str()];
-        for i in self.images.values() {
-            if !v.contains(&i.as_str()) {
-                v.push(i);
-            }
-        }
-        v
-    }
-
-    /// The `run` argument list for the default image.
-    pub fn run_args(&self, task_id: &str, p: &SandboxProfile) -> Result<Vec<String>> {
-        self.run_args_for(task_id, &self.image, p)
+    pub fn environment_for(&self, project: &str) -> Result<&Environment> {
+        self.environments.get(project).ok_or_else(|| Error::Sandbox(format!("no approved environment for project `{project}` (`toto projects add`)")))
     }
 
     /// The `run` argument list; pure so the hardening flags are unit-tested without a daemon.
-    pub fn run_args_for(&self, task_id: &str, image: &str, p: &SandboxProfile) -> Result<Vec<String>> {
-        let net = match (&self.network, p.network_allowlist.is_empty()) {
-            (_, true) => "none",
-            (Some(name), false) => name.as_str(),
-            (None, false) => return Err(Error::Sandbox("the task wants network access but this sandbox has no `network` configured; refusing to run".into())),
+    pub fn run_args(&self, task_id: &str, env: &Environment, p: &SandboxProfile) -> Result<Vec<String>> {
+        let net = match (&self.network, env.network) {
+            (_, false) => "none",
+            (Some(name), true) => name.as_str(),
+            (None, true) => return Err(Error::Sandbox("this project's agent needs a network but the sandbox has no fenced `network` configured (`toto net-setup`); refusing to run".into())),
         };
         let mut a: Vec<String> = [
             "run", "-d", "--rm", "--name", &Self::container_name(task_id),
             "--network", net, "--read-only", "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges", "--user", "65534:65534",
             "--pids-limit", "256", "--workdir", "/workspace",
+            // A prebuilt snapshot may carry the devcontainer CLI's entrypoint; tasks never use it.
+            "--entrypoint", "",
         ]
         .map(String::from)
         .into();
@@ -216,10 +187,10 @@ impl DockerSandbox {
             "--cpus".into(), format!("{:.2}", p.cpu_millis as f64 / 1000.0),
             "--memory".into(), format!("{}m", p.memory_mb),
             "--tmpfs".into(), format!("/workspace:rw,noexec,nosuid,mode=1777,size={}m", self.workspace_mb),
-            "--tmpfs".into(), "/tmp:rw,noexec,nosuid,mode=1777,size=64m".into(),
+            "--tmpfs".into(), "/tmp:rw,nosuid,mode=1777,size=256m".into(),
         ]);
-        if let Some(b) = &self.bridge {
-            a.extend(["--mount".into(), format!("type=bind,src={},dst={BRIDGE_PATH},readonly", b.display())]);
+        if let Some(b) = &self.relay {
+            a.extend(["--mount".into(), format!("type=bind,src={},dst={RELAY_PATH},readonly", b.display())]);
         }
         if let Some(profile) = &self.seccomp_profile {
             a.extend(["--security-opt".into(), format!("seccomp={}", profile.display())]);
@@ -227,13 +198,10 @@ impl DockerSandbox {
         if let Some(sock) = &self.proxy_socket {
             a.extend(["--mount".into(), format!("type=bind,src={},dst={PROXY_SOCKET_PATH}", sock.display())]);
         }
-        for f in &self.agent_files {
-            a.extend(["--mount".into(), format!("type=bind,src={},dst={AGENT_DIR}/{},readonly", f.display(), f.file_name().unwrap_or_default().to_string_lossy())]);
-        }
         if let Some(rt) = &self.runtime {
             a.extend(["--runtime".into(), rt.clone()]);
         }
-        a.extend([image.to_string(), "sleep".into(), p.timeout_secs.to_string()]);
+        a.extend([env.image.clone(), "sleep".into(), p.timeout_secs.to_string()]);
         Ok(a)
     }
 
@@ -245,43 +213,40 @@ impl DockerSandbox {
             Err(Error::Sandbox(String::from_utf8_lossy(&out.stderr).trim().to_string()))
         }
     }
-}
-
-impl DockerSandbox {
-    /// Path of the agent executable inside the container, if agent files are configured.
-    pub fn agent_exe(&self) -> Option<String> {
-        self.agent_files.first().map(|f| format!("{AGENT_DIR}/{}", f.file_name().unwrap_or_default().to_string_lossy()))
-    }
 
     /// Starts the loopback relay to the credential proxy inside the container and waits until it
-    /// accepts connections. Needs the bridge binary (which provides `relay` and `probe`).
+    /// accepts connections.
     fn start_relay(&self, container: &str) -> Result<()> {
-        if self.bridge.is_none() {
-            return Err(Error::Sandbox("the credential proxy relay needs the bridge binary".into()));
+        if self.relay.is_none() {
+            return Err(Error::Sandbox("the credential proxy needs the relay binary (`relay` in the sandbox config)".into()));
         }
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        self.docker(&s(&["exec", "-d", container, BRIDGE_PATH, "relay", PROXY_ADDR, PROXY_SOCKET_PATH]))?;
+        self.docker(&s(&["exec", "-d", container, RELAY_PATH, "relay", PROXY_ADDR, PROXY_SOCKET_PATH]))?;
         for _ in 0..50 {
-            if self.docker(&s(&["exec", container, BRIDGE_PATH, "probe", PROXY_ADDR])).is_ok() {
+            if self.docker(&s(&["exec", container, RELAY_PATH, "probe", PROXY_ADDR])).is_ok() {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(100));
         }
         Err(Error::Sandbox("the credential proxy relay did not start".into()))
     }
-}
 
-impl DockerSandbox {
-    /// The image must be present; a project's image that is not is pulled (the contributor's docker
-    /// does the pulling; tasks never get network for it).
+    /// The image must be present. A pulled image (`repo@digest`) that is missing is pulled again;
+    /// one built here cannot be, so the project must be updated.
     fn ensure_image(&self, image: &str) -> Result<()> {
         if self.docker(&["image".into(), "inspect".into(), image.into()]).is_ok() {
             return Ok(());
         }
-        if image == self.image {
-            return Err(Error::Sandbox(format!("image `{image}` not present; run `{} pull {image}`", self.bin)));
+        if !image.contains('@') {
+            return Err(Error::Sandbox(format!("approved image `{image}` is no longer on this machine; run `toto projects update`")));
         }
-        self.docker(&["pull".into(), "-q".into(), image.into()]).map(|_| ()).map_err(|e| Error::Sandbox(format!("could not pull the project's image `{image}`: {e}")))
+        self.docker(&["pull".into(), "-q".into(), image.into()]).map(|_| ()).map_err(|e| Error::Sandbox(format!("could not pull the approved image `{image}`: {e}")))
+    }
+}
+
+impl Default for DockerSandbox {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -289,29 +254,29 @@ impl Sandbox for DockerSandbox {
     fn probe(&self) -> Result<()> {
         self.docker(&["version".into(), "--format".into(), "{{.Server.Version}}".into()])
             .map_err(|e| Error::Sandbox(format!("{} daemon unreachable: {e}", self.bin)))?;
-        for image in self.all_images() {
-            self.ensure_image(image)?;
-            if let Some(net) = &self.network {
-                crate::netfence::verify(&self.bin, net, image)?;
+        if let Some(r) = &self.relay
+            && !r.is_file()
+        {
+            return Err(Error::Sandbox(format!("relay binary {} not found", r.display())));
+        }
+        for env in self.environments.values() {
+            self.ensure_image(&env.image)?;
+            if env.network && self.network.is_none() {
+                return Err(Error::Sandbox(format!("image `{}` needs a network but no fenced `network` is configured (`toto net-setup`)", env.image)));
             }
-            if let Some(exe) = self.agent_exe() {
-                // The mounted agent must run in this image (the Claude CLI is a glibc binary: Alpine/musl images will not do).
-                let mut args: Vec<String> = ["run", "--rm", "--network", "none"].map(String::from).into();
-                for f in &self.agent_files {
-                    args.extend(["--mount".into(), format!("type=bind,src={},dst={AGENT_DIR}/{},readonly", f.display(), f.file_name().unwrap_or_default().to_string_lossy())]);
-                }
-                args.extend([image.to_string(), exe, "--version".into()]);
-                self.docker(&args)
-                    .map_err(|e| Error::Sandbox(format!("the agent binary does not run in image `{image}` (it needs a glibc-based image such as debian or ubuntu): {e}")))?;
-            }
+        }
+        if let Some(net) = &self.network
+            && let Some(env) = self.environments.values().next()
+        {
+            crate::netfence::verify(&self.bin, net, &env.image)?;
         }
         Ok(())
     }
 
     fn create(&self, task: &TaskManifest, profile: &SandboxProfile) -> Result<Workspace> {
-        let image = self.image_for(&task.project_id);
-        self.ensure_image(image)?;
-        let args = self.run_args_for(&task.id, image, profile)?;
+        let env = self.environment_for(&task.project_id)?;
+        self.ensure_image(&env.image)?;
+        let args = self.run_args(&task.id, env, profile)?;
         let name = Self::container_name(&task.id);
         // A container left behind by a crash or an aborted run would block a retry of this task.
         let _ = self.docker(&["rm".into(), "-f".into(), name.clone()]);
@@ -320,7 +285,7 @@ impl Sandbox for DockerSandbox {
         if self.proxy_socket.is_some() {
             self.start_relay(&name)?;
         }
-        Ok(Workspace { task_id: task.id.clone(), path: PathBuf::new(), exec_prefix, bridge: self.bridge.is_some() })
+        Ok(Workspace { task_id: task.id.clone(), path: PathBuf::new(), exec_prefix })
     }
 
     fn put_inputs(&self, ws: &Workspace, bundle: &[u8], max_bytes: u64) -> Result<()> {
@@ -443,81 +408,4 @@ pub fn exec_io(ws: &Workspace, argv: &[&str], input: Option<&[u8]>, timeout: Dur
         return Err(Error::Sandbox(format!("output exceeds {max_out} bytes")));
     }
     Ok(Output { status, stdout, stderr: err.join().unwrap_or_default() })
-}
-
-/// bubblewrap sandbox (Linux): no daemon or image needed. Each exec is a fresh `bwrap` with
-/// an empty root (read-only `/usr`, `/bin`, `/lib*`), no network, a fresh pid/ipc/uts/user
-/// namespace, a cleared environment and a single writable scratch directory at `/workspace`.
-///
-/// Limits are weaker than a container: `prlimit` bounds processes, CPU seconds and data
-/// segment size (an approximation of the memory limit); there is no pids/cgroup accounting.
-pub struct BwrapSandbox {
-    pub bin: String,
-    /// Host directory holding per-task scratch dirs; the only host path a task can touch.
-    pub root: PathBuf,
-}
-
-impl BwrapSandbox {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { bin: "bwrap".into(), root: root.into() }
-    }
-
-    /// Everything up to the user command; pure apart from reading the host's `/bin` layout.
-    pub fn prefix(&self, host_dir: &std::path::Path, p: &SandboxProfile) -> Result<Vec<String>> {
-        if !p.network_allowlist.is_empty() {
-            return Err(Error::Sandbox("network allowlists are not supported yet; refusing to run".into()));
-        }
-        let mut a: Vec<String> = [
-            &self.bin[..], "--unshare-all", "--die-with-parent", "--new-session", "--clearenv", "--cap-drop", "ALL",
-            "--uid", "65534", "--gid", "65534", "--ro-bind", "/usr", "/usr",
-        ]
-        .map(String::from)
-        .into();
-        for d in ["bin", "sbin", "lib", "lib64"] {
-            let host = PathBuf::from("/").join(d);
-            match std::fs::read_link(&host) {
-                Ok(target) => a.extend(["--symlink".into(), target.to_string_lossy().into(), format!("/{d}")]),
-                Err(_) if host.is_dir() => a.extend(["--ro-bind".into(), format!("/{d}"), format!("/{d}")]),
-                Err(_) => {}
-            }
-        }
-        a.extend(["--ro-bind-try", "/etc/ld.so.cache", "/etc/ld.so.cache", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"].map(String::from));
-        a.extend(["--bind".into(), host_dir.to_string_lossy().into(), "/workspace".into(), "--chdir".into(), "/workspace".into()]);
-        a.extend(["--setenv", "HOME", "/workspace", "--setenv", "PATH", "/usr/bin:/bin"].map(String::from));
-        a.extend([
-            "prlimit".into(), "--nproc=256".into(), format!("--cpu={}", p.timeout_secs),
-            format!("--data={}", p.memory_mb as u64 * 1024 * 1024),
-        ]);
-        Ok(a)
-    }
-}
-
-impl Sandbox for BwrapSandbox {
-    fn probe(&self) -> Result<()> {
-        let dir = self.root.join(".probe");
-        std::fs::create_dir_all(&dir)?;
-        let ws = Workspace { task_id: "probe".into(), path: dir.clone(), exec_prefix: self.prefix(&dir, &SandboxProfile::default())?, bridge: false };
-        let out = exec(&ws, &["true"], Duration::from_secs(10)).map_err(|e| Error::Sandbox(format!("bwrap unusable: {e}")))?;
-        let _ = std::fs::remove_dir_all(dir);
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(Error::Sandbox(format!("bwrap probe failed: {}", String::from_utf8_lossy(&out.stderr).trim())))
-        }
-    }
-
-    fn create(&self, task: &TaskManifest, profile: &SandboxProfile) -> Result<Workspace> {
-        let path = self.root.join(DockerSandbox::container_name(&task.id));
-        std::fs::create_dir_all(&path)?;
-        let exec_prefix = self.prefix(&path, profile)?;
-        Ok(Workspace { task_id: task.id.clone(), path, exec_prefix, bridge: false })
-    }
-
-    fn destroy(&self, ws: Workspace) -> Result<()> {
-        if let Ok(b) = baseline_path(&ws) {
-            let _ = std::fs::remove_file(b);
-        }
-        let _ = std::fs::remove_dir_all(ws.path);
-        Ok(())
-    }
 }

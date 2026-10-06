@@ -1,46 +1,27 @@
-//! Harness seam (ADR 4): Omnigent is the primary implementation, behind this trait.
+//! Harness seam (ADR 4): Omnigent is the implementation, behind this trait so tests can use a stub.
 
-use crate::context::ProjectContext;
 use crate::manifest::TaskManifest;
 use crate::meter::UsageMeter;
 use crate::sandbox::Workspace;
 use crate::Result;
 
 pub trait Harness: Send {
-    /// Checks at daemon start that the harness is installed and usable.
+    /// Checks at daemon start that the harness is usable.
     fn probe(&self) -> Result<()> {
         Ok(())
     }
 
-    /// Whether the harness wants the project's context files (skills, CLAUDE.md, .mcp.json)
-    /// unpacked into the task workspace instead of receiving them as parsed data.
-    fn context_in_workspace(&self) -> bool {
-        false
-    }
-
-    /// Whether this harness can deliver project-supplied skills and MCP servers (ADR 9).
-    /// Tasks carrying context are refused by harnesses that cannot.
-    fn supports_context(&self) -> bool {
-        false
-    }
-
     /// Runs the task against the workspace, reporting every usage increment to `meter`
     /// and aborting with its error when a limit is hit. Returns the raw output.
-    fn run(&self, task: &TaskManifest, ctx: &ProjectContext, ws: &Workspace, meter: &mut UsageMeter) -> Result<String>;
+    fn run(&self, task: &TaskManifest, ws: &Workspace, meter: &mut UsageMeter) -> Result<String>;
 }
 
 impl<T: Harness + ?Sized> Harness for Box<T> {
     fn probe(&self) -> Result<()> {
         (**self).probe()
     }
-    fn supports_context(&self) -> bool {
-        (**self).supports_context()
-    }
-    fn context_in_workspace(&self) -> bool {
-        (**self).context_in_workspace()
-    }
-    fn run(&self, task: &TaskManifest, ctx: &ProjectContext, ws: &Workspace, meter: &mut UsageMeter) -> Result<String> {
-        (**self).run(task, ctx, ws, meter)
+    fn run(&self, task: &TaskManifest, ws: &Workspace, meter: &mut UsageMeter) -> Result<String> {
+        (**self).run(task, ws, meter)
     }
 }
 
@@ -50,7 +31,7 @@ pub struct EchoHarness {
 }
 
 impl Harness for EchoHarness {
-    fn run(&self, task: &TaskManifest, _ctx: &ProjectContext, _ws: &Workspace, meter: &mut UsageMeter) -> Result<String> {
+    fn run(&self, task: &TaskManifest, _ws: &Workspace, meter: &mut UsageMeter) -> Result<String> {
         meter.record(self.tokens_per_run)?;
         Ok(format!("echo: {}", task.prompt))
     }

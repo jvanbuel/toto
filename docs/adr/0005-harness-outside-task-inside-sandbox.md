@@ -1,6 +1,6 @@
 # 5. Harness outside, task inside the sandbox
 
-- Status: Proposed
+- Status: Superseded by ADR 13; was: Proposed
 - Date: 2026-10-04
 
 ## Context

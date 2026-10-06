@@ -8,20 +8,16 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxProfile {
-    /// Egress rules in Omnigent's DSL (`METHODS host/path`, e.g. `GET api.github.com/repos/org/**`).
-    /// Empty means no network at all. The runner only validates and passes them on; Omnigent inside
-    /// the container enforces them.
-    #[serde(default)]
-    pub network_allowlist: Vec<String>,
     pub cpu_millis: u32,
     pub memory_mb: u32,
     pub timeout_secs: u64,
 }
 
 impl Default for SandboxProfile {
-    /// The strictest profile: no network, one CPU, 1 GiB, 10 minutes.
+    /// The strictest profile: one CPU, 1 GiB, 10 minutes. Network is the project's business
+    /// (its approved agent directory), never the task's.
     fn default() -> Self {
-        Self { network_allowlist: vec![], cpu_millis: 1000, memory_mb: 1024, timeout_secs: 600 }
+        Self { cpu_millis: 1000, memory_mb: 1024, timeout_secs: 600 }
     }
 }
 
@@ -39,9 +35,6 @@ fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
-/// MCP server name the runner reserves for its own exec bridge; projects cannot use it.
-pub const BRIDGE_SERVER_NAME: &str = "sandbox";
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskManifest {
     pub id: String,
@@ -57,10 +50,6 @@ pub struct TaskManifest {
     pub cost_estimate: u64,
     pub output_schema: OutputSchema,
     pub redundancy: u32,
-    /// SHA-256 (hex) of a context tar: `.mcp.json`, `.claude/skills/`, `AGENTS.md`/`CLAUDE.md`
-    /// (ADR 9). Fetched from the queue like `inputs`; absent means no project context.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<String>,
 }
 
 /// DSSE payload type of a signed task manifest.
@@ -105,15 +94,4 @@ pub fn generate_key() -> SigningKey {
     let mut seed = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut seed);
     SigningKey::from_bytes(&seed)
-}
-
-/// Whether `rule` is a well-formed Omnigent egress rule: `METHODS host/path`, where METHODS is `*`
-/// or comma-separated upper-case verbs, host is a DNS-safe name (optionally `*.domain`) and the
-/// path starts with `/`.
-pub fn valid_egress_rule(rule: &str) -> bool {
-    let Some((methods, target)) = rule.split_once(' ') else { return false };
-    let methods_ok = methods == "*" || methods.split(',').all(|m| !m.is_empty() && m.bytes().all(|b| b.is_ascii_uppercase()));
-    let Some((host, path)) = target.split_once('/') else { return false };
-    let host = host.strip_prefix("*.").unwrap_or(host);
-    methods_ok && !host.is_empty() && host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') && !path.contains(char::is_whitespace)
 }

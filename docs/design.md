@@ -98,8 +98,8 @@ A task is a self-contained, signed manifest plus an input bundle; runners need n
 | Policy engine | Holds the contributor's consent: caps per day/week, per-project resource shares, quiet hours, allowed projects and task kinds, review-before-submit toggle |
 | Queue client | Authenticates the runner (its own keypair, not the AI account), claims leases, renews heartbeats, submits results |
 | Manifest verifier | Checks project signature, schema and that the sandbox profile is within contributor policy |
-| Harness (Omnigent) | A `Harness` trait implemented on top of a local [Omnigent](https://github.com/omnigent-ai/omnigent) server, which drives Claude Code, Codex, Cursor, raw API keys and more non-interactively and reports usage (see ADR 4) |
-| Sandbox manager | Spins up an isolated container/microVM per task, mounts inputs read-only, applies network allowlist and limits |
+| Harness (Omnigent) | A `Harness` trait; as built, it runs the project's own Omnigent agent directory inside the project's image, behind the credential proxy (ADR 13) |
+| Sandbox manager | Starts a hardened container per task from the project's approved dev container image, unpacks inputs, applies limits; no network unless the agent needs one and the contributor fenced it (ADR 13) |
 | Usage meter | Tracks tokens/minutes per task against caps; hard-stops a task that exceeds its estimate by a set margin |
 | Result packager | Validates output against `output_schema`, hashes it, signs it with the runner key, attaches run metadata |
 | Local audit log | Append-only record of every task, project and cost, viewable in the TUI and exportable |
@@ -118,7 +118,7 @@ A task is a self-contained, signed manifest plus an input bundle; runners need n
 
 **Credential handling**
 
-The hardest design point: the AI tool needs its login inside the sandbox, but task content must not be able to read it. Options, in order of preference:
+The hardest design point: the AI tool needs its login inside the sandbox, but task content must not be able to read it. As built (ADR 12, 13): the third option, a host-side proxy. The options considered, in the original order of preference:
 
 - Run the tool outside the sandbox and give it only the sandboxed workspace (tool trusted, task untrusted).
 - Inject a short-lived, scoped token where the provider supports it.

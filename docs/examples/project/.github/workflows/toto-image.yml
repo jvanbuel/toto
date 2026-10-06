@@ -1,9 +1,11 @@
-# Builds the environment image and publishes it where `.devcontainer/toto/devcontainer.json` points.
+# Builds the dev container image with the spec's reference CLI and publishes it where
+# `.devcontainer/devcontainer.json` names it (customizations.toto.image). Contributors then pull
+# that image instead of prebuilding on their own machines.
 name: toto image
 on:
   push:
     branches: [main]
-    paths: [environment/**]
+    paths: [.devcontainer/**]
   workflow_dispatch:
 permissions:
   contents: read
@@ -18,8 +20,5 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
-        with:
-          context: environment
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/toto-env:1.0
+      - run: npm install -g @devcontainers/cli
+      - run: devcontainer build --workspace-folder . --image-name ghcr.io/${{ github.repository_owner }}/toto-env:1.0 --push

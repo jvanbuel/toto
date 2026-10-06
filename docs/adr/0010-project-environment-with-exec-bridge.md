@@ -1,6 +1,6 @@
 # 10. Project-defined environment in the sandbox, reached through an MCP exec bridge
 
-- Status: Proposed (route prototyped; see "Verified")
+- Status: Superseded by ADR 13; was: Proposed (route prototyped; see "Verified")
 - Date: 2026-10-04
 - Refines: ADR 5 and ADR 9
 

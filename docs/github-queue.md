@@ -11,7 +11,7 @@ The first queue for toto (ADR 1's "simpler v1 option"): no server to run. A proj
 | Thing | GitHub object | Who writes it |
 |---|---|---|
 | Task | An open issue labelled `toto`. The body starts with `<!-- toto:task -->` and holds the signed envelope in a ```` ```json ```` block. | The project |
-| Input bundle, context bundle | A release asset named by its SHA-256 on the pre-release tagged `toto-bundles` | The project |
+| Input bundle | A release asset named by its SHA-256 on the pre-release tagged `toto-bundles` | The project |
 | Lease | A *claim comment*: `<!-- toto:claim runner=<id> lease=<secs> released=0\|1 beat=<n> -->` | The runner |
 | Heartbeat, release | An **edit** of the runner's own claim comment (`released=1` ends the lease at once) | The runner |
 | Result | One or more *result comments*: `<!-- toto:result runner=<id> sum=<12 hex> part=i/n -->` plus a ```` ```json ```` block holding the signed result, split at 60,000 bytes, at most 8 parts | The runner |
@@ -27,7 +27,7 @@ A task is offered when it is open, has no lease and has no complete, correctly s
 ## Limits
 
 - **Result size.** A result (output plus artifacts, base64) must fit 8 comments, about 480 KB; submit fails with a clear message otherwise. Projects set `max_artifact_bytes` accordingly.
-- **Latency and rate.** A runner polls issues, then the comments of each issue that has any. Fine for a pilot with a modest number of open tasks; a busy queue wants the HTTP coordinator (`docs/queue-protocol.md`).
+- **Latency and rate.** A runner polls issues, then the comments of each issue that has any. Fine for a pilot with a modest number of open tasks; a busy queue wants a coordinator (`docs/queue-protocol.md`).
 - **Redundancy.** The first complete result closes the task for everyone; `redundancy > 1` is not honoured by this queue.
 
 ## Trust
@@ -61,7 +61,7 @@ Pushes made with the Action's default `GITHUB_TOKEN` do not trigger other workfl
 ## Project side
 
 ```
-toto post-task --key project.key --config cfg.json --github org/project --github-token-file gh.token task.json [--bundle dir] [--context dir]
+toto post-task --key project.key --config cfg.json --github org/project --github-token-file gh.token task.json [--bundle dir]
 toto results-to-pr org/project --project id=<hex pubkey> --base main      # PRs for finished tasks (normally on a schedule)
 toto github-results org/project --out results/      # verified results, one file each
 toto extract-result results/<id>.<runner>.json out/

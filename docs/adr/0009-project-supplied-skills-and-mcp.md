@@ -1,6 +1,6 @@
 # 9. Projects may supply skills and remote MCP servers, under contributor policy
 
-- Status: Revised 2026-10-04 (supersedes the first version below)
+- Status: Superseded by ADR 13; was: Revised 2026-10-04 (supersedes the first version below)
 - Date: 2026-10-04
 
 ## Revision (2026-10-04): use the existing formats

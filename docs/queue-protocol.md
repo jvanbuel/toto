@@ -1,6 +1,6 @@
 # Queue protocol, version 1
 
-The wire protocol between a `toto` runner and a coordinator (ADR 1, ADR 8). The reference implementation is `toto serve-queue` (a spool directory served over HTTP); `HttpQueue` in `src/http_queue.rs` is the client. Any service that implements these routes can replace it.
+The wire protocol between a `toto` runner and a coordinator (ADR 1, ADR 8). No coordinator is implemented yet: the queue in use is GitHub issues (`docs/github-queue.md`, `src/github_queue.rs`), and the `QueueClient` trait in `src/queue.rs` is what a coordinator client would implement. The routes below are the design for it.
 
 **The coordinator is not a trust anchor.** The runner checks the project's signature on every task (DSSE, ADR 3), signs its own results, and checks input bundles against the hash in the signed manifest. A coordinator can withhold, delay or reorder work. It cannot forge a task or a result.
 
