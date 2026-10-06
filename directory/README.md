@@ -27,6 +27,9 @@ git add directory && git commit -m "Directory: add owner/name"
 this way, deliberately). `remove` drops one. The maintainers' private key never enters the
 repository; `toto project-key <file>` prints the public key of an existing key file.
 
+The site (`site/`) is built from this file and published on GitHub Pages, so signing a new
+directory also updates the public list.
+
 Curation (ADR 7): list projects whose code and prompts you have looked at, since contributors
 read this list as "someone checked". The entry is not a review of the image or the agent;
 contributors still see and approve both when they add the project.

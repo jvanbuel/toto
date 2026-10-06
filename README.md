@@ -70,6 +70,10 @@ Linux, macOS and Windows hosts with Docker Desktop, Docker Engine or Podman. Not
 
 `DockerSandbox` works with Docker or Podman (`bin`), optionally under gVisor (`runtime = "runsc"`). `cargo test` runs live isolation checks for each combination and skips those whose daemon or image is missing. gVisor needs a runtime registered with `--network=none` (`/etc/docker/daemon.json`: `{"runtimes":{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--network=none"]}}}`); nested VMs without KVM need `--platform=ptrace`. gVisor cannot run Omnigent's nested sandbox, so projects with egress rules need the default runtime plus `nested_userns` (`profiles/README.md`).
 
+## The site
+
+`site/` is a static SvelteKit site built from the signed directory (what toto is, how to contribute, every listed project with the command to add it), published to GitHub Pages by `.github/workflows/site.yml` whenever the directory or the site changes. The build verifies the directory's signature first, as a runner does. See `site/README.md`.
+
 ## Guides
 
 - Contributors: [docs/first-live-run.md](docs/first-live-run.md), [docs/projects.md](docs/projects.md).
