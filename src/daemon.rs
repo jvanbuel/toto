@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Snapshot written to `<state_dir>/status.json` for the TUI and `toto status`.
+/// Snapshot written to `<state_dir>/status.json` for `toto status` and the local UI.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Status {
     pub state: String,

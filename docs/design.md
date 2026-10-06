@@ -89,7 +89,7 @@ A task is a self-contained, signed manifest plus an input bundle; runners need n
 
 ## Runner architecture (`toto`)
 
-`toto` is a single Rust binary: a background daemon plus a TUI (ratatui) for contributor controls. It is the only component that ever touches the contributor's AI tools, and it never reads or transmits their credentials.
+`toto` is a single Rust binary: a background daemon with a CLI for contributor controls; a local web page served by the daemon is planned for reading approvals and status, and no terminal UI (decided 2026-10-06). It is the only component that ever touches the contributor's AI tools, and it never reads or transmits their credentials.
 
 **Modules**
 
@@ -102,7 +102,7 @@ A task is a self-contained, signed manifest plus an input bundle; runners need n
 | Sandbox manager | Starts a hardened container per task from the project's approved dev container image, unpacks inputs, applies limits; no network unless the agent needs one and the contributor fenced it (ADR 13) |
 | Usage meter | Tracks tokens/minutes per task against caps; hard-stops a task that exceeds its estimate by a set margin |
 | Result packager | Validates output against `output_schema`, hashes it, signs it with the runner key, attaches run metadata |
-| Local audit log | Append-only record of every task, project and cost, viewable in the TUI and exportable |
+| Local audit log | Append-only record of every task, project and cost (`toto audit`) |
 
 **Task lifecycle**
 
@@ -113,7 +113,7 @@ A task is a self-contained, signed manifest plus an input bundle; runners need n
 5. Provider adapter runs the tool inside the sandbox; the auth handle is passed in without exposing it to task content.
 6. Usage meter enforces limits throughout; overruns abort the task.
 7. Result packager validates and signs the output.
-8. If review-before-submit is on, the TUI shows a diff/preview and waits for approval.
+8. Results are reviewed on the project side, as pull requests (ADR 13); there is no contributor-side review step.
 9. Queue client submits the result; the audit log records it.
 
 **Credential handling**
@@ -124,7 +124,7 @@ The hardest design point: the AI tool needs its login inside the sandbox, but ta
 - Inject a short-lived, scoped token where the provider supports it.
 - Proxy model calls through a runner-side broker that adds auth headers, so the sandbox never holds a secret.
 
-**Suggested crates**: `tokio`, `reqwest`, `serde`, `ed25519-dalek` (signing), `ratatui` (TUI), `bollard` (Docker) or Firecracker bindings for microVMs.
+**Suggested crates**: `tokio`, `reqwest`, `serde`, `ed25519-dalek` (signing), `bollard` (Docker) or Firecracker bindings for microVMs.
 
 ## Sandbox and security model
 
@@ -181,7 +181,7 @@ Prove the runner is safe and useful with a small set of adapters and one friendl
 1. **Runner spike**: Rust daemon, Docker sandbox, two adapters (API key and one subscription CLI, e.g. Claude Code), local audit log, CLI only.
 2. **Toy queue**: minimal HTTP server, signed manifests, leases, one task kind (`code-fix` with tests).
 3. **Pilot project**: one open-source project you know well; 5–10 trusted contributors.
-4. **TUI and policy engine**: caps, allowlists, review-before-submit.
+4. **Policy engine and local UI**: caps, allowlists, reserve; a local web page for approvals and status.
 5. **Security review**: external audit of sandbox and credential handling; red-team with injection tasks.
 6. **More adapters + provider outreach**: add further subscription CLIs; pursue formal sign-off for those already supported.
 7. **Intake and board**: open applications once the pilot shows accepted results.

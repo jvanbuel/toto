@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Review-before-submit hook; the TUI implements it, tests use closures.
+/// Review-before-submit hook; the daemon declines it (results are reviewed as pull requests), tests use closures.
 pub trait Reviewer: Send {
     fn approve(&self, task: &TaskManifest, result: &SignedResult) -> bool;
 }
