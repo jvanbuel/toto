@@ -97,6 +97,11 @@ pub fn valid_image_ref(r: &str) -> bool {
     r.len() <= 256 && tagged && name_ok(path) && !host_name.is_empty() && (host.contains('.') || host.contains(':') || host == "localhost") && host_name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
 }
 
+/// A project id: 1-64 characters of `a-z`, `0-9`, `-` or `_`.
+pub fn valid_id(s: &str) -> bool {
+    ident(s)
+}
+
 fn ident(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }

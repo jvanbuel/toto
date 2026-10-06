@@ -66,7 +66,7 @@ In `.devcontainer/devcontainer.json`:
 }
 ```
 
-Publish the key's fingerprint somewhere independent of the repository (your website, your README) so contributors can compare it when they add you.
+Publish the key's fingerprint somewhere independent of the repository (your website, your README) so contributors can compare it when they add you, and ask to be listed in the signed project directory (`directory/README.md` in the toto repository): listed projects are added by name, and the directory carries your key, so a contributor's runner checks it for them.
 
 ## 4. Post tasks
 

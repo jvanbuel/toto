@@ -42,6 +42,11 @@ enum Cmd {
         #[arg(long, global = true)]
         config: Option<PathBuf>,
     },
+    /// The signed project directory: list it, or (maintainers) add, remove and sign entries.
+    Directory {
+        #[command(subcommand)]
+        cmd: DirectoryCmd,
+    },
     /// Check the whole setup (sandbox, network fence, approved environments, credentials, harness)
     /// and report what works, what is risky and what is missing. Exits 1 if anything failed.
     Doctor {
@@ -151,12 +156,49 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum DirectoryCmd {
+    /// Show the projects in the signed directory your config points at.
+    List {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Maintainers: read a project's own files from GitHub into the unsigned directory file.
+    Add {
+        /// `owner/name`
+        repo: String,
+        /// The unsigned directory file to edit (created if missing).
+        #[arg(long, default_value = "projects.unsigned.json")]
+        file: PathBuf,
+        #[arg(long, default_value = toto::github_queue::DEFAULT_API)]
+        api: String,
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+    },
+    /// Maintainers: drop a project from the unsigned directory file.
+    Remove {
+        id: String,
+        #[arg(long, default_value = "projects.unsigned.json")]
+        file: PathBuf,
+    },
+    /// Maintainers: sign the directory file with the maintainers' key into the file runners read.
+    Sign {
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long, default_value = "projects.unsigned.json")]
+        file: PathBuf,
+        /// Default: `projects.json` next to the input.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ProjectsCmd {
     /// Support a project: reads its `.devcontainer/devcontainer.json` and agent directory from
     /// GitHub, pulls or prebuilds its environment, shows everything you are approving and, after
     /// you confirm, trusts its key, gives it a share and adds its queue to your config.
     Add {
-        /// `owner/name` of the project's repository
+        /// A project name from the directory (`toto directory list`), or `owner/name` on GitHub.
         repo: String,
         /// Relative weight against your other projects.
         #[arg(long, default_value_t = 1)]
@@ -238,6 +280,28 @@ fn approval_for(cfg: &toto::config::Config, repo: &str, f: &toto::projects::Fetc
         }
     };
     Ok(toto::projects::Approval::new(&image, info, &f.agent_files, f.commit.clone(), prebuilt)?)
+}
+
+fn today() -> String {
+    Local::now().format("%Y-%m-%d").to_string()
+}
+
+fn load_signing_key(path: &std::path::Path) -> Result<ed25519_dalek::SigningKey, Box<dyn std::error::Error>> {
+    let seed: [u8; 32] = hex::decode(fs::read_to_string(path)?.trim()).ok().and_then(|b| b.try_into().ok()).ok_or("the key file must hold 32 bytes of hex (from `toto project-key`)")?;
+    Ok(ed25519_dalek::SigningKey::from_bytes(&seed))
+}
+
+fn load_unsigned(file: &std::path::Path) -> Result<toto::directory::Directory, Box<dyn std::error::Error>> {
+    if !file.exists() {
+        return Ok(toto::directory::Directory::default());
+    }
+    Ok(toto::directory::Directory::load_unsigned(&fs::read(file)?)?)
+}
+
+fn fetch_directory(d: &toto::config::DirectoryConfig) -> Result<toto::directory::Directory, Box<dyn std::error::Error>> {
+    let key = toto::directory::parse_key(&d.public_key)?;
+    let gh = toto::github_queue::GitHubQueue::new(&d.api_url, &d.repo, toto::github_queue::DEFAULT_LABEL, None);
+    Ok(toto::directory::fetch(&gh, &d.path, &key)?)
 }
 
 fn home() -> PathBuf {
@@ -325,11 +389,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Cmd::ProjectKey { out } => {
-            let key = toto::manifest::generate_key();
-            fs::write(&out, hex::encode(key.to_bytes()))?;
-            fs::set_permissions(&out, fs::Permissions::from_mode(0o600))?;
+            let key = if out.exists() {
+                load_signing_key(&out)?
+            } else {
+                let key = toto::manifest::generate_key();
+                fs::write(&out, hex::encode(key.to_bytes()))?;
+                fs::set_permissions(&out, fs::Permissions::from_mode(0o600))?;
+                key
+            };
             println!("public key: {}", hex::encode(key.verifying_key().to_bytes()));
         }
+        Cmd::Directory { cmd } => match cmd {
+            DirectoryCmd::List { config } => {
+                let cfg = toto::config::Config::load(&config_path(config))?;
+                let d = fetch_directory(&cfg.directory)?;
+                println!("directory github:{} ({}), signed by the maintainers' key {}…", cfg.directory.repo, cfg.directory.path, cfg.directory.public_key.chars().take(16).collect::<String>());
+                for l in toto::directory::describe(&d) {
+                    println!("{l}");
+                }
+            }
+            DirectoryCmd::Add { repo, file, api, token_file } => {
+                let gh = github(&api, &repo, token_file.as_deref())?;
+                let f = toto::projects::fetch(&gh)?;
+                let entry = toto::directory::entry_from(&repo, &f, &today())?;
+                let mut d = load_unsigned(&file)?;
+                let replaced = d.upsert(entry.clone());
+                fs::write(&file, serde_json::to_string_pretty(&d)? + "\n")?;
+                println!("{} `{}` ({}, key {}…, kinds {}, harness {}); now sign: toto directory sign --key <maintainers key> --file {}", if replaced { "refreshed" } else { "added" }, entry.id, entry.repo, &entry.public_key[..16], entry.kinds.join(","), entry.harness, file.display());
+            }
+            DirectoryCmd::Remove { id, file } => {
+                let mut d = load_unsigned(&file)?;
+                if !d.remove(&id) {
+                    return Err(format!("`{id}` is not in {}", file.display()).into());
+                }
+                fs::write(&file, serde_json::to_string_pretty(&d)? + "\n")?;
+                println!("removed `{id}`; now sign the file");
+            }
+            DirectoryCmd::Sign { key, file, out } => {
+                let d = load_unsigned(&file)?;
+                let key = load_signing_key(&key)?;
+                let env = d.sign(&key, &today())?;
+                let out = out.unwrap_or_else(|| file.with_file_name("projects.json"));
+                fs::write(&out, serde_json::to_string_pretty(&env)? + "\n")?;
+                // Read it back the way a runner will.
+                toto::directory::Directory::open(&fs::read(&out)?, &key.verifying_key())?;
+                println!("signed {} projects into {} with key {}…; commit it", d.projects.len(), out.display(), hex::encode(key.verifying_key().to_bytes()).chars().take(16).collect::<String>());
+            }
+        },
         Cmd::ExtractResult { result, out } => {
             let r: toto::result::SignedResult = serde_json::from_slice(&fs::read(&result)?)?;
             let body = r.open()?; // verifies the runner's signature, output hash and artifacts hash
@@ -433,12 +539,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                ProjectsCmd::Add { repo, share, token_file, api, yes } => {
+                ProjectsCmd::Add { repo: arg, share, token_file, api, yes } => {
+                    // A name is looked up in the signed directory; `owner/name` is used as is but
+                    // still cross-checked against the directory when it is listed there.
+                    let listed = match fetch_directory(&cfg.directory) {
+                        Ok(d) => d.resolve(&arg).cloned(),
+                        Err(e) if arg.contains('/') => {
+                            println!("note: the project directory could not be checked ({e})");
+                            None
+                        }
+                        Err(e) => return Err(format!("`{arg}` is not `owner/name`, and the project directory could not be read to look it up: {e}").into()),
+                    };
+                    let repo = match (&listed, arg.contains('/')) {
+                        (Some(e), _) => e.repo.clone(),
+                        (None, true) => arg.clone(),
+                        (None, false) => return Err(format!("no project `{arg}` in the directory (`toto directory list` shows them; or give `owner/name`)").into()),
+                    };
                     let gh = github(&api, &repo, token_file.as_deref())?;
                     let f = toto::projects::fetch(&gh)?;
                     let t = &f.devcontainer.toto;
+                    if let Some(e) = &listed {
+                        toto::directory::check_key(e, t)?;
+                    }
                     println!("{} ({}), from github:{repo}\n{}\n", t.name, t.id, t.description);
-                    println!("  key fingerprint  {} (compare it with what the project publishes)", t.public_key.chars().take(16).collect::<String>());
+                    match &listed {
+                        Some(_) => println!("  key fingerprint  {} (matches the signed directory)", t.public_key.chars().take(16).collect::<String>()),
+                        None => println!("  key fingerprint  {} (not in the directory: compare it with what the project publishes)", t.public_key.chars().take(16).collect::<String>()),
+                    }
                     println!("  task kinds       {}", t.kinds.join(", "));
                     println!("  share            {}", share.max(1));
                     for n in &f.devcontainer.notes {

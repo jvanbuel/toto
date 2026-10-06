@@ -11,6 +11,7 @@ pub mod config;
 pub mod daemon;
 pub mod doctor;
 pub mod devcontainer;
+pub mod directory;
 pub mod dsse;
 pub mod github_queue;
 pub mod harness;

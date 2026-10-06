@@ -116,6 +116,43 @@ pub struct Config {
     /// Where each project was added from (`owner/name` on GitHub), set by `toto projects add`.
     #[serde(default)]
     pub sources: BTreeMap<String, String>,
+    /// The signed project directory `toto projects add <name>` resolves names through.
+    #[serde(default)]
+    pub directory: DirectoryConfig,
+}
+
+/// Where the signed project directory is and whose key signs it (`crate::directory`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectoryConfig {
+    /// `owner/name` of the repository holding the directory file.
+    #[serde(default = "directory_repo")]
+    pub repo: String,
+    #[serde(default = "directory_path")]
+    pub path: String,
+    /// Hex Ed25519 public key of the directory maintainers.
+    #[serde(default = "directory_key")]
+    pub public_key: String,
+    #[serde(default = "github_api")]
+    pub api_url: String,
+}
+
+impl Default for DirectoryConfig {
+    fn default() -> Self {
+        Self { repo: directory_repo(), path: directory_path(), public_key: directory_key(), api_url: github_api() }
+    }
+}
+
+fn directory_repo() -> String {
+    crate::directory::DEFAULT_REPO.into()
+}
+fn directory_path() -> String {
+    crate::directory::DEFAULT_PATH.into()
+}
+fn directory_key() -> String {
+    crate::directory::DEFAULT_KEY.trim().into()
+}
+fn github_api() -> String {
+    crate::github_queue::DEFAULT_API.into()
 }
 
 /// Where tasks come from.
@@ -209,6 +246,7 @@ impl Config {
             projects: BTreeMap::new(),
             environments: BTreeMap::new(),
             sources: BTreeMap::new(),
+            directory: DirectoryConfig::default(),
         }
     }
 

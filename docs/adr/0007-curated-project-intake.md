@@ -1,6 +1,6 @@
 # 7. Curate project intake
 
-- Status: Proposed
+- Status: Accepted (2026-10-06: a signed directory file in the toto repository, `src/directory.rs`, `directory/README.md`; curation is the maintainers' review before signing)
 - Date: 2026-10-04
 
 ## Context

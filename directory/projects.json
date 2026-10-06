@@ -1,0 +1,10 @@
+{
+  "payload": "ewogICJ2ZXJzaW9uIjogMSwKICAidXBkYXRlZCI6ICIyMDI2LTEwLTA2IiwKICAicHJvamVjdHMiOiBbXQp9",
+  "payloadType": "application/vnd.toto.directory+json",
+  "signatures": [
+    {
+      "keyid": "4d3075239274bd46a67f8758799f1b21a68e386d000b15a5d48815cdab882306",
+      "sig": "QP0Ma4Opuan9h8oP0s0OzkzhmabKB2bkKou4QTwVhLuzBcpN19/v5wPnuVvsM3P/fCtOBC8h9DdWrVwAY0O+DA=="
+    }
+  ]
+}

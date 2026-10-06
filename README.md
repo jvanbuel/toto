@@ -36,7 +36,8 @@ cargo run -- demo
 cargo build --release
 toto init                                   # ~/.config/toto: runner key, strict starter config
 toto login                                  # Anthropic subscription token (or api_key_file for OpenAI)
-toto projects add owner/name                # shows the image and the agent; you approve
+toto directory list                         # the signed list of projects
+toto projects add <name>                    # shows the image and the agent; you approve
 toto doctor                                 # what works, what is missing
 toto run --once                             # or: toto install-service
 ```

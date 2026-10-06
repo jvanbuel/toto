@@ -5,7 +5,8 @@ Contributors decide which projects their runner supports; nothing runs for a pro
 ## For contributors
 
 ```
-toto projects add owner/name [--share 2] [--token-file gh.token] [--yes]
+toto directory list
+toto projects add <name> | owner/name [--share 2] [--token-file gh.token] [--yes]
 toto projects inspect owner/name
 toto projects update <id>
 toto projects list
@@ -14,7 +15,7 @@ toto projects remove <id>
 
 `add` reads two things from the project's GitHub repository at its current commit: `.devcontainer/devcontainer.json` (the project's dev container, with toto's block under `customizations.toto`) and the agent directory it names (`.toto/agent`, an Omnigent agent). It then shows what will run and asks for confirmation (`--yes` to skip; it refuses to proceed without a terminal otherwise):
 
-- the key fingerprint, to compare with what the project publishes elsewhere;
+- the key fingerprint: checked against the signed directory when the project is listed there, otherwise yours to compare with what the project publishes elsewhere;
 - the task kinds it posts, its share against your other projects, its queue;
 - **the image**: pulled, then its digest, user, environment variables, entrypoint, size and the build steps of every layer, read from the image itself. If the project publishes no image, its dev container is **prebuilt on your machine** with the reference dev container CLI (`build`, `onCreateCommand`, `updateContentCommand`), under toto's flags (no capabilities, no new privileges, your fenced network, no host mounts), and the snapshot's id is what you approve;
 - **the agent**: harness (which decides whether your credential fits), model, the first line of its prompt, each MCP server (command, or URL), skills, and the egress rules of its sandbox, if any;
@@ -34,4 +35,4 @@ See `docs/project-owner-guide.md`. In short: your `.devcontainer/devcontainer.js
 
 ## Finding projects
 
-There is no directory yet. A curated list (a repository or a signed file the platform maintains, ADR 7) is the natural next step; `toto projects add` already works with any entry in it, because it only needs `owner/name`.
+`toto directory list` shows the signed project directory (`directory/projects.json` in the toto repository by default; `directory` in your config points elsewhere). `toto projects add <name>` takes a name from it and resolves the repository; the directory also lists each project's key, and adding refuses a project whose repository now publishes a different key. Adding by `owner/name` still works for a project that is not listed, and is cross-checked when it is. How projects get listed: `directory/README.md`.

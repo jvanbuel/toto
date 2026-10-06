@@ -2407,6 +2407,72 @@ mod github_queue {
         assert!(!issue_closed(&p, 0));
     }
 
+    // ----------------------------------------------------------------- the signed directory
+
+    #[test]
+    fn the_directory_is_signed_verified_and_resolves_names() {
+        use crate::directory::{self, Directory, Entry};
+        let p = project();
+        publish(&p, &devcontainer_json(&p.key, ""), &[("config.yaml", &agent_config(""))]);
+        let gh = p.fake.queue(None);
+        let f = projects::fetch(&gh).unwrap();
+        let entry = directory::entry_from("org/proj", &f, "2026-10-06").unwrap();
+        assert_eq!((entry.id.as_str(), entry.repo.as_str(), entry.harness.as_str(), entry.needs_network, entry.kinds.as_slice()), ("acme", "org/proj", "claude-sdk", false, &["summarise".to_string()][..]));
+        assert_eq!(entry.public_key, f.devcontainer.toto.public_key);
+        assert!(directory::entry_from("not-a-repo", &f, "2026-10-06").is_err());
+
+        let maintainers = crate::manifest::generate_key();
+        let mut d = Directory::default();
+        assert!(!d.upsert(entry.clone()));
+        assert!(d.upsert(Entry { description: "refreshed".into(), ..entry.clone() }), "same id replaces");
+        assert_eq!(d.projects.len(), 1);
+        let signed = serde_json::to_vec(&d.sign(&maintainers, "2026-10-06").unwrap()).unwrap();
+        p.fake.state.lock().unwrap().files.push((directory::DEFAULT_PATH.into(), signed.clone()));
+
+        // A runner fetches and verifies it with the maintainers' key, and nothing else.
+        let got = directory::fetch(&gh, directory::DEFAULT_PATH, &maintainers.verifying_key()).unwrap();
+        assert_eq!((got.updated.as_str(), got.projects[0].description.as_str()), ("2026-10-06", "refreshed"));
+        assert_eq!(got.resolve("acme").map(|e| e.repo.as_str()), Some("org/proj"));
+        assert_eq!(got.resolve("ORG/proj").map(|e| e.id.as_str()), Some("acme"), "repositories match case-insensitively");
+        assert!(got.resolve("nope").is_none() && got.resolve("x/y").is_none());
+        let other = crate::manifest::generate_key();
+        let e = directory::fetch(&gh, directory::DEFAULT_PATH, &other.verifying_key()).unwrap_err().to_string();
+        assert!(e.contains("does not verify"), "{e}");
+        let mut tampered: crate::dsse::Envelope = serde_json::from_slice(&signed).unwrap();
+        let mut d2 = d.clone();
+        d2.projects[0].public_key = hex::encode(other.verifying_key().to_bytes());
+        tampered.payload = { use base64::Engine; base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec_pretty(&d2).unwrap()) };
+        assert!(Directory::open(&serde_json::to_vec(&tampered).unwrap(), &maintainers.verifying_key()).is_err(), "an edited payload fails the signature");
+        assert!(directory::fetch(&gh, "directory/missing.json", &maintainers.verifying_key()).unwrap_err().to_string().contains("no directory"));
+
+        // The key check: the repository must still publish the key the directory listed.
+        assert!(directory::check_key(&entry, &f.devcontainer.toto).is_ok());
+        publish(&p, &devcontainer_json(&other, ""), &[("config.yaml", &agent_config(""))]);
+        let swapped = projects::fetch(&gh).unwrap();
+        let e = directory::check_key(&entry, &swapped.devcontainer.toto).unwrap_err().to_string();
+        assert!(e.contains("now publishes") && e.contains("refusing"), "{e}");
+        let renamed = crate::devcontainer::Toto { id: "other-id".into(), ..f.devcontainer.toto.clone() };
+        assert!(directory::check_key(&entry, &renamed).unwrap_err().to_string().contains("calls itself"));
+
+        // What a maintainer cannot sign.
+        for (what, bad) in [
+            ("duplicate id", Directory { projects: vec![entry.clone(), entry.clone()], ..Default::default() }),
+            ("bad repo", Directory { projects: vec![Entry { repo: "org".into(), ..entry.clone() }], ..Default::default() }),
+            ("bad key", Directory { projects: vec![Entry { public_key: "abcd".into(), ..entry.clone() }], ..Default::default() }),
+            ("no kinds", Directory { projects: vec![Entry { kinds: vec![], ..entry.clone() }], ..Default::default() }),
+            ("bad id", Directory { projects: vec![Entry { id: "Acme!".into(), ..entry.clone() }], ..Default::default() }),
+            ("version", Directory { version: 2, ..Default::default() }),
+        ] {
+            assert!(bad.sign(&maintainers, "2026-10-06").is_err(), "{what} must be refused");
+        }
+        assert!(d.remove("acme") && !d.remove("acme") && d.projects.is_empty());
+        let text = directory::describe(&got).join("\n");
+        assert!(text.contains("acme") && text.contains("org/proj") && text.contains("claude-sdk"), "{text}");
+        // The built-in default key parses, so a fresh config can read the real directory.
+        assert!(directory::parse_key(directory::DEFAULT_KEY).is_ok());
+        assert!(directory::parse_key("zz").is_err());
+    }
+
     // ----------------------------------------------------------------- contributors choose projects
 
     use crate::config::{Config, QueueEndpoint};
