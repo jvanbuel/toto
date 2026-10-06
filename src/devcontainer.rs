@@ -2,12 +2,15 @@
 //! environment. Projects already have a `devcontainer.json` for their own developers; toto reads the
 //! prebuilt `image` from it and nothing else that acts.
 //!
-//! Most of the spec acts on the machine that runs it (`initializeCommand` runs on the host, `mounts`
+//! Much of the spec acts on the machine that runs it (`initializeCommand` runs on the host, `mounts`
 //! bind host paths, `runArgs` passes arbitrary docker flags, `privileged` and `capAdd` weaken the
-//! sandbox) or builds on it (`build`, `dockerFile`, `features` run install scripts as root with
-//! network). A contributor's machine does neither for a stranger, so those keys are *refused* with a
-//! message instead of being silently dropped, and the project builds its image in its own CI and
-//! publishes it. Keys that only matter in an editor or at dev time are ignored with a warning.
+//! sandbox). Other keys make the contributor's machine *build* the environment (`build`,
+//! `dockerFile`, `features`): the steps run in a build container with network, which is contained but
+//! is a stranger's code running before the contributor has approved anything, and the result is
+//! not something that can be inspected and pinned like a published image. So all of these are
+//! *refused* with a message instead of being silently dropped: the project builds its image in its
+//! own CI and publishes it, and the contributor inspects and approves that image (`image`).
+//! Keys that only matter in an editor or at dev time are ignored with a warning.
 
 use crate::{Error, Result};
 
@@ -17,7 +20,7 @@ const REFUSED: [(&str, &str); 13] = [
     ("dockerFile", "builds an image on the contributor's machine"),
     ("dockerComposeFile", "starts other services on the contributor's machine"),
     ("service", "starts other services on the contributor's machine"),
-    ("features", "runs install scripts as root on the contributor's machine"),
+    ("features", "runs install scripts on the contributor's machine"),
     ("mounts", "mounts host paths into the container"),
     ("workspaceMount", "mounts host paths into the container"),
     ("runArgs", "passes arbitrary flags to docker"),

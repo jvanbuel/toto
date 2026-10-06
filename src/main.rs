@@ -188,6 +188,29 @@ enum ProjectsCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Read everything a project asks you to approve, without changing anything: its descriptor, the
+    /// `devcontainer.json` that names its environment, and (after pulling it) the image itself: user,
+    /// environment, size and the build steps of every layer.
+    Inspect {
+        /// `owner/name`
+        repo: String,
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        #[arg(long, default_value = toto::github_queue::DEFAULT_API)]
+        api: String,
+    },
+    /// Re-check a project's environment image: if its tag now points to a different digest, show
+    /// what changed and, after you confirm, approve and pin the new one. Until then tasks keep
+    /// running the image you approved.
+    Update {
+        id: String,
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        #[arg(long, default_value = toto::github_queue::DEFAULT_API)]
+        api: String,
+        #[arg(long)]
+        yes: bool,
+    },
     /// Show the projects you support.
     List,
     /// Stop supporting a project.
@@ -199,6 +222,45 @@ fn save_config(path: &std::path::Path, cfg: &toto::config::Config) -> Result<(),
     fs::write(&tmp, serde_json::to_string_pretty(cfg)?)?;
     fs::rename(tmp, path)?;
     Ok(())
+}
+
+fn docker_bin(cfg: &toto::config::Config) -> Result<String, Box<dyn std::error::Error>> {
+    match &cfg.sandbox {
+        toto::config::SandboxConfig::Docker { bin, .. } => Ok(bin.clone()),
+        _ => Err("project environments are container images: configure a docker or podman sandbox first".into()),
+    }
+}
+
+/// Asks the contributor; `yes` answers for them, and without a terminal there is nobody to ask.
+fn confirm(question: &str, yes: bool) -> Result<bool, Box<dyn std::error::Error>> {
+    use std::io::{BufRead, IsTerminal, Write};
+    if yes {
+        return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err("not a terminal: re-run with --yes to confirm".into());
+    }
+    print!("\n{question} [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    Ok(answer.trim().eq_ignore_ascii_case("y"))
+}
+
+/// A project's descriptor and the environment image it names (with warnings about ignored keys).
+struct Fetched {
+    gh: toto::github_queue::GitHubQueue,
+    d: toto::projects::Descriptor,
+    env: Option<(String, Vec<String>)>,
+}
+
+fn fetch_project(api: &str, repo: &str, token_file: Option<&std::path::Path>) -> Result<Fetched, Box<dyn std::error::Error>> {
+    let token = token_file.map(toto::claude_cli::read_secret).transpose()?;
+    let gh = toto::github_queue::GitHubQueue::new(api, repo, toto::github_queue::DEFAULT_LABEL, token);
+    let bytes = gh.file(toto::projects::DESCRIPTOR_PATH)?.ok_or_else(|| format!("{repo} has no {} (is it a toto project?)", toto::projects::DESCRIPTOR_PATH))?;
+    let d = toto::projects::Descriptor::parse(&bytes)?;
+    let env = d.environment_image(&|path| gh.file(path))?;
+    Ok(Fetched { gh, d, env })
 }
 
 fn home() -> PathBuf {
@@ -327,38 +389,100 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("{}", toto::projects::remove(&mut cfg, &id)?);
                     save_config(&path, &cfg)?;
                 }
+                ProjectsCmd::Inspect { repo, token_file, api } => {
+                    let f = fetch_project(&api, &repo, token_file.as_deref())?;
+                    println!("{} ({}), from github:{repo}\n{}\n", f.d.name, f.d.id, f.d.description);
+                    println!("descriptor  {}\n  key fingerprint {}, kinds {}", toto::projects::DESCRIPTOR_PATH, f.d.fingerprint(), f.d.kinds.join(", "));
+                    println!("  needs: network {:?}, context {}, stdio MCP {}, MCP hosts {:?}", f.d.needs.network, f.d.needs.context, f.d.needs.stdio_mcp, f.d.needs.mcp_hosts);
+                    match (&f.d.environment, &f.env) {
+                        (Some(toto::projects::Environment { devcontainer: Some(path), .. }), Some((image, warnings))) => {
+                            println!("\n{path}:\n{}", String::from_utf8_lossy(&f.gh.file(path)?.unwrap_or_default()));
+                            for w in warnings {
+                                println!("  note: {w}");
+                            }
+                            let info = toto::image::inspect(&docker_bin(&cfg)?, image, true)?;
+                            println!("\nthe image itself:");
+                            for l in toto::image::describe(image, &info) {
+                                println!("  {l}");
+                            }
+                        }
+                        (_, Some((image, _))) => {
+                            let info = toto::image::inspect(&docker_bin(&cfg)?, image, true)?;
+                            println!("\nthe image itself:");
+                            for l in toto::image::describe(image, &info) {
+                                println!("  {l}");
+                            }
+                        }
+                        _ => println!("\nno environment named: its tasks would run in your default sandbox image"),
+                    }
+                }
+                ProjectsCmd::Update { id, token_file, api, yes } => {
+                    let repo = cfg.sources.get(&id).cloned().ok_or_else(|| format!("project `{id}` was not added with `toto projects add`"))?;
+                    let f = fetch_project(&api, &repo, token_file.as_deref())?;
+                    if cfg.projects.get(&id) != Some(&f.d.public_key) {
+                        return Err(format!("{repo} now publishes a different key for `{id}`: if you trust the change, `toto projects remove {id}` and add it again").into());
+                    }
+                    let Some((image, _)) = f.env else { return Err("the project names no environment any more".into()) };
+                    let info = toto::image::inspect(&docker_bin(&cfg)?, &image, true)?;
+                    let new = toto::image::EnvApproval { image, info };
+                    match cfg.environments.get(&id) {
+                        Some(old) if old.info.digest == new.info.digest && old.image == new.image => println!("{id}: up to date ({})", old.info.digest),
+                        old => {
+                            println!("{id}: the environment changed since you approved it");
+                            match old {
+                                Some(old) => {
+                                    if old.image != new.image {
+                                        println!("  image {} -> {}", old.image, new.image);
+                                    }
+                                    for l in toto::image::diff(&old.info, &new.info) {
+                                        println!("  {l}");
+                                    }
+                                }
+                                None => {
+                                    for l in toto::image::describe(&new.image, &new.info) {
+                                        println!("  {l}");
+                                    }
+                                }
+                            }
+                            if !confirm(&format!("Approve and pin {}?", new.info.digest), yes)? {
+                                println!("nothing changed; tasks keep running the image you approved");
+                                return Ok(());
+                            }
+                            cfg.environments.insert(id.clone(), new);
+                            save_config(&path, &cfg)?;
+                            println!("pinned");
+                        }
+                    }
+                }
                 ProjectsCmd::Add { repo, share, accept, token_file, api, yes } => {
-                    use std::io::{BufRead, IsTerminal, Write};
-                    let token = token_file.as_deref().map(toto::claude_cli::read_secret).transpose()?;
-                    let gh = toto::github_queue::GitHubQueue::new(&api, &repo, toto::github_queue::DEFAULT_LABEL, token);
-                    let bytes = gh.file(toto::projects::DESCRIPTOR_PATH)?.ok_or_else(|| format!("{repo} has no {} (is it a toto project?)", toto::projects::DESCRIPTOR_PATH))?;
-                    let d = toto::projects::Descriptor::parse(&bytes)?;
-                    let env = d.environment_image(&|path| gh.file(path))?;
-                    let opts = toto::projects::AddOptions { share, accept: accept.into_iter().collect(), token_file, image: env.as_ref().map(|e| e.0.clone()) };
+                    let f = fetch_project(&api, &repo, token_file.as_deref())?;
+                    let environment = match &f.env {
+                        Some((image, _)) => Some(toto::image::EnvApproval { image: image.clone(), info: toto::image::inspect(&docker_bin(&cfg)?, image, true)? }),
+                        None => None,
+                    };
+                    let opts = toto::projects::AddOptions { share, accept: accept.into_iter().collect(), token_file, environment: environment.clone() };
                     let mut updated = cfg.clone();
-                    let notes = toto::projects::add(&mut updated, &repo, &d, &opts)?;
-                    println!("{} ({}), from github:{repo}\n{}\n", d.name, d.id, d.description);
-                    println!("  key fingerprint  {} (compare it with what the project publishes)", d.fingerprint());
-                    println!("  task kinds       {}", d.kinds.join(", "));
+                    let notes = toto::projects::add(&mut updated, &repo, &f.d, &opts)?;
+                    println!("{} ({}), from github:{repo}\n{}\n", f.d.name, f.d.id, f.d.description);
+                    println!("  key fingerprint  {} (compare it with what the project publishes)", f.d.fingerprint());
+                    println!("  task kinds       {}", f.d.kinds.join(", "));
                     println!("  share            {}", share.max(1));
                     for n in &notes {
                         println!("  {n}");
                     }
-                    for w in env.iter().flat_map(|e| &e.1) {
+                    for w in f.env.iter().flat_map(|e| &e.1) {
                         println!("  note: devcontainer.json {w}");
                     }
-                    if !yes {
-                        if !std::io::stdin().is_terminal() {
-                            return Err("not a terminal: re-run with --yes to confirm".into());
+                    if let Some(env) = &environment {
+                        println!("\nthe environment you are approving:");
+                        for l in toto::image::describe(&env.image, &env.info) {
+                            println!("  {l}");
                         }
-                        print!("\nSupport this project? [y/N] ");
-                        std::io::stdout().flush()?;
-                        let mut answer = String::new();
-                        std::io::stdin().lock().read_line(&mut answer)?;
-                        if !answer.trim().eq_ignore_ascii_case("y") {
-                            println!("nothing changed");
-                            return Ok(());
-                        }
+                        println!("\n(`toto projects inspect {repo}` also shows the project's devcontainer.json)");
+                    }
+                    if !confirm("Support this project and approve this environment?", yes)? {
+                        println!("nothing changed");
+                        return Ok(());
                     }
                     save_config(&path, &updated)?;
                     println!("\nadded; run `toto doctor` to check the setup");

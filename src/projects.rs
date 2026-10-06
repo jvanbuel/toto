@@ -132,8 +132,9 @@ pub struct AddOptions {
     pub accept: BTreeSet<String>,
     /// File with the contributor's GitHub token (to claim and answer tasks); `None` leaves it unset.
     pub token_file: Option<PathBuf>,
-    /// The project's environment image, resolved from its descriptor (`Descriptor::environment_image`).
-    pub image: Option<String>,
+    /// The environment the contributor reviewed and approved: the image the descriptor names, pinned
+    /// to the digest they were shown (`image::inspect`). `None`: the project names none.
+    pub environment: Option<crate::image::EnvApproval>,
 }
 
 /// Adds the project to `cfg`; returns what was granted and what was left off, for the contributor.
@@ -148,12 +149,12 @@ pub fn add(cfg: &mut Config, repo: &str, d: &Descriptor, o: &AddOptions) -> Resu
     cfg.projects.insert(d.id.clone(), d.public_key.clone());
     cfg.policy.project_shares.insert(d.id.clone(), o.share.max(1));
     cfg.sources.insert(d.id.clone(), repo.to_string());
-    match &o.image {
-        Some(image) if crate::devcontainer::valid_image_ref(image) => {
-            cfg.environments.insert(d.id.clone(), image.clone());
-            notes.push(format!("environment {image} (its tasks run in this image, as an unprivileged user, with no network unless you grant it)"));
+    match &o.environment {
+        Some(env) if crate::devcontainer::valid_image_ref(&env.image) => {
+            cfg.environments.insert(d.id.clone(), env.clone());
+            notes.push(format!("environment {} (pinned to {}: its tasks run exactly this, as an unprivileged user, with no network unless you grant it)", env.image, env.info.digest));
         }
-        Some(image) => return Err(Error::Policy(format!("environment image `{image}` is not a fully qualified reference"))),
+        Some(env) => return Err(Error::Policy(format!("environment image `{}` is not a fully qualified reference", env.image))),
         None => {
             cfg.environments.remove(&d.id);
             notes.push("environment: none named; its tasks run in your default sandbox image".into());

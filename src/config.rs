@@ -189,10 +189,11 @@ pub struct Config {
     /// Trusted project public keys (hex ed25519), by project id.
     #[serde(default)]
     pub projects: BTreeMap<String, String>,
-    /// The environment image each project named when it was added (`toto projects add`); its tasks
-    /// run in this image instead of the sandbox's default.
+    /// The environment each project named and the contributor approved (`toto projects add`), pinned
+    /// by digest with a snapshot of what was reviewed. Its tasks run in that exact image instead of
+    /// the sandbox's default.
     #[serde(default)]
-    pub environments: BTreeMap<String, String>,
+    pub environments: BTreeMap<String, crate::image::EnvApproval>,
     /// Where each project was added from (`owner/name` on GitHub), set by `toto projects add`.
     #[serde(default)]
     pub sources: BTreeMap<String, String>,
@@ -339,7 +340,7 @@ impl Config {
                 s.runtime = runtime.clone();
                 s.bridge = bridge.clone();
                 s.network = network.clone();
-                s.images = self.environments.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                s.images = self.environments.iter().map(|(k, v)| (k.clone(), v.pinned())).collect();
                 if *nested_userns {
                     let path = self.state_dir.join("seccomp-nested-userns.json");
                     let _ = std::fs::create_dir_all(&self.state_dir);

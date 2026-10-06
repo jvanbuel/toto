@@ -18,6 +18,10 @@ toto projects remove <id>
 
 Adding a project trusts its key, gives it a share, allows its task kinds and adds its queue. **Nothing that widens what a task may do is granted unless you name it**: `--accept network` (its egress rules join your allowed rules), `context` (skills, instructions, `.mcp.json`), `stdio-mcp` (MCP servers that run a command in the sandbox), `mcp-hosts` (its remote MCP hosts). A task that needs something you did not accept is refused by your policy, as before. A project cannot swap its key later: adding it again with a different key is refused until you remove it. Removing leaves the allowed kinds and accepted permissions in your policy, since other projects may rely on them.
 
+**Inspecting and approving the environment.** If the project names an environment image, `add` pulls it and shows what it will run: the image's digest, user, environment variables, entrypoint, size and the build steps of every layer (from the image itself, so it does not depend on anything the project asserts). Your approval is bound to the **digest**: the runner starts exactly that image, so the project cannot change what your approval covers by moving a tag. `toto projects inspect owner/name` shows all of this plus the project's `devcontainer.json` without changing anything. When the project publishes something new, `toto projects update <id>` re-pulls the tag, shows what changed (digest, user, environment, added and removed build steps) and asks again; until you approve, tasks keep running the image you approved.
+
+What this does not tell you: the build history lists commands, not the contents of files they copy in, and an image can be built to look innocent. The approval is a decision about whether you trust the project and what it shows you, not a proof the image is harmless; the container's isolation (read-only, unprivileged, no credential, no network unless you grant it) is what limits the damage.
+
 The descriptor is a convenience only. Every task is still checked against the key you trusted, and your policy decides what runs.
 
 ## For projects

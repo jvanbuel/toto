@@ -17,6 +17,7 @@ pub mod github_queue;
 pub mod harness;
 pub mod manifest;
 pub mod http_queue;
+pub mod image;
 pub mod meter;
 pub mod netfence;
 pub mod omnigent;

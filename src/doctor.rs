@@ -86,6 +86,9 @@ pub fn run_all(cfg: &Config) -> Vec<Check> {
         }
     }
 
+    for (id, env) in &cfg.environments {
+        c.push(Check::new(Level::Ok, "environment", format!("{id}: {} (approved, tasks run exactly this digest; `toto projects update {id}` checks for a new one)", env.pinned())));
+    }
     // Building the runner also validates the harness settings and reads the credential files.
     match cfg.build() {
         Err(e) => c.push(Check::new(Level::Fail, "harness", e.to_string())),
