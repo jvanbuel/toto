@@ -7,10 +7,6 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-/// Where the static relay binary appears inside a container.
-pub const RELAY_PATH: &str = "/toto/relay";
-/// Where the credential proxy's unix socket appears inside the container.
-pub const PROXY_SOCKET_PATH: &str = "/toto/proxy.sock";
 /// Loopback address the in-container relay serves; the agent's API base URL points here.
 pub const PROXY_ADDR: &str = "127.0.0.1:8080";
 
@@ -137,11 +133,9 @@ pub struct DockerSandbox {
     pub workspace_mb: u32,
     /// The approved environment per project id. A task from a project without one is refused.
     pub environments: std::collections::HashMap<String, Environment>,
-    /// Static `toto-relay` binary mounted read-only at `RELAY_PATH`: the only host path a task
-    /// container can see. Needed when `proxy_socket` is set.
-    pub relay: Option<PathBuf>,
-    /// Credential proxy socket (host side), bind-mounted at `PROXY_SOCKET_PATH`. When set, a
-    /// loopback relay to it is started inside the container at `PROXY_ADDR`.
+    /// Credential proxy socket (host side). When set, the relay script is written into each
+    /// container and run over `exec -i`, serving `PROXY_ADDR` on the container's loopback
+    /// (`crate::relay`); nothing is mounted.
     pub proxy_socket: Option<PathBuf>,
     /// Seccomp profile file. `None` keeps Docker's default; toto's opt-in profile allows a nested
     /// bubblewrap (see `profiles/README.md`).
@@ -150,11 +144,13 @@ pub struct DockerSandbox {
     pub network: Option<String>,
     /// Content baselines of unpacked inputs, by task id (kept on the host, never in the container).
     baselines: std::sync::Mutex<std::collections::HashMap<String, std::collections::BTreeMap<String, String>>>,
+    /// The running relay per task; dropping one ends it.
+    relays: std::sync::Mutex<std::collections::HashMap<String, crate::relay::RelayLink>>,
 }
 
 impl DockerSandbox {
     pub fn new() -> Self {
-        Self { bin: "docker".into(), runtime: None, workspace_mb: 512, environments: Default::default(), relay: None, proxy_socket: None, seccomp_profile: None, network: None, baselines: Default::default() }
+        Self { bin: "docker".into(), runtime: None, workspace_mb: 512, environments: Default::default(), proxy_socket: None, seccomp_profile: None, network: None, baselines: Default::default(), relays: Default::default() }
     }
 
     pub fn container_name(task_id: &str) -> String {
@@ -189,14 +185,8 @@ impl DockerSandbox {
             "--tmpfs".into(), format!("/workspace:rw,noexec,nosuid,mode=1777,size={}m", self.workspace_mb),
             "--tmpfs".into(), "/tmp:rw,nosuid,mode=1777,size=256m".into(),
         ]);
-        if let Some(b) = &self.relay {
-            a.extend(["--mount".into(), format!("type=bind,src={},dst={RELAY_PATH},readonly", b.display())]);
-        }
         if let Some(profile) = &self.seccomp_profile {
             a.extend(["--security-opt".into(), format!("seccomp={}", profile.display())]);
-        }
-        if let Some(sock) = &self.proxy_socket {
-            a.extend(["--mount".into(), format!("type=bind,src={},dst={PROXY_SOCKET_PATH}", sock.display())]);
         }
         if let Some(rt) = &self.runtime {
             a.extend(["--runtime".into(), rt.clone()]);
@@ -214,21 +204,17 @@ impl DockerSandbox {
         }
     }
 
-    /// Starts the loopback relay to the credential proxy inside the container and waits until it
-    /// accepts connections.
-    fn start_relay(&self, container: &str) -> Result<()> {
-        if self.relay.is_none() {
-            return Err(Error::Sandbox("the credential proxy needs the relay binary (`relay` in the sandbox config)".into()));
+    /// Writes the relay script into the container and starts it over `exec -i`, so the agent
+    /// can reach the credential proxy at `PROXY_ADDR` and nothing else.
+    fn start_relay(&self, ws: &Workspace, proxy_socket: &std::path::Path) -> Result<()> {
+        let script = format!("cat > {}", crate::relay::SCRIPT_PATH);
+        let out = exec_io(ws, &["sh", "-c", &script], Some(crate::relay::SCRIPT.as_bytes()), Duration::from_secs(30), 1 << 16)?;
+        if !out.status.success() {
+            return Err(Error::Sandbox(format!("could not place the relay script in the container: {}", String::from_utf8_lossy(&out.stderr).trim())));
         }
-        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        self.docker(&s(&["exec", "-d", container, RELAY_PATH, "relay", PROXY_ADDR, PROXY_SOCKET_PATH]))?;
-        for _ in 0..50 {
-            if self.docker(&s(&["exec", container, RELAY_PATH, "probe", PROXY_ADDR])).is_ok() {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        Err(Error::Sandbox("the credential proxy relay did not start".into()))
+        let link = crate::relay::RelayLink::start(&ws.exec_prefix, crate::relay::SCRIPT_PATH, PROXY_ADDR, proxy_socket)?;
+        self.relays.lock().unwrap().insert(ws.task_id.clone(), link);
+        Ok(())
     }
 
     /// The image must be present. A pulled image (`repo@digest`) that is missing is pulled again;
@@ -254,11 +240,6 @@ impl Sandbox for DockerSandbox {
     fn probe(&self) -> Result<()> {
         self.docker(&["version".into(), "--format".into(), "{{.Server.Version}}".into()])
             .map_err(|e| Error::Sandbox(format!("{} daemon unreachable: {e}", self.bin)))?;
-        if let Some(r) = &self.relay
-            && !r.is_file()
-        {
-            return Err(Error::Sandbox(format!("relay binary {} not found", r.display())));
-        }
         for env in self.environments.values() {
             self.ensure_image(&env.image)?;
             if env.network && self.network.is_none() {
@@ -282,10 +263,14 @@ impl Sandbox for DockerSandbox {
         let _ = self.docker(&["rm".into(), "-f".into(), name.clone()]);
         self.docker(&args)?;
         let exec_prefix = vec![self.bin.clone(), "exec".into(), "-i".into(), name.clone()];
-        if self.proxy_socket.is_some() {
-            self.start_relay(&name)?;
+        let ws = Workspace { task_id: task.id.clone(), path: PathBuf::new(), exec_prefix };
+        if let Some(sock) = &self.proxy_socket
+            && let Err(e) = self.start_relay(&ws, sock)
+        {
+            let _ = self.docker(&["rm".into(), "-f".into(), name]);
+            return Err(e);
         }
-        Ok(Workspace { task_id: task.id.clone(), path: PathBuf::new(), exec_prefix })
+        Ok(ws)
     }
 
     fn put_inputs(&self, ws: &Workspace, bundle: &[u8], max_bytes: u64) -> Result<()> {
@@ -349,6 +334,7 @@ impl Sandbox for DockerSandbox {
 
     fn destroy(&self, ws: Workspace) -> Result<()> {
         self.baselines.lock().unwrap().remove(&ws.task_id);
+        self.relays.lock().unwrap().remove(&ws.task_id);
         // `--rm` removes it once stopped; `-t 0` kills immediately. Ignore "already gone".
         let _ = self.docker(&["stop".into(), "-t".into(), "0".into(), Self::container_name(&ws.task_id)]);
         Ok(())

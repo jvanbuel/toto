@@ -304,7 +304,7 @@ mod daemon {
     #[test]
     fn config_roundtrip_and_review_refused() {
         let f = fixture("cfg");
-        let mut c = config(&f.dir, &f.key_a, SandboxConfig::Docker { bin: "docker".into(), runtime: None, relay: None, nested_userns: false, network: None });
+        let mut c = config(&f.dir, &f.key_a, SandboxConfig::Docker { bin: "docker".into(), runtime: None, nested_userns: false, network: None });
         let json = serde_json::to_string(&c).unwrap();
         assert!(serde_json::from_str::<Config>(&json).is_ok());
         c.policy.review_before_submit = true;
@@ -367,7 +367,6 @@ mod io_artifacts {
     use chrono::Local;
     use ed25519_dalek::SigningKey;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::Path;
 
     fn path_of(r: &Record) -> String {
         match r {
@@ -658,17 +657,15 @@ mod io_artifacts {
     }
 
     #[test]
-    fn container_roundtrip_through_the_relay() {
-        let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/toto-relay");
+    fn container_roundtrip() {
         let docker_ok = std::process::Command::new("docker").args(["image", "inspect", "alpine"]).output().is_ok_and(|o| o.status.success());
-        if !bin.exists() || !docker_ok {
-            eprintln!("skipping: needs docker, alpine and the musl relay build");
+        if !docker_ok {
+            eprintln!("skipping: needs docker and alpine");
             return;
         }
         let f = fixture("io-docker");
         let t = task("io1", "a", 1, &f.key_a);
-        let mut sb = { let mut sb = DockerSandbox::new(); sb.environments.insert("a".into(), crate::sandbox::Environment { image: "alpine".into(), network: false }); sb };
-        sb.relay = Some(bin);
+        let sb = { let mut sb = DockerSandbox::new(); sb.environments.insert("a".into(), crate::sandbox::Environment { image: "alpine".into(), network: false }); sb };
         let ws = sb.create(&t, &t.sandbox_profile).unwrap();
         sb.put_inputs(&ws, &input_bundle(), 1 << 20).unwrap();
         let sh = |c: &str| crate::sandbox::exec(&ws, &["sh", "-c", c], std::time::Duration::from_secs(20)).unwrap();
@@ -971,11 +968,6 @@ mod proxy_container {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    pub fn relay() -> Option<std::path::PathBuf> {
-        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/toto-relay");
-        p.exists().then_some(p)
-    }
-
     pub fn docker_has(image: &str) -> bool {
         std::process::Command::new("docker").args(["image", "inspect", image]).output().is_ok_and(|o| o.status.success())
     }
@@ -1017,10 +1009,10 @@ mod proxy_container {
 
     #[test]
     fn container_reaches_only_the_proxy_and_never_sees_the_credential() {
-        let (Some(bin), true) = (relay(), docker_has("alpine")) else {
-            eprintln!("skipping: needs docker, alpine and the musl relay build");
+        if !docker_has("toto-omnigent-test") {
+            eprintln!("skipping: needs docker and the toto-omnigent-test image (python3 for the relay)");
             return;
-        };
+        }
         let f = fixture("pxc");
         let (url, seen) = fake_api(r#"{"usage":{"input_tokens":3,"output_tokens":4}}"#, "application/json");
         let dir = f.dir.join("sock");
@@ -1029,14 +1021,16 @@ mod proxy_container {
         let proxy = AuthProxy::start(&dir.join("p.sock"), &url, crate::proxy::Provider::Anthropic, Auth::Bearer { token: "REAL-SECRET-TOKEN".into(), oauth: false }).unwrap();
 
         let t = task("pxc1", "a", 1, &f.key_a);
-        let mut sb = { let mut sb = DockerSandbox::new(); sb.environments.insert("a".into(), crate::sandbox::Environment { image: "alpine".into(), network: false }); sb };
-        sb.relay = Some(bin);
+        let mut sb = { let mut sb = DockerSandbox::new(); sb.environments.insert("a".into(), crate::sandbox::Environment { image: "toto-omnigent-test".into(), network: false }); sb };
         sb.proxy_socket = Some(proxy.socket().to_path_buf());
         let ws = sb.create(&t, &t.sandbox_profile).unwrap();
         let sh = |c: &str| exec(&ws, &["sh", "-c", c], Duration::from_secs(20)).unwrap();
+        // The image has python3 (as every toto image must) and nothing like wget; `req METHOD URL`
+        // exits non-zero on any error or non-2xx status.
+        const REQ: &str = "req() { python3 -c \"import sys,urllib.request as u; r=u.urlopen(u.Request(sys.argv[2], data=(b'{}' if sys.argv[1]=='POST' else None), headers={'authorization':'Bearer dummy-in-container','x-api-key':'dummy2'}, method=sys.argv[1]), timeout=3); sys.stdout.write(r.read().decode())\" \"$@\"; }; ";
 
         // 1. a request through the relay reaches upstream with the REAL credential, not the dummy
-        let out = sh("wget -q -O- --header 'authorization: Bearer dummy-in-container' --header 'x-api-key: dummy2' --post-data '{}' http://127.0.0.1:8080/v1/messages");
+        let out = sh(&format!("{REQ}req POST http://127.0.0.1:8080/v1/messages"));
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert!(String::from_utf8_lossy(&out.stdout).contains("input_tokens"));
         let h = seen.lock().unwrap()[0].clone();
@@ -1046,13 +1040,13 @@ mod proxy_container {
         assert_eq!(proxy.tokens(), 7);
 
         // 2. the credential is not anywhere in the container: environment, mounts, filesystem
-        let hay = sh("env; cat /proc/mounts; ls -la /toto; find / -xdev -type f -size -64k 2>/dev/null | head -2000 | xargs grep -l REAL-SECRET 2>/dev/null; echo done");
+        let hay = sh("env; cat /proc/mounts; find / -xdev -type f -size -64k 2>/dev/null | head -2000 | xargs grep -l REAL-SECRET 2>/dev/null; echo done");
         assert!(!String::from_utf8_lossy(&hay.stdout).contains("REAL-SECRET"), "credential leaked into the container");
 
         // 3. the container still has no network: only the relay is reachable, and only the allowed calls pass
-        assert!(!sh("wget -T 2 -q -O- http://1.1.1.1").status.success(), "no outside network");
-        assert!(!sh("wget -T 2 -q -O- http://127.0.0.1:9999/").status.success(), "no other loopback service");
-        assert!(!sh("wget -q -O- http://127.0.0.1:8080/v1/models").status.success(), "the proxy refuses other endpoints (403)");
+        assert!(!sh(&format!("{REQ}req GET http://1.1.1.1")).status.success(), "no outside network");
+        assert!(!sh(&format!("{REQ}req GET http://127.0.0.1:9999/")).status.success(), "no other loopback service");
+        assert!(!sh(&format!("{REQ}req GET http://127.0.0.1:8080/v1/models")).status.success(), "the proxy refuses other endpoints (403)");
         assert_eq!(seen.lock().unwrap().len(), 1, "upstream saw only the allowed request");
         sb.destroy(ws).unwrap();
     }
@@ -1133,12 +1127,6 @@ mod omnigent_in_container {
         (url, seen)
     }
 
-    /// The static relay binary, when the musl build exists.
-    pub fn relay() -> Option<std::path::PathBuf> {
-        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/toto-relay");
-        p.exists().then_some(p)
-    }
-
     /// An Omnigent agent directory as a project would commit it.
     pub fn agent_dir(harness: &str, model: &str, extra_yaml: &str, skills: &[(&str, &str)]) -> std::collections::BTreeMap<String, Vec<u8>> {
         let mut files = std::collections::BTreeMap::new();
@@ -1176,17 +1164,17 @@ mod omnigent_in_container {
         use crate::config::{Config, HarnessConfig, ProviderConfig, SandboxConfig};
         use crate::queue::DirQueue;
         use chrono::Local;
-        let (Some(relay), true) = (relay(), docker_has("toto-omnigent-test")) else {
-            eprintln!("skipping: needs docker, the musl relay and the toto-omnigent-test image");
+        if !docker_has("toto-omnigent-test") {
+            eprintln!("skipping: needs docker and the toto-omnigent-test image");
             return;
-        };
+        }
         let f = fixture("omni-runner");
         let (url, seen) = fake_scripted(vec![
             ("ToolSearch", serde_json::json!({"query": "select:mcp__omnigent__sys_os_shell", "max_results": 1})),
             ("mcp__omnigent__sys_os_shell", serde_json::json!({"command": "cat calc.txt; echo fixed > calc.txt; ls /tmp/toto-agent/skills; id -u; echo secret-check=${ANTHROPIC_AUTH_TOKEN:-unset}"})),
         ]);
         let mut cfg = Config::starter(&f.dir);
-        cfg.sandbox = SandboxConfig::Docker { bin: "docker".into(), runtime: None, relay: Some(relay), nested_userns: false, network: None };
+        cfg.sandbox = SandboxConfig::Docker { bin: "docker".into(), runtime: None, nested_userns: false, network: None };
         cfg.harness = HarnessConfig::Omnigent { provider: ProviderConfig::Anthropic, upstream: Some(url), token_file: None, api_key_file: None };
         cfg.policy = super::policy();
         cfg.policy.daily_token_cap = 10_000_000;
@@ -1253,10 +1241,10 @@ mod omnigent_in_container {
         use crate::meter::UsageMeter;
         use crate::omnigent::{ApprovedAgent, OmnigentHarness};
         use crate::sandbox::Environment;
-        let (Some(relay), true) = (relay(), docker_has("toto-omnigent-test")) else {
-            eprintln!("skipping: needs docker, the musl relay and the toto-omnigent-test image (with bwrap)");
+        if !docker_has("toto-omnigent-test") {
+            eprintln!("skipping: needs docker and the toto-omnigent-test image (with bwrap)");
             return;
-        };
+        }
         let f = fixture("omni-egress");
         // A local web server on the docker bridge gateway stands in for "the internet". The agent's
         // rules allow `GET /ok` only; the server records every path it is asked for.
@@ -1294,7 +1282,6 @@ mod omnigent_in_container {
         assert!(summary.needs_network && summary.needs_nested_sandbox() && summary.egress_rules == [format!("GET {gw}/ok")]);
         let mut sb = DockerSandbox::new();
         sb.network = Some("bridge".into()); // the plain bridge, so the gateway stand-in is reachable
-        sb.relay = Some(relay);
         sb.proxy_socket = Some(proxy.socket().to_path_buf());
         sb.seccomp_profile = Some(profile);
         sb.environments.insert("a".into(), Environment { image: "toto-omnigent-test".into(), network: true });
@@ -1443,9 +1430,9 @@ mod codex_in_container {
         use crate::meter::UsageMeter;
         use crate::omnigent::{ApprovedAgent, OmnigentHarness};
         use crate::sandbox::Environment;
-        use super::omnigent_in_container::{agent_dir, relay, NO_SANDBOX};
-        let (Some(relay), Some(image)) = (relay(), image_with_codex()) else {
-            eprintln!("skipping: needs docker, the musl relay, the toto-omnigent-test image and a static codex binary (CODEX_BIN)");
+        use super::omnigent_in_container::{agent_dir, NO_SANDBOX};
+        let Some(image) = image_with_codex() else {
+            eprintln!("skipping: needs docker, the toto-omnigent-test image and a static codex binary (CODEX_BIN)");
             return;
         };
         let f = fixture("codex-omni");
@@ -1455,7 +1442,6 @@ mod codex_in_container {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let proxy = Arc::new(AuthProxy::start(&dir.join("p.sock"), &url, Provider::OpenAi, Auth::Bearer { token: "sk-REAL-OPENAI".into(), oauth: false }).unwrap());
         let mut sb = DockerSandbox::new();
-        sb.relay = Some(relay);
         sb.proxy_socket = Some(proxy.socket().to_path_buf());
         sb.environments.insert("a".into(), Environment { image, network: false });
         let mut t = task("cx2", "a", 100000, &f.key_a);
@@ -1634,7 +1620,7 @@ mod doctor {
     #[test]
     fn approved_environments_are_checked_against_the_setup() {
         let mut c = cfg("envs");
-        c.sandbox = SandboxConfig::Docker { bin: "docker".into(), runtime: None, relay: None, nested_userns: false, network: None };
+        c.sandbox = SandboxConfig::Docker { bin: "docker".into(), runtime: None, nested_userns: false, network: None };
         let files = super::omnigent_in_container::agent_dir("claude-sdk", "m", "os_env:\n  type: caller_process\n  cwd: \".\"\n  sandbox: {type: linux_bwrap, allow_network: true, egress_rules: [\"GET a.org/**\"]}", &[]);
         let info = crate::image::ImageInfo { id: "sha256:abc".into(), digest: Some(format!("sha256:{}", "ab".repeat(32))), user: String::new(), env: vec![], entrypoint: vec![], cmd: vec![], size: 1, history: vec![] };
         c.environments.insert("acme".into(), crate::projects::Approval::new("ghcr.io/acme/env:1", info, &files, None, false).unwrap());
@@ -1642,18 +1628,18 @@ mod doctor {
         let text: String = checks.iter().map(|k| k.to_string()).collect::<Vec<_>>().join("\n");
         assert!(text.contains("acme: ghcr.io/acme/env:1"), "{text}");
         assert!(text.contains("needs a network, none configured") && text.contains("nested_userns"), "the agent's needs are checked against the setup: {text}");
-        assert!(text.contains("`relay` is not set"), "{text}");
         assert!(!passed(&checks));
     }
 
     #[test]
     fn a_harness_mismatch_is_reported() {
         let mut c = cfg("mismatch");
+        c.sandbox = SandboxConfig::Docker { bin: "docker".into(), runtime: None, nested_userns: false, network: None };
         c.harness = HarnessConfig::Omnigent { provider: crate::config::ProviderConfig::Openai, upstream: None, token_file: None, api_key_file: None };
         let checks = run_all(&c);
         assert!(!passed(&checks));
         let text: String = checks.iter().map(|k| k.to_string()).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("api_key_file") || text.contains("relay"), "the missing credential or relay is named: {text}");
+        assert!(text.contains("api_key_file"), "the missing credential is named: {text}");
     }
 }
 
@@ -2524,6 +2510,69 @@ mod github_queue {
         assert_eq!(cfg.queues.len(), 1, "acme-two still reads that repository");
         projects::remove(&mut cfg, "acme-two").unwrap();
         assert!(cfg.queues.is_empty() && projects::list(&cfg).is_empty());
+    }
+}
+
+mod relay {
+    use crate::relay::{RelayLink, SCRIPT};
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+
+    /// The script and the runner side, on the host with no container: a unix echo server stands
+    /// in for the proxy; several loopback connections at once each get their own bytes back.
+    #[test]
+    fn the_relay_multiplexes_loopback_connections_over_the_exec_stream() {
+        if std::process::Command::new("python3").arg("--version").output().is_err() {
+            eprintln!("skipping: needs python3");
+            return;
+        }
+        let f = super::fixture("relay");
+        let script = f.dir.join("toto-relay.py");
+        std::fs::write(&script, SCRIPT).unwrap();
+        let sock = f.dir.join("echo.sock");
+        let echo = UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            for c in echo.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let (mut r, mut w) = (c.try_clone().unwrap(), c);
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = r.read(&mut buf) {
+                        if n == 0 || w.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = w.shutdown(std::net::Shutdown::Both);
+                });
+            }
+        });
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let listen = format!("127.0.0.1:{port}");
+        let link = RelayLink::start(&[], script.to_str().unwrap(), &listen, &sock).unwrap();
+        let workers: Vec<_> = (0..8u8)
+            .map(|i| {
+                let listen = listen.clone();
+                std::thread::spawn(move || {
+                    let mut c = std::net::TcpStream::connect(&listen).unwrap();
+                    c.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+                    let msg: Vec<u8> = (0..200_000).map(|j| (j as u8).wrapping_add(i)).collect();
+                    let writer = { let mut w = c.try_clone().unwrap(); let m = msg.clone(); std::thread::spawn(move || w.write_all(&m).unwrap()) };
+                    let mut got = vec![0u8; msg.len()];
+                    c.read_exact(&mut got).unwrap();
+                    writer.join().unwrap();
+                    assert_eq!(got, msg, "connection {i} got its own bytes back");
+                    c.shutdown(std::net::Shutdown::Both).unwrap();
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        // A closed upstream closes the loopback side too.
+        drop(link);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(std::net::TcpStream::connect(&listen).is_err(), "the relay stops with its link");
+        let bad = RelayLink::start(&["false".into()], "x", &listen, &sock);
+        assert!(bad.unwrap_err().to_string().contains("did not start"));
     }
 }
 

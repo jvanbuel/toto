@@ -274,7 +274,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cfg = toto::config::Config::starter(&dir);
             let id = hex::encode(cfg.load_or_create_key()?.verifying_key().to_bytes());
             fs::write(&path, serde_json::to_string_pretty(&cfg)?)?;
-            println!("wrote {}\nrunner id: {id}\nNext: build the relay (`relay` in the sandbox config), `toto login`, `toto projects add owner/name`, `toto doctor`.", path.display());
+            println!("wrote {}\nrunner id: {id}\nNext: `toto login`, `toto projects add owner/name`, `toto doctor`.", path.display());
         }
         Cmd::Run { config, once: false } => {
             let cfg = toto::config::Config::load(&config_path(config))?;
@@ -305,6 +305,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Cmd::NetSetup { name, subnet, bin, apply, remove } => {
+            if !cfg!(target_os = "linux") {
+                return Err("the network fence is built from Linux iptables rules on the docker host; on macOS and Windows the daemon runs in a VM you cannot add rules to, so projects whose agents need a network, and prebuilds, are not supported there (published images and offline agents work)".into());
+            }
             let dns = toto::netfence::resolvers(&fs::read_to_string("/etc/resolv.conf").unwrap_or_default());
             let script = if remove { toto::netfence::teardown_script(&bin, &name, &subnet, &dns) } else { toto::netfence::script(&bin, &name, &subnet, &dns) };
             if !apply {

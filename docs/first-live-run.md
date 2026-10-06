@@ -5,17 +5,13 @@ Goal: run one task through the real chain (daemon, hardened container, the proje
 ## Prerequisites
 
 - Rust, Docker (or Podman) running, and for the subscription path the `claude` CLI installed (only `claude setup-token` is used).
-- Linux. The proxy's unix socket is bind-mounted into the container, which Docker Desktop's VM may not support.
+- Linux or macOS (Windows with Docker Desktop should work the same, untested). On macOS, use a project with a published image and an agent that needs no network: the fence is Linux-only.
 
 ## 1. Build
 
 ```
 cargo build --release
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl -p toto-relay
 ```
-
-The relay is the static binary mounted into every task container (`/toto/relay`); build it **for the architecture your containers run** (arm64 on Apple Silicon: `aarch64-unknown-linux-musl`, or build inside `rust:alpine` with `apk add musl-dev`).
 
 ## 2. Configure
 
@@ -27,7 +23,7 @@ toto init                      # ~/.config/toto (or $XDG_CONFIG_HOME/toto)
 In `~/.config/toto/config.json`:
 
 ```json
-"sandbox": {"kind": "docker", "relay": "/ABSOLUTE/PATH/TO/target/x86_64-unknown-linux-musl/release/toto-relay"},
+"sandbox": {"kind": "docker"},
 "harness": {"kind": "omnigent", "provider": "anthropic"}
 ```
 
@@ -46,7 +42,7 @@ toto projects add you/scratch --token-file gh.token
 toto doctor
 ```
 
-`doctor` checks the runner key, the projects, the policy, the queue, the sandbox (including the relay and each approved image: does it contain `omnigent`, `tar`, and `bwrap` if the agent needs it), the network fence, the nested-sandbox prerequisites and the credential, and exits 1 on any `FAIL`.
+`doctor` checks the runner key, the projects, the policy, the queue, the sandbox (including each approved image: does it contain `omnigent`, `python3`, `tar`, and `bwrap` if the agent needs it), the network fence, the nested-sandbox prerequisites and the credential, and exits 1 on any `FAIL`.
 
 ## 4. Post a task and run
 
@@ -60,7 +56,7 @@ toto audit ~/.config/toto/state/audit.jsonl
 
 ## Variant: an agent with egress rules
 
-If the project's agent uses Omnigent's own sandbox (`os_env.sandbox.type: linux_bwrap` with `egress_rules`), the agent's tools reach only those hosts, enforced inside the container. The contributor side needs two things, which `toto projects add` tells you about: as root, `toto net-setup --apply` creates the fenced bridge `toto-egress` (no route to private ranges, other containers or this host), then set `"network": "toto-egress"` and `"nested_userns": true` in the sandbox config. `toto doctor` refuses to pass if the fence does not hold. `toto net-setup --remove --apply` undoes it. Without `network`, projects whose agent needs one are refused; without `nested_userns`, their tools fail.
+If the project's agent uses Omnigent's own sandbox (`os_env.sandbox.type: linux_bwrap` with `egress_rules`), the agent's tools reach only those hosts, enforced inside the container. The contributor side needs two things, which `toto projects add` tells you about (Linux only; the fence is iptables on the docker host): as root, `toto net-setup --apply` creates the fenced bridge `toto-egress` (no route to private ranges, other containers or this host), then set `"network": "toto-egress"` and `"nested_userns": true` in the sandbox config. `toto doctor` refuses to pass if the fence does not hold. `toto net-setup --remove --apply` undoes it. Without `network`, projects whose agent needs one are refused; without `nested_userns`, their tools fail.
 
 ## What to look for
 
@@ -72,7 +68,7 @@ Things this run is meant to settle (note what you see):
 2. **Is the usage figure right?** Compare `tokens=` in the audit line with what your account shows.
 3. **Did anything touch your personal profile?** Your own `~/.claude` should be unchanged; the agent runs in the container with `HOME=/tmp/home`.
 4. **Limits.** If you hit the subscription limit, what exactly comes back? That is the missing signal for "donate only unused capacity".
-5. **Isolation spot-check.** While a task runs: `docker ps` shows one `toto-<task>` container; `docker inspect toto-<task> --format '{{json .Mounts}}'` shows only the relay and the proxy socket; `docker exec toto-<task> env` shows no token.
+5. **Isolation spot-check.** While a task runs: `docker ps` shows one `toto-<task>` container; `docker inspect toto-<task> --format '{{json .Mounts}}'` shows no mounts at all; `docker exec toto-<task> env` shows no token.
 
 ## If it fails
 

@@ -20,7 +20,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # Tests that need a Docker image (toto-omnigent-test, alpine), the musl relay or the dev
+      # Tests that need a Docker image (toto-omnigent-test, alpine) or the dev
       # container CLI print "skipping" and pass; everything else runs.
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings

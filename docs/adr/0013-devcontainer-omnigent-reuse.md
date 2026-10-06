@@ -23,11 +23,11 @@ One path. A project is two standard artefacts, and toto generates nothing:
 
 **Approval binds content at a commit.** `toto projects add` records the image by digest (pulled) or id (prebuilt), the agent directory as a tar plus its hash, and the commit both were read at. The runner starts exactly that; `toto projects update` re-reads, shows the diff (image fields and build steps; the new agent summary) and asks again.
 
-**The container is the sandbox; the runtime is the contributor's.** Docker or Podman with hardened flags (read-only root, all capabilities dropped, `no-new-privileges`, uid 65534, tmpfs `/workspace` and `/tmp`, pid/CPU/memory/time limits, `--entrypoint ""`, no host mounts except the relay binary and the proxy socket), optionally gVisor. `--network none` by default; an agent that needs a network (a URL MCP server, or a sandbox with `allow_network`) gets the contributor's fenced bridge (`toto net-setup`: no private ranges, no other containers, no host) or is refused.
+**The container is the sandbox; the runtime is the contributor's.** Docker or Podman with hardened flags (read-only root, all capabilities dropped, `no-new-privileges`, uid 65534, tmpfs `/workspace` and `/tmp`, pid/CPU/memory/time limits, `--entrypoint ""`, no host mounts at all), optionally gVisor. `--network none` by default; an agent that needs a network (a URL MCP server, or a sandbox with `allow_network`) gets the contributor's fenced bridge (`toto net-setup`: no private ranges, no other containers, no host) or is refused.
 
 **Egress rules live inside the sandbox.** They are the project's, in Omnigent's syntax, in the project's agent config, enforced by Omnigent's nested bubblewrap inside toto's container. toto's part is the opt-in seccomp profile that lets a nested user namespace start (`profiles/seccomp-nested-userns.json`, `nested_userns: true`), the image's `/run/lakebox` marker so bwrap can bind the container's `/proc`, and the check that rule syntax is valid before approval. The host proxy never filters traffic: it exists only to keep the credential out of the harness.
 
-**Kept:** the credential proxy and in-container relay (ADR 12, renamed `toto-relay`), provider profiles (Anthropic, OpenAI), token metering by the proxy, the network fence, DSSE signing, GitHub issues as the queue, results to pull requests, `doctor`.
+**Kept:** the credential proxy (ADR 12) and an in-container relay to it, now a Python script written into the container over `docker exec -i` that multiplexes the container's loopback port over the exec stream (every toto image has Python, since Omnigent needs it; nothing is mounted, no static binary to build, and it works through Docker Desktop's VM on macOS and Windows), provider profiles (Anthropic, OpenAI), token metering by the proxy, the network fence, DSSE signing, GitHub issues as the queue, results to pull requests, `doctor`.
 
 **Deleted:** the host `claude` CLI harness and host placements, the MCP exec bridge (the relay stays), the bubblewrap sandbox, context bundles and the per-kind context opt-ins (`allow_context`, `allow_stdio_mcp`, `allowed_mcp_hosts`), the manifest's `network_allowlist`, the HTTP queue and `serve-queue`, `.toto/project.json`, toto's own dev container subset, the `--accept` gates.
 
@@ -43,7 +43,7 @@ One path. A project is two standard artefacts, and toto generates nothing:
 ## Not verified
 
 - Any real credential, with either provider; whether Anthropic accepts a subscription token through the proxy (ADR 12, ADR 11's terms question).
-- macOS and Windows (unix socket bind mount), Podman with the prebuild, gVisor (cannot run the nested sandbox; projects with egress rules need the default runtime).
+- macOS and Windows end to end (the relay no longer needs a bind mount, and its host side and script are tested on Linux; the fence stays Linux-only, so those hosts get published images and offline agents only), Podman with the prebuild, gVisor (cannot run the nested sandbox; projects with egress rules need the default runtime).
 - A prebuild that needs the fenced network from a machine without root for `net-setup`.
 
 ## Consequences

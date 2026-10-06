@@ -1,7 +1,0 @@
-[package]
-name = "toto-relay"
-version = "0.1.0"
-edition = "2021"
-description = "Static helper mounted into task containers: a loopback relay to the credential proxy socket, and a readiness probe"
-
-[dependencies]

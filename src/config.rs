@@ -28,9 +28,6 @@ pub enum SandboxConfig {
         bin: String,
         #[serde(default)]
         runtime: Option<String>,
-        /// Path to the static `toto-relay` binary, mounted read-only into the container.
-        #[serde(default)]
-        relay: Option<PathBuf>,
         /// Use toto's seccomp profile that allows a nested bubblewrap, so Omnigent can run its own
         /// sandbox inside the container (see `profiles/README.md`). Opt-in.
         #[serde(default)]
@@ -195,7 +192,7 @@ impl Config {
             queue_dir: dir.join("queue"),
             queues: vec![],
             poll_secs: default_poll(),
-            sandbox: SandboxConfig::Docker { bin: docker_bin(), runtime: None, relay: None, nested_userns: false, network: None },
+            sandbox: SandboxConfig::Docker { bin: docker_bin(), runtime: None, nested_userns: false, network: None },
             harness: HarnessConfig::Omnigent { provider: ProviderConfig::Anthropic, upstream: None, token_file: None, api_key_file: None },
             policy: Policy {
                 daily_token_cap: 100_000,
@@ -266,11 +263,10 @@ impl Config {
     fn build_sandbox_with(&self, proxy_socket: Option<PathBuf>) -> Box<dyn Sandbox> {
         match &self.sandbox {
             SandboxConfig::Dir => Box::new(DirSandbox { root: self.state_dir.join("work") }),
-            SandboxConfig::Docker { bin, runtime, relay, nested_userns, network } => {
+            SandboxConfig::Docker { bin, runtime, nested_userns, network } => {
                 let mut s = DockerSandbox::new();
                 s.bin = bin.clone();
                 s.runtime = runtime.clone();
-                s.relay = relay.clone();
                 s.network = network.clone();
                 s.environments = self.environments.iter().map(|(k, a)| (k.clone(), Environment { image: a.pinned(), network: a.agent.needs_network })).collect();
                 if *nested_userns {
@@ -323,8 +319,8 @@ impl Config {
         let harness: Box<dyn Harness> = match &self.harness {
             HarnessConfig::Echo { tokens_per_run } => Box::new(EchoHarness { tokens_per_run: *tokens_per_run }),
             HarnessConfig::Omnigent { provider, upstream, token_file, api_key_file } => {
-                if !matches!(self.sandbox, SandboxConfig::Docker { relay: Some(_), .. }) {
-                    return Err(Error::Policy("the omnigent harness needs a Docker/Podman sandbox with `relay` set to the static toto-relay binary".into()));
+                if !matches!(self.sandbox, SandboxConfig::Docker { .. }) {
+                    return Err(Error::Policy("the omnigent harness needs a Docker/Podman sandbox".into()));
                 }
                 let token_file = token_file.clone().unwrap_or_else(|| self.token_path());
                 let proxy = self.start_proxy(*provider, upstream.as_deref().unwrap_or(provider.default_upstream()), &token_file, api_key_file.as_deref())?;

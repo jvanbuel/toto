@@ -75,18 +75,16 @@ pub fn run_all(cfg: &Config) -> Vec<Check> {
 
     match &cfg.sandbox {
         SandboxConfig::Dir => c.push(Check::new(Level::Warn, "sandbox", "`dir` gives no isolation (development only)")),
-        SandboxConfig::Docker { bin, runtime, nested_userns, network, relay } => {
-            // `probe` covers the daemon, every approved image, the relay binary and the network fence.
+        SandboxConfig::Docker { bin, runtime, nested_userns, network } => {
+            // `probe` covers the daemon, every approved image and the network fence.
             match cfg.build_sandbox().probe() {
                 Ok(()) => c.push(Check::new(Level::Ok, "sandbox", format!("{bin}{}", runtime.as_deref().map_or(String::new(), |r| format!(" (runtime {r})"))))),
                 Err(e) => c.push(Check::new(Level::Fail, "sandbox", e.to_string())),
             }
-            if relay.is_none() {
-                c.push(Check::new(Level::Fail, "sandbox", "`relay` is not set: build the static toto-relay binary and point the sandbox config at it"));
-            }
             match network {
                 Some(net) => c.push(Check::new(Level::Ok, "network", format!("`{net}` is the fenced network for agents that need one"))),
-                None => c.push(Check::new(Level::Warn, "network", "none configured: projects whose agents need a network are refused (`toto net-setup`)")),
+                None if cfg!(target_os = "linux") => c.push(Check::new(Level::Warn, "network", "none configured: projects whose agents need a network are refused (`toto net-setup`)")),
+                None => c.push(Check::new(Level::Warn, "network", "none: the fence needs Linux iptables, so on this OS projects whose agents need a network, and prebuilds, are refused (published images and offline agents work)")),
             }
             if *nested_userns && runtime.as_deref().is_some_and(|r| r.contains("runsc")) {
                 c.push(Check::new(Level::Fail, "nested sandbox", "gVisor (runsc) cannot run a nested bubblewrap"));
@@ -102,9 +100,12 @@ pub fn run_all(cfg: &Config) -> Vec<Check> {
                 if a.agent.needs_nested_sandbox() && !nested_userns {
                     notes.push("uses Omnigent's sandbox, needs `nested_userns: true`");
                 }
-                let tools = run(bin, &["run", "--rm", "--network", "none", "--entrypoint", "sh", &a.pinned(), "-c", "command -v omnigent >/dev/null && echo omnigent; command -v tar >/dev/null && echo tar; command -v bwrap >/dev/null && echo bwrap"]).unwrap_or_default();
+                let tools = run(bin, &["run", "--rm", "--network", "none", "--entrypoint", "sh", &a.pinned(), "-c", "command -v omnigent >/dev/null && echo omnigent; command -v python3 >/dev/null && echo python3; command -v tar >/dev/null && echo tar; command -v bwrap >/dev/null && echo bwrap"]).unwrap_or_default();
                 if !tools.contains("omnigent") {
                     notes.push("image has no `omnigent`");
+                }
+                if !tools.contains("python3") {
+                    notes.push("image has no `python3` (the credential relay runs on it)");
                 }
                 if !tools.contains("tar") {
                     notes.push("image has no `tar`");

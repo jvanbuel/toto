@@ -25,6 +25,7 @@ pub mod pr_flow;
 pub mod projects;
 pub mod proxy;
 pub mod queue;
+pub mod relay;
 pub mod result;
 pub mod runner;
 pub mod sandbox;

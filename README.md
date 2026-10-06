@@ -34,9 +34,7 @@ cargo run -- demo
 
 ```
 cargo build --release
-cargo build --release --target x86_64-unknown-linux-musl -p toto-relay   # the in-container relay (static)
 toto init                                   # ~/.config/toto: runner key, strict starter config
-$EDITOR ~/.config/toto/config.json          # sandbox.relay = path to toto-relay
 toto login                                  # Anthropic subscription token (or api_key_file for OpenAI)
 toto projects add owner/name                # shows the image and the agent; you approve
 toto doctor                                 # what works, what is missing
@@ -46,7 +44,7 @@ toto run --once                             # or: toto install-service
 `config.json`, the parts you set:
 
 ```json
-"sandbox": {"kind": "docker", "relay": "/abs/path/toto-relay"},
+"sandbox": {"kind": "docker"},
 "harness": {"kind": "omnigent", "provider": "anthropic"}
 ```
 
@@ -56,8 +54,12 @@ Add `"bin": "podman"` for Podman, `"runtime": "runsc"` for gVisor, `"nested_user
 
 - the project's image, started read-only with all capabilities dropped, `no-new-privileges`, uid 65534, a 512 MB writable `/workspace`, pid, CPU, memory and time limits from the manifest, `--network none` unless the agent needs a network and you fenced one;
 - the project's agent directory at `/tmp/toto-agent`, run with `omnigent run`; the task prompt from the manifest;
-- model calls through `127.0.0.1:8080` in the container, relayed over a unix socket to the proxy on your host, which adds your credential and counts tokens; the usage meter aborts a task that overruns its estimate;
+- model calls through `127.0.0.1:8080` in the container, where a small Python relay (written in over `docker exec`, no mount) carries them over the exec stream to the proxy on your host, which adds your credential and counts tokens; the usage meter aborts a task that overruns its estimate;
 - the task's input bundle unpacked into `/workspace`; only files the agent changed come back, as a signed artifact tar (deletions as whiteouts), capped by the task.
+
+## Platforms
+
+Linux, macOS and Windows hosts with Docker Desktop, Docker Engine or Podman. Nothing is mounted into a task container and it needs no network, so the relay works through Docker Desktop's VM as well. The network fence is Linux-only (iptables on the docker host): on macOS and Windows, projects whose agents need a network, and projects without a published image (which need the fence to prebuild), are refused; published images and offline agents work. `toto doctor` says which applies.
 
 ## Sandbox runtimes
 

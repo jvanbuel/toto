@@ -865,10 +865,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "toto-relay"
-version = "0.1.0"
-
-[[package]]
 name = "toto-runner"
 version = "0.1.0"
 dependencies = [
