@@ -24,6 +24,11 @@ pub struct Status {
     pub submitted: u64,
     pub dropped: u64,
     pub last_error: Option<String>,
+    /// Set while the runner pauses for quota (`state` is `paused`).
+    #[serde(default)]
+    pub paused_until: Option<String>,
+    #[serde(default)]
+    pub pause_reason: Option<String>,
     pub updated: String,
 }
 
@@ -85,6 +90,8 @@ async fn run_runner(runner: DaemonRunner, cfg: Config, shutdown: impl Future<Out
             Ok(Tick::Submitted(id)) => {
                 status.submitted += 1;
                 backoff = Duration::ZERO;
+                status.paused_until = None;
+                status.pause_reason = None;
                 status.write(&cfg.state_dir, "idle", Some(id));
                 Duration::ZERO
             }
@@ -96,8 +103,18 @@ async fn run_runner(runner: DaemonRunner, cfg: Config, shutdown: impl Future<Out
             }
             Ok(Tick::Idle) => {
                 backoff = Duration::ZERO;
+                status.paused_until = None;
+                status.pause_reason = None;
                 status.write(&cfg.state_dir, "idle", None);
                 poll
+            }
+            Ok(Tick::Paused { until, reason }) => {
+                backoff = Duration::ZERO;
+                status.paused_until = Some(until.to_rfc3339());
+                status.pause_reason = Some(reason);
+                status.write(&cfg.state_dir, "paused", None);
+                // Re-check at the reset, and at least every few minutes in case the signal changes.
+                (until - Local::now()).to_std().unwrap_or(poll).clamp(poll, MAX_BACKOFF)
             }
             Err(e) => {
                 backoff = (backoff * 2).clamp(poll, MAX_BACKOFF);

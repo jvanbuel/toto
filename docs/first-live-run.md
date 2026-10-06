@@ -67,7 +67,7 @@ Things this run is meant to settle (note what you see):
 1. **Does Anthropic accept the subscription token through the proxy?** The proxy adds the token and the OAuth beta flag itself. Failure shows as `authentication_failed` or a 401 in the harness error. If it fails, compare with an API key (`api_key_file`).
 2. **Is the usage figure right?** Compare `tokens=` in the audit line with what your account shows.
 3. **Did anything touch your personal profile?** Your own `~/.claude` should be unchanged; the agent runs in the container with `HOME=/tmp/home`.
-4. **Limits.** If you hit the subscription limit, what exactly comes back? That is the missing signal for "donate only unused capacity".
+4. **Limits.** `toto status` after a task should show nothing paused while your usage is below the reserve (`policy.reserve_pct`, default 20%). If you run a task while your subscription window is nearly used up, the runner should pause with the reason and the reset time, and the task should reappear in the queue rather than fail. The headers this relies on (`anthropic-ratelimit-unified-*` for subscriptions, `anthropic-ratelimit-*` for API keys) are read from real responses only here, so note what `toto status` and the audit log say.
 5. **Isolation spot-check.** While a task runs: `docker ps` shows one `toto-<task>` container; `docker inspect toto-<task> --format '{{json .Mounts}}'` shows no mounts at all; `docker exec toto-<task> env` shows no token.
 
 ## If it fails

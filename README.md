@@ -57,6 +57,10 @@ Add `"bin": "podman"` for Podman, `"runtime": "runsc"` for gVisor, `"nested_user
 - model calls through `127.0.0.1:8080` in the container, where a small Python relay (written in over `docker exec`, no mount) carries them over the exec stream to the proxy on your host, which adds your credential and counts tokens; the usage meter aborts a task that overruns its estimate;
 - the task's input bundle unpacked into `/workspace`; only files the agent changed come back, as a signed artifact tar (deletions as whiteouts), capped by the task.
 
+## Only unused capacity
+
+The proxy sees every provider response, so it reads the rate-limit headers the provider sends: the subscription's 5-hour and 7-day window utilization, an API key's remaining requests and tokens, OpenAI's equivalents, and any 429 or 529 refusal. `policy.reserve_pct` (default 20) is the share of each window you keep for yourself: once the provider reports less than that left, or refuses a request, the runner stops claiming tasks until the window resets, and a task that was running is given back to the queue unfailed. `toto status` shows `paused` with the reason and the time, and the audit log records each pause once.
+
 ## Platforms
 
 Linux, macOS and Windows hosts with Docker Desktop, Docker Engine or Podman. Nothing is mounted into a task container and it needs no network, so the relay works through Docker Desktop's VM as well. The network fence is Linux-only (iptables on the docker host): on macOS and Windows, projects whose agents need a network, and projects without a published image (which need the fence to prebuild), are refused; published images and offline agents work. `toto doctor` says which applies.

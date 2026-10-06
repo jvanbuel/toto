@@ -289,6 +289,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 match runner.tick(Local::now())? {
                     Tick::Idle => break,
+                    Tick::Paused { until, reason } => {
+                        println!("paused: {reason}; until {}", until.format("%H:%M"));
+                        break;
+                    }
                     other => println!("{other:?}"),
                 }
             }
@@ -581,6 +585,7 @@ fn demo() -> Result<(), Box<dyn std::error::Error>> {
         abort_margin_pct: 25,
         available_tools: vec!["echo".into()],
         max_input_bytes: 64 * 1024 * 1024,
+        reserve_pct: 20,
     };
     let queue = InMemoryQueue::default();
     queue.post(

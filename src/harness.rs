@@ -14,11 +14,19 @@ pub trait Harness: Send {
     /// Runs the task against the workspace, reporting every usage increment to `meter`
     /// and aborting with its error when a limit is hit. Returns the raw output.
     fn run(&self, task: &TaskManifest, ws: &Workspace, meter: &mut UsageMeter) -> Result<String>;
+
+    /// What the provider last said about the contributor's allowance (`None`: no information).
+    fn quota(&self) -> Option<crate::quota::QuotaSignal> {
+        None
+    }
 }
 
 impl<T: Harness + ?Sized> Harness for Box<T> {
     fn probe(&self) -> Result<()> {
         (**self).probe()
+    }
+    fn quota(&self) -> Option<crate::quota::QuotaSignal> {
+        (**self).quota()
     }
     fn run(&self, task: &TaskManifest, ws: &Workspace, meter: &mut UsageMeter) -> Result<String> {
         (**self).run(task, ws, meter)

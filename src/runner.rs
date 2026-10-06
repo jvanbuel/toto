@@ -33,6 +33,9 @@ pub enum Tick {
     Submitted(String),
     /// Claimed but not submitted (aborted, failed or declined in review).
     Dropped(String),
+    /// The contributor's allowance is at the reserve or refused by the provider: nothing is
+    /// claimed (and a running task was released, not failed) until `until`.
+    Paused { until: DateTime<Local>, reason: String },
 }
 
 pub struct Runner<Q, H, S, R> {
@@ -49,12 +52,14 @@ pub struct Runner<Q, H, S, R> {
     refused: HashSet<String>,
     /// Id of the task currently leased, shared with the daemon's heartbeat task.
     pub current_lease: Arc<Mutex<Option<String>>>,
+    /// Whether the last tick paused, so a pause is logged once rather than every tick.
+    paused: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
 impl<Q: QueueClient, H: Harness, S: Sandbox, R: Reviewer> Runner<Q, H, S, R> {
     pub fn new(policy: Policy, trusted: TrustedProjects, key: SigningKey, queue: Q, harness: H, sandbox: S, reviewer: R, audit: AuditLog) -> Self {
-        Self { policy, trusted, key, queue, harness, sandbox, reviewer, audit, lease: Duration::from_secs(900), refused: HashSet::new(), current_lease: Arc::default() }
+        Self { policy, trusted, key, queue, harness, sandbox, reviewer, audit, lease: Duration::from_secs(900), refused: HashSet::new(), current_lease: Arc::default(), paused: false }
     }
 
     pub fn runner_id(&self) -> String {
@@ -70,6 +75,13 @@ impl<Q: QueueClient, H: Harness, S: Sandbox, R: Reviewer> Runner<Q, H, S, R> {
         if self.policy.in_quiet_hours(now) {
             return Ok(Tick::Idle);
         }
+        // 1b. Quota: the provider's last word on the allowance decides whether anything is claimed.
+        if let Some(q) = self.harness.quota()
+            && let Some((until, reason)) = self.policy.pause_until(&q, now)
+        {
+            return self.pause(until, reason, now);
+        }
+        self.paused = false;
         let per_project = self.audit.usage_on(now.date_naive())?;
         let used_today: u64 = per_project.values().sum();
 
@@ -114,6 +126,14 @@ impl<Q: QueueClient, H: Harness, S: Sandbox, R: Reviewer> Runner<Q, H, S, R> {
         out
     }
 
+    fn pause(&mut self, until: DateTime<Local>, reason: String, now: DateTime<Local>) -> Result<Tick> {
+        if !self.paused {
+            self.audit.append(&AuditEntry { ts: now, task_id: "-".into(), project_id: "-".into(), outcome: "paused".into(), detail: format!("{reason}; until {}", until.format("%H:%M")), tokens: 0 })?;
+            self.paused = true;
+        }
+        Ok(Tick::Paused { until, reason })
+    }
+
     /// Fetches the task's input bundle, checks it against the signed hash and unpacks it into the
     /// workspace. An all-zero hash means the task has no inputs.
     fn prepare_inputs(&self, task: &TaskManifest, ws: &crate::sandbox::Workspace) -> Result<()> {
@@ -155,6 +175,13 @@ impl<Q: QueueClient, H: Harness, S: Sandbox, R: Reviewer> Runner<Q, H, S, R> {
         let packaged = run.and_then(|out| SignedResult::package(&task.id, out, meter.used(), &task.output_schema, &self.key, artifacts?));
         let result = match packaged {
             Ok(r) => r,
+            Err(Error::Quota(reason)) => {
+                // Not the task's fault: give it back for another runner and pause.
+                self.log(&task, "released", &reason, meter.used(), now)?;
+                self.queue.release(&task.id, &id)?;
+                let until = self.harness.quota().and_then(|q| self.policy.pause_until(&q, now)).map_or(now + chrono::Duration::seconds(crate::policy::DEFAULT_PAUSE_SECS), |(u, _)| u);
+                return self.pause(until, reason, now);
+            }
             Err(e) => {
                 let outcome = if matches!(e, Error::Meter { .. }) { "aborted" } else { "failed" };
                 self.log(&task, outcome, &e, meter.used(), now)?;

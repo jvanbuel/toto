@@ -22,7 +22,7 @@ fn policy() -> Policy {
         daily_token_cap: 1000, project_shares: BTreeMap::from([("a".into(), 1), ("b".into(), 1)]),
         allowed_kinds: vec!["summarise".into()], quiet_hours: None, review_before_submit: false,
         max_profile: SandboxProfile::default(), abort_margin_pct: 25, available_tools: vec!["echo".into()],
-        max_input_bytes: 64 * 1024 * 1024,
+        max_input_bytes: 64 * 1024 * 1024, reserve_pct: 20,
     }
 }
 
@@ -713,7 +713,7 @@ mod proxy {
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Debug)]
-    struct Seen {
+    pub(super) struct Seen {
         method: String,
         path: String,
         headers: Vec<(String, String)>,
@@ -728,6 +728,11 @@ mod proxy {
 
     /// A fake API origin that records requests and answers every one with the same response.
     fn upstream(status: u16, ctype: &'static str, body: Vec<u8>) -> (String, Arc<Mutex<Vec<Seen>>>) {
+        upstream_with(status, ctype, "", body)
+    }
+
+    /// Like `upstream`, with extra response header lines (`k: v\r\n`).
+    pub(super) fn upstream_with(status: u16, ctype: &'static str, extra: &'static str, body: Vec<u8>) -> (String, Arc<Mutex<Vec<Seen>>>) {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", l.local_addr().unwrap());
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -755,11 +760,29 @@ mod proxy {
                 r.read_exact(&mut b).unwrap();
                 log.lock().unwrap().push(Seen { method, path, headers, body: b });
                 let mut s = s;
-                let _ = write!(s, "HTTP/1.1 {status} X\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                let _ = write!(s, "HTTP/1.1 {status} X\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\n{extra}connection: close\r\n\r\n", body.len());
                 let _ = s.write_all(&body);
             }
         });
         (url, seen)
+    }
+
+    #[test]
+    fn the_quota_signal_is_read_from_every_upstream_response() {
+        let f = fixture("px-quota");
+        let (url, _) = upstream_with(200, "application/json", "anthropic-ratelimit-unified-status: allowed_warning\r\nanthropic-ratelimit-unified-5h-utilization: 0.93\r\nanthropic-ratelimit-unified-5h-reset: 1900000000\r\nanthropic-ratelimit-unified-7d-utilization: 0.4\r\n", b"{}".to_vec());
+        let p = start(&f, &url, Auth::Bearer { token: "T".into(), oauth: true });
+        assert!(p.quota().is_none(), "nothing known before the first request");
+        call(p.socket(), &post("/v1/messages", "", "{}"));
+        let q = p.quota().unwrap();
+        assert_eq!((q.status, q.limited, q.utilization, q.resets_at), (200, false, Some(0.93), Some(1900000000)));
+        let (url, _) = upstream_with(429, "application/json", "retry-after: 30\r\n", br#"{"type":"error","error":{"type":"rate_limit_error"}}"#.to_vec());
+        let f2 = fixture("px-quota-429");
+        let p2 = start(&f2, &url, Auth::ApiKey("K".into()));
+        let (st, _) = call(p2.socket(), &post("/v1/messages", "", "{}"));
+        assert_eq!(st, 429, "the refusal passes through to the agent as is");
+        let q = p2.quota().unwrap();
+        assert!(q.limited && q.retry_after == Some(30) && q.describe().contains("refused"), "{q:?}");
     }
 
     /// Sends a raw request over the unix socket and returns (status, body).
@@ -1213,6 +1236,40 @@ mod omnigent_in_container {
         let log = runner.audit.entries().unwrap();
         assert!(log[0].outcome == "submitted" && log[0].tokens > 50, "metered by the proxy: {log:?}");
         assert!(!bodies.iter().any(|(_, b)| b.contains("REAL-SECRET")));
+    }
+
+    /// The provider refuses (429) while Omnigent runs: the harness stops at once instead of
+    /// letting the agent retry against a closed door, and reports a quota error, not a failure.
+    #[test]
+    fn a_refusal_from_the_provider_stops_the_run_as_a_quota_pause() {
+        use crate::harness::Harness;
+        use crate::meter::UsageMeter;
+        use crate::omnigent::{ApprovedAgent, OmnigentHarness};
+        use crate::sandbox::Environment;
+        if !docker_has("toto-omnigent-test") {
+            eprintln!("skipping: needs docker and the toto-omnigent-test image");
+            return;
+        }
+        let f = fixture("omni-429");
+        let (url, _) = super::proxy::upstream_with(429, "application/json", "retry-after: 60\r\nanthropic-ratelimit-unified-status: rejected\r\n", br#"{"type":"error","error":{"type":"rate_limit_error","message":"out of allowance"}}"#.to_vec());
+        let proxy = Arc::new(AuthProxy::start(&sock_dir(&f).join("p.sock"), &url, crate::proxy::Provider::Anthropic, Auth::Bearer { token: "T".into(), oauth: true }).unwrap());
+        let mut sb = DockerSandbox::new();
+        sb.proxy_socket = Some(proxy.socket().to_path_buf());
+        sb.environments.insert("a".into(), Environment { image: "toto-omnigent-test".into(), network: false });
+        let mut t = task("q429", "a", 100000, &f.key_a);
+        t.sandbox_profile.timeout_secs = 170;
+        let ws = sb.create(&t, &t.sandbox_profile).unwrap();
+        let mut h = OmnigentHarness::new(proxy.clone(), crate::proxy::Provider::Anthropic);
+        h.agents.insert("a".into(), ApprovedAgent { tar: crate::agent::pack(&agent_dir("claude-sdk", "claude-fake", NO_SANDBOX, &[])).unwrap(), harness: "claude-sdk".into() });
+        let started = std::time::Instant::now();
+        let e = h.run(&t, &ws, &mut UsageMeter::new(1_000_000, 25)).unwrap_err();
+        eprintln!("FACT 429 run stopped after {:?}: {e}", started.elapsed());
+        sb.destroy(ws).unwrap();
+        assert!(matches!(e, crate::Error::Quota(_)), "{e}");
+        assert!(e.to_string().contains("refused") && e.to_string().contains("retry after 60s"), "{e}");
+        let q = h.quota().unwrap();
+        assert!(q.limited && q.retry_after == Some(60));
+        assert!(started.elapsed() < std::time::Duration::from_secs(120), "stopped at the first refusal, not after the agent's own retries");
     }
 
     /// A project whose agent uses a harness this runner has no credential for is refused before anything runs.
@@ -2573,6 +2630,146 @@ mod relay {
         assert!(std::net::TcpStream::connect(&listen).is_err(), "the relay stops with its link");
         let bad = RelayLink::start(&["false".into()], "x", &listen, &sock);
         assert!(bad.unwrap_err().to_string().contains("did not start"));
+    }
+}
+
+mod quota {
+    use crate::quota::QuotaSignal;
+    use chrono::{Local, TimeZone};
+
+    fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn subscription_api_key_and_openai_headers_are_understood() {
+        let now = 1_800_000_000;
+        let sub = QuotaSignal::from_response(200, &h(&[("anthropic-ratelimit-unified-status", "allowed"), ("anthropic-ratelimit-unified-5h-utilization", "0.42"), ("anthropic-ratelimit-unified-5h-reset", "1800003600"), ("anthropic-ratelimit-unified-7d-utilization", "0.81"), ("anthropic-ratelimit-unified-7d-reset", "1800400000")]), now);
+        assert_eq!((sub.limited, sub.utilization, sub.resets_at, sub.remaining), (false, Some(0.81), Some(1800400000), None), "the busiest window counts: {sub:?}");
+        let rejected = QuotaSignal::from_response(200, &h(&[("anthropic-ratelimit-unified-status", "rejected"), ("anthropic-ratelimit-unified-reset", "1800000900"), ("anthropic-ratelimit-unified-5h-utilization", "100")]), now);
+        assert!(rejected.limited && rejected.resets_at == Some(1800000900) && rejected.utilization == Some(1.0), "a percentage is accepted too: {rejected:?}");
+        let key = QuotaSignal::from_response(200, &h(&[("anthropic-ratelimit-requests-limit", "50"), ("anthropic-ratelimit-requests-remaining", "49"), ("anthropic-ratelimit-requests-reset", "2027-01-01T00:00:00Z"), ("anthropic-ratelimit-tokens-limit", "40000"), ("anthropic-ratelimit-tokens-remaining", "4000"), ("anthropic-ratelimit-tokens-reset", "2027-01-01T00:00:10Z")]), now);
+        assert_eq!((key.remaining, key.resets_at, key.utilization), (Some(0.1), Some(1798761610), None), "the tightest limit and its reset: {key:?}");
+        let oa = QuotaSignal::from_response(200, &h(&[("x-ratelimit-limit-requests", "100"), ("x-ratelimit-remaining-requests", "90"), ("x-ratelimit-reset-requests", "1s"), ("x-ratelimit-limit-tokens", "1000"), ("x-ratelimit-remaining-tokens", "50"), ("x-ratelimit-reset-tokens", "6m0s")]), now);
+        assert_eq!((oa.remaining, oa.resets_at), (Some(0.05), Some(now + 360)), "{oa:?}");
+        let ms = QuotaSignal::from_response(429, &h(&[("x-ratelimit-limit-tokens", "10"), ("x-ratelimit-remaining-tokens", "0"), ("x-ratelimit-reset-tokens", "250ms"), ("retry-after", "2")]), now);
+        assert!(ms.limited && ms.resets_at == Some(now + 1) && ms.retry_after == Some(2), "{ms:?}");
+        let overloaded = QuotaSignal::from_response(529, &[], now);
+        assert!(overloaded.limited && overloaded.describe().contains("529"));
+        let none = QuotaSignal::from_response(200, &h(&[("content-type", "text/event-stream")]), now);
+        assert!(!none.limited && none.utilization.is_none() && none.remaining.is_none() && none.describe().contains("no quota information"));
+    }
+
+    #[test]
+    fn the_reserve_decides_when_to_pause_and_the_reset_when_to_resume() {
+        let mut p = super::policy();
+        let now = Local.with_ymd_and_hms(2026, 10, 6, 12, 0, 0).unwrap();
+        let t = now.timestamp();
+        let sig = |utilization: f64, resets_at: Option<i64>| QuotaSignal { seen_at: t, status: 200, limited: false, utilization: Some(utilization), remaining: None, resets_at, retry_after: None };
+        assert!(p.pause_until(&sig(0.5, Some(t + 3600)), now).is_none(), "half used, 20% reserve: keep going");
+        let (until, reason) = p.pause_until(&sig(0.85, Some(t + 3600)), now).unwrap();
+        assert_eq!(until, now + chrono::Duration::seconds(3600));
+        assert!(reason.contains("85%") && reason.contains("20%"), "{reason}");
+        assert!(p.pause_until(&sig(0.85, Some(t - 1)), now).is_none(), "the window reset since: try again");
+        p.reserve_pct = 0;
+        assert!(p.pause_until(&sig(0.99, Some(t + 60)), now).is_none(), "no reserve: only a refusal pauses");
+        let refused = QuotaSignal { seen_at: t, status: 429, limited: true, utilization: None, remaining: None, resets_at: None, retry_after: Some(45) };
+        let (until, reason) = p.pause_until(&refused, now).unwrap();
+        assert_eq!(until, now + chrono::Duration::seconds(45));
+        assert!(reason.contains("refused"));
+        let bare = QuotaSignal { seen_at: t, status: 529, limited: true, utilization: None, remaining: None, resets_at: None, retry_after: None };
+        assert_eq!(p.pause_until(&bare, now).unwrap().0, now + chrono::Duration::seconds(crate::policy::DEFAULT_PAUSE_SECS), "no reset given: a short default pause");
+        p.reserve_pct = 20;
+        let key = QuotaSignal { seen_at: t, status: 200, limited: false, utilization: None, remaining: Some(0.15), resets_at: Some(t + 10), retry_after: None };
+        assert!(p.pause_until(&key, now).unwrap().1.contains("15%"), "API-key remaining counts against the reserve too");
+    }
+}
+
+mod quota_runner {
+    use super::{fixture, policy, task};
+    use crate::audit::AuditLog;
+    use crate::harness::Harness;
+    use crate::manifest::{TaskManifest, TrustedProjects};
+    use crate::meter::UsageMeter;
+    use crate::queue::{InMemoryQueue, QueueClient};
+    use crate::quota::QuotaSignal;
+    use crate::runner::{Runner, Tick};
+    use crate::sandbox::{DirSandbox, Workspace};
+    use chrono::Local;
+    use std::sync::{Arc, Mutex};
+
+    /// A harness whose quota signal the test sets, and that can hit the limit mid-run.
+    struct QuotaHarness {
+        signal: Arc<Mutex<Option<QuotaSignal>>>,
+        limit_during_run: Arc<Mutex<bool>>,
+        runs: Arc<Mutex<u32>>,
+    }
+    impl Harness for QuotaHarness {
+        fn quota(&self) -> Option<QuotaSignal> {
+            self.signal.lock().unwrap().clone()
+        }
+        fn run(&self, task: &TaskManifest, _ws: &Workspace, meter: &mut UsageMeter) -> crate::Result<String> {
+            *self.runs.lock().unwrap() += 1;
+            meter.record(10)?;
+            if *self.limit_during_run.lock().unwrap() {
+                let now = Local::now().timestamp();
+                *self.signal.lock().unwrap() = Some(QuotaSignal { seen_at: now, status: 429, limited: true, utilization: None, remaining: None, resets_at: Some(now + 120), retry_after: None });
+                return Err(crate::Error::Quota("the provider refused a request (status 429)".into()));
+            }
+            Ok(format!("ok: {}", task.prompt))
+        }
+    }
+
+    #[test]
+    fn the_runner_pauses_at_the_reserve_and_gives_a_task_back_when_the_limit_hits_mid_run() {
+        let f = fixture("quota-runner");
+        let mut trusted = TrustedProjects::default();
+        trusted.insert("a", f.key_a.verifying_key());
+        let signal: Arc<Mutex<Option<QuotaSignal>>> = Default::default();
+        let limit_during_run = Arc::new(Mutex::new(false));
+        let runs = Arc::new(Mutex::new(0));
+        let h = QuotaHarness { signal: signal.clone(), limit_during_run: limit_during_run.clone(), runs: runs.clone() };
+        let mut r = Runner::new(policy(), trusted, crate::manifest::generate_key(), InMemoryQueue::default(), h, DirSandbox { root: f.dir.join("work") }, |_: &TaskManifest, _: &crate::result::SignedResult| true, AuditLog::new(f.dir.join("audit.jsonl")));
+        r.queue.post(task("q1", "a", 100, &f.key_a).sign(&f.key_a).unwrap());
+        r.queue.post(task("q2", "a", 100, &f.key_a).sign(&f.key_a).unwrap());
+
+        // 1. Over the reserve: nothing is claimed, the pause is logged once.
+        let now = Local::now().timestamp();
+        *signal.lock().unwrap() = Some(QuotaSignal { seen_at: now, status: 200, limited: false, utilization: Some(0.9), remaining: None, resets_at: Some(now + 600), retry_after: None });
+        for _ in 0..3 {
+            assert!(matches!(r.tick(Local::now()).unwrap(), Tick::Paused { reason, .. } if reason.contains("90%")));
+        }
+        assert_eq!(r.queue.available().unwrap().len(), 2, "nothing claimed while paused");
+        assert_eq!(*runs.lock().unwrap(), 0);
+        let log = r.audit.entries().unwrap();
+        assert_eq!(log.iter().filter(|e| e.outcome == "paused").count(), 1, "logged once, not every tick: {log:?}");
+
+        // 2. The window reset: work resumes.
+        *signal.lock().unwrap() = Some(QuotaSignal { seen_at: now, status: 200, limited: false, utilization: Some(0.9), remaining: None, resets_at: Some(now - 1), retry_after: None });
+        assert_eq!(r.tick(Local::now()).unwrap(), Tick::Submitted("q1".into()));
+
+        // 3. The limit hits during a task: the lease goes back, the task is not marked failed or
+        //    refused, and the runner pauses until the reset the provider gave.
+        *limit_during_run.lock().unwrap() = true;
+        let before = Local::now();
+        match r.tick(Local::now()).unwrap() {
+            Tick::Paused { until, reason } => {
+                assert!(reason.contains("refused"), "{reason}");
+                assert!(until >= before + chrono::Duration::seconds(110) && until <= Local::now() + chrono::Duration::seconds(121), "{until}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(r.queue.available().unwrap().len(), 1, "q2 is available again for any runner");
+        let log = r.audit.entries().unwrap();
+        assert!(log.iter().any(|e| e.task_id == "q2" && e.outcome == "released"), "{log:?}");
+        assert!(!log.iter().any(|e| e.task_id == "q2" && (e.outcome == "failed" || e.outcome == "aborted")));
+        // Still paused on the next tick, from the signal alone.
+        assert!(matches!(r.tick(Local::now()).unwrap(), Tick::Paused { .. }));
+        // Once the pause is over and the limit is gone, the same task runs.
+        *limit_during_run.lock().unwrap() = false;
+        *signal.lock().unwrap() = None;
+        assert_eq!(r.tick(Local::now()).unwrap(), Tick::Submitted("q2".into()));
+        assert_eq!(*runs.lock().unwrap(), 3);
     }
 }
 

@@ -25,6 +25,7 @@ pub mod pr_flow;
 pub mod projects;
 pub mod proxy;
 pub mod queue;
+pub mod quota;
 pub mod relay;
 pub mod result;
 pub mod runner;
@@ -50,6 +51,10 @@ pub enum Error {
     Schema(String),
     #[error("queue error: {0}")]
     Queue(String),
+    /// The provider reported that the contributor's allowance is used up; the task is released,
+    /// not failed, and the runner pauses.
+    #[error("paused for quota: {0}")]
+    Quota(String),
     #[error("result rejected by contributor")]
     ReviewRejected,
     #[error(transparent)]

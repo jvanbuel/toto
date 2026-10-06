@@ -1,6 +1,7 @@
 //! Policy engine: the contributor's consent (ADR 4: source of truth for caps and shares).
 
 use crate::manifest::{SandboxProfile, TaskManifest};
+use crate::quota::QuotaSignal;
 use crate::{Error, Result};
 use chrono::{DateTime, Local, Timelike};
 use serde::{Deserialize, Serialize};
@@ -30,7 +31,19 @@ pub struct Policy {
     /// Largest input bundle this runner will unpack into a task workspace.
     #[serde(default = "default_input_bytes")]
     pub max_input_bytes: u64,
+    /// Share of each rate window kept for the contributor's own use, in percent. Tasks pause
+    /// when the provider reports less than this left, or refuses a request, until the window
+    /// resets: toto donates unused capacity, not the contributor's own.
+    #[serde(default = "default_reserve")]
+    pub reserve_pct: u64,
 }
+
+fn default_reserve() -> u64 {
+    20
+}
+
+/// How long a pause lasts when the provider gave no reset time.
+pub const DEFAULT_PAUSE_SECS: i64 = 300;
 
 fn default_input_bytes() -> u64 {
     64 * 1024 * 1024
@@ -41,6 +54,24 @@ fn default_margin() -> u64 {
 }
 
 impl Policy {
+    /// Whether the last quota signal means the runner should pause, and until when, with the
+    /// reason. A signal whose reset time has passed no longer pauses: the next task refreshes it.
+    pub fn pause_until(&self, q: &QuotaSignal, now: DateTime<Local>) -> Option<(DateTime<Local>, String)> {
+        let floor = self.reserve_pct.min(100) as f64 / 100.0;
+        let reason = if q.limited {
+            format!("the provider refused a request (status {})", q.status)
+        } else if q.utilization.is_some_and(|u| u >= 1.0 - floor) {
+            format!("{:.0}% of a rate window is used, you keep {}%", q.utilization.unwrap_or(0.0) * 100.0, self.reserve_pct)
+        } else if q.remaining.is_some_and(|r| r <= floor) {
+            format!("{:.0}% of a rate limit is left, you keep {}%", q.remaining.unwrap_or(0.0) * 100.0, self.reserve_pct)
+        } else {
+            return None;
+        };
+        let until = q.resets_at.or_else(|| q.retry_after.map(|r| q.seen_at + r as i64)).unwrap_or(q.seen_at + DEFAULT_PAUSE_SECS);
+        let until = DateTime::from_timestamp(until, 0)?.with_timezone(&Local);
+        (until > now).then_some((until, reason))
+    }
+
     pub fn in_quiet_hours(&self, now: DateTime<Local>) -> bool {
         match self.quiet_hours {
             None => false,

@@ -204,6 +204,7 @@ impl Config {
                 abort_margin_pct: 25,
                 available_tools: vec!["claude".into(), "omnigent".into()],
                 max_input_bytes: 64 * 1024 * 1024,
+                reserve_pct: 20,
             },
             projects: BTreeMap::new(),
             environments: BTreeMap::new(),

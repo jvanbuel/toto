@@ -69,6 +69,8 @@ struct Shared {
     provider: Provider,
     upstream: String,
     auth: Auth,
+    /// What the last upstream response said about the contributor's allowance.
+    quota: std::sync::Mutex<Option<crate::quota::QuotaSignal>>,
     tokens: AtomicU64,
     requests: AtomicU64,
     active: AtomicU64,
@@ -90,7 +92,7 @@ impl AuthProxy {
         // The container user must be able to connect through the bind mount; the private parent
         // directory keeps other host users out.
         std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o666))?;
-        let shared = Arc::new(Shared { provider, upstream: upstream.trim_end_matches('/').to_string(), auth, tokens: 0.into(), requests: 0.into(), active: 0.into(), stop: false.into() });
+        let shared = Arc::new(Shared { provider, upstream: upstream.trim_end_matches('/').to_string(), auth, quota: Default::default(), tokens: 0.into(), requests: 0.into(), active: 0.into(), stop: false.into() });
         let s = shared.clone();
         let thread = std::thread::spawn(move || {
             for conn in listener.incoming() {
@@ -120,6 +122,11 @@ impl AuthProxy {
 
     pub fn requests(&self) -> u64 {
         self.shared.requests.load(Ordering::Relaxed)
+    }
+
+    /// The quota signal from the most recent upstream response, if any request was made.
+    pub fn quota(&self) -> Option<crate::quota::QuotaSignal> {
+        self.shared.quota.lock().unwrap().clone()
     }
 
     pub fn socket(&self) -> &Path {
@@ -241,6 +248,8 @@ fn forward(sh: &Shared, method: &str, path: &str, query: &str, headers: &[(Strin
     let resp = agent.run(req).map_err(|e| Error::Harness(e.to_string()))?;
     let (parts, body) = resp.into_parts();
     let status = parts.status.as_u16();
+    let lowered: Vec<(String, String)> = parts.headers.iter().filter_map(|(k, v)| Some((k.as_str().to_ascii_lowercase(), v.to_str().ok()?.to_string()))).collect();
+    *sh.quota.lock().unwrap() = Some(crate::quota::QuotaSignal::from_response(status, &lowered, chrono::Utc::now().timestamp()));
     let sse = parts.headers.get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream"));
 
     let mut out = conn;

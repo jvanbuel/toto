@@ -42,6 +42,10 @@ impl OmnigentHarness {
 }
 
 impl Harness for OmnigentHarness {
+    fn quota(&self) -> Option<crate::quota::QuotaSignal> {
+        self.proxy.quota()
+    }
+
     fn run(&self, task: &TaskManifest, ws: &Workspace, meter: &mut UsageMeter) -> Result<String> {
         let agent = self.agents.get(&task.project_id).ok_or_else(|| Error::Harness(format!("no approved agent for project `{}`", task.project_id)))?;
         match agent::provider_for(&agent.harness) {
@@ -74,6 +78,7 @@ impl Harness for OmnigentHarness {
         exec_io(&sh, &["sh", "-c", "cat > /tmp/prompt.txt"], Some(task.prompt.as_bytes()), t, 4096)?;
 
         let start = self.proxy.tokens();
+        let started_at = chrono::Utc::now().timestamp();
         let mut argv = sh.exec_prefix.clone();
         argv.extend(["sh".into(), "-c".into(), format!("exec omnigent run {CONTAINER_AGENT_DIR} -p \"$(cat /tmp/prompt.txt)\"")]);
         let mut child = Command::new(&argv[0]).args(&argv[1..]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
@@ -108,6 +113,16 @@ impl Harness for OmnigentHarness {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(Error::Harness(format!("timed out after {}s", task.sandbox_profile.timeout_secs)));
+            }
+            // The allowance ran out under this task: stop now rather than let the agent retry
+            // against a closed door; the runner gives the lease back and pauses.
+            if let Some(q) = self.proxy.quota()
+                && q.limited
+                && q.seen_at >= started_at
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Quota(q.describe()));
             }
             std::thread::sleep(Duration::from_millis(50));
         };
