@@ -35,7 +35,7 @@
 	{/if}
 	{#if a.egress_rules.length}
 		<dt class="text-muted-foreground">egress rules</dt>
-		<dd class="font-mono text-xs">{a.egress_rules.join('\n')}</dd>
+		<dd class="font-mono text-xs whitespace-pre-line">{a.egress_rules.join('\n')}</dd>
 	{/if}
 </dl>
 <details class="mt-3 text-sm">
