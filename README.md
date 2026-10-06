@@ -1,3 +1,5 @@
+<img src="assets/logo.svg" alt="toto" width="236" height="64">
+
 # toto
 
 **toto** — *Tokens Offered To Others* — is the local runner that donates unused capacity from your own AI subscriptions or API keys to projects you choose, without your credentials ever leaving your machine.

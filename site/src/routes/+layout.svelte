@@ -14,7 +14,9 @@
 
 <div class="mx-auto flex min-h-screen max-w-5xl flex-col px-4 sm:px-6">
 	<header class="flex items-center justify-between py-5">
-		<a href={resolve('/')} class="text-lg font-semibold tracking-tight">toto</a>
+		<a href={resolve('/')} class="flex items-center gap-2 text-lg font-semibold tracking-tight"
+			><img src={favicon} alt="" class="h-6 w-6" /> toto</a
+		>
 		<nav class="flex gap-5 text-sm text-muted-foreground">
 			<a href="{resolve('/')}#projects" class="hover:text-foreground">Projects</a>
 			<a href="{resolve('/')}#contribute" class="hover:text-foreground">Contribute</a>

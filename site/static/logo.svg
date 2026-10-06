@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 236 64" width="236" height="64">
+  <title>toto — Tokens Offered To Others</title>
+  <style>
+    .s { fill: none; stroke: #18181b; stroke-width: 8; stroke-linecap: round; stroke-linejoin: round; }
+    .m { stroke-width: 6; }
+    @media (prefers-color-scheme: dark) { .s { stroke: #fafafa; } }
+  </style>
+  <!-- mark: a token offered into open hands -->
+  <circle class="s m" cx="32" cy="19" r="9"/>
+  <path class="s m" d="M12 33v8a20 20 0 0 0 40 0v-8"/>
+  <!-- wordmark: t o t o, the o's are the token -->
+  <g transform="translate(78 0)">
+    <path class="s" d="M16 8v36a8 8 0 0 0 8 8h4M6 22h22"/>
+    <circle class="s" cx="54" cy="36" r="14"/>
+    <path class="s" d="M90 8v36a8 8 0 0 0 8 8h4M80 22h22"/>
+    <circle class="s" cx="128" cy="36" r="14"/>
+  </g>
+</svg>

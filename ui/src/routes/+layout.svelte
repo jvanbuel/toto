@@ -1,5 +1,6 @@
 <script lang="ts">
 	import './layout.css';
+	import favicon from '#lib/assets/favicon.svg';
 	import { resolve } from '$app/paths';
 	import { page } from '$app/state';
 	import { token } from '#lib/api.js';
@@ -18,11 +19,14 @@
 
 <svelte:head>
 	<title>toto</title>
+	<link rel="icon" href={favicon} />
 </svelte:head>
 
 <div class="mx-auto flex min-h-screen max-w-4xl flex-col px-4 sm:px-6">
 	<header class="flex items-center justify-between py-5">
-		<a href={resolve('/')} class="text-lg font-semibold tracking-tight">toto</a>
+		<a href={resolve('/')} class="flex items-center gap-2 text-lg font-semibold tracking-tight"
+			><img src={favicon} alt="" class="h-6 w-6" /> toto</a
+		>
 		<nav class="flex gap-5 text-sm">
 			{#each links as l (l.href)}
 				<a
