@@ -181,3 +181,133 @@ pub fn list(cfg: &Config) -> Vec<String> {
         })
         .collect()
 }
+
+// ----------------------------------------------------------------------------------------------
+// Previews: everything `add` and `update` show before asking, computed without changing the
+// config, so the CLI and the local UI run the same logic and differ only in how they ask.
+
+use crate::directory::{self, Entry};
+use crate::github_queue::GitHubQueue;
+
+/// What a contributor is about to approve for one project.
+#[derive(Debug)]
+pub struct Preview {
+    pub repo: String,
+    pub fetched: Fetched,
+    pub approval: Approval,
+    /// The directory entry the name resolved to, or the entry for this repository if listed.
+    pub listed: Option<Entry>,
+    /// What `add` would say about the contributor's setup (fence, nested sandbox, token, harness).
+    pub notes: Vec<String>,
+}
+
+/// The result of re-checking a project.
+#[derive(Debug)]
+pub enum UpdateCheck {
+    UpToDate(String),
+    Changed(Box<Changed>),
+}
+
+#[derive(Debug)]
+pub struct Changed {
+    pub old: Option<Approval>,
+    pub preview: Preview,
+    pub lines: Vec<String>,
+}
+
+fn github(api: &str, repo: &str, token_file: Option<&std::path::Path>) -> Result<GitHubQueue> {
+    let token = token_file.map(crate::secrets::read_secret).transpose()?;
+    Ok(GitHubQueue::new(api, repo, crate::github_queue::DEFAULT_LABEL, token))
+}
+
+/// Resolves what the contributor typed: a directory name, or `owner/name` (cross-checked with the
+/// directory when listed). Returns the repository, the entry if any, and a note when the
+/// directory could not be read for an `owner/name`.
+pub fn resolve(cfg: &Config, arg: &str) -> Result<(String, Option<Entry>, Option<String>)> {
+    let d = &cfg.directory;
+    let lookup = || -> Result<Option<Entry>> {
+        let key = directory::parse_key(&d.public_key)?;
+        let gh = GitHubQueue::new(&d.api_url, &d.repo, crate::github_queue::DEFAULT_LABEL, None);
+        Ok(directory::fetch(&gh, &d.path, &key)?.resolve(arg).cloned())
+    };
+    match (lookup(), arg.contains('/')) {
+        (Ok(Some(e)), _) => Ok((e.repo.clone(), Some(e), None)),
+        (Ok(None), true) => Ok((arg.to_string(), None, None)),
+        (Ok(None), false) => Err(Error::Policy(format!("no project `{arg}` in the directory (`toto directory list` shows them; or give `owner/name`)"))),
+        (Err(e), true) => Ok((arg.to_string(), None, Some(format!("the project directory could not be checked ({e})")))),
+        (Err(e), false) => Err(Error::Policy(format!("`{arg}` is not `owner/name`, and the project directory could not be read to look it up: {e}"))),
+    }
+}
+
+/// Pulls or prebuilds the project's environment and assembles the approval the contributor is
+/// shown. `progress` gets a line when something slow starts.
+pub fn approval_for(cfg: &Config, repo: &str, f: &Fetched, progress: &mut dyn FnMut(&str)) -> Result<Approval> {
+    let bin = cfg.docker_bin().ok_or_else(|| Error::Policy("project environments are container images: configure a docker or podman sandbox first".into()))?;
+    let (image, info, prebuilt) = match &f.devcontainer.image {
+        Some(image) => {
+            progress(&format!("pulling {image}..."));
+            (image.clone(), crate::image::inspect(bin, image, true)?, false)
+        }
+        None => {
+            let network = cfg.sandbox_network().ok_or_else(|| Error::Policy("this project publishes no image, so it has to be prebuilt here, and a prebuild needs the fenced network: run `toto net-setup --apply` and set `network` in the sandbox config".into()))?;
+            let pb = crate::prebuild::Prebuild { bin: bin.into(), cli: crate::prebuild::DEFAULT_CLI.into(), network: network.into(), work_dir: cfg.state_dir.join("prebuild") };
+            progress(&format!("prebuilding {repo} (build, onCreateCommand, updateContentCommand); this can take a while..."));
+            let (tag, info) = pb.build(&format!("https://github.com/{repo}.git"), f.commit.as_deref(), &f.devcontainer.toto.id, &f.devcontainer_text, crate::devcontainer::PATH)?;
+            (tag, info, true)
+        }
+    };
+    Approval::new(&image, info, &f.agent_files, f.commit.clone(), prebuilt)
+}
+
+/// Everything `toto projects add <arg>` shows. Nothing in `cfg` changes.
+pub fn preview_add(cfg: &Config, arg: &str, api: &str, token_file: Option<&std::path::Path>, share: u32, progress: &mut dyn FnMut(&str)) -> Result<Preview> {
+    let (repo, listed, note) = resolve(cfg, arg)?;
+    if let Some(n) = &note {
+        progress(&format!("note: {n}"));
+    }
+    let fetched = fetch(&github(api, &repo, token_file)?)?;
+    if let Some(e) = &listed {
+        directory::check_key(e, &fetched.devcontainer.toto)?;
+    }
+    let approval = approval_for(cfg, &repo, &fetched, progress)?;
+    let mut trial = cfg.clone();
+    let notes = add(&mut trial, &repo, &fetched.devcontainer, approval.clone(), &AddOptions { share, token_file: token_file.map(Into::into) })?;
+    Ok(Preview { repo, fetched, approval, listed, notes })
+}
+
+/// Applies a preview the contributor confirmed.
+pub fn apply_add(cfg: &mut Config, p: &Preview, o: &AddOptions) -> Result<Vec<String>> {
+    add(cfg, &p.repo, &p.fetched.devcontainer, p.approval.clone(), o)
+}
+
+/// Everything `toto projects update <id>` shows. Nothing in `cfg` changes.
+pub fn preview_update(cfg: &Config, id: &str, api: &str, token_file: Option<&std::path::Path>, progress: &mut dyn FnMut(&str)) -> Result<UpdateCheck> {
+    let repo = cfg.sources.get(id).cloned().ok_or_else(|| Error::Policy(format!("project `{id}` was not added with `toto projects add`")))?;
+    let fetched = fetch(&github(api, &repo, token_file)?)?;
+    if cfg.projects.get(id) != Some(&fetched.devcontainer.toto.public_key) {
+        return Err(Error::Verify(format!("{repo} now publishes a different key for `{id}`: if you trust the change, `toto projects remove {id}` and add it again")));
+    }
+    let old = cfg.environments.get(id).cloned();
+    if let Some(o) = &old
+        && o.prebuilt && o.commit.is_some() && o.commit == fetched.commit
+    {
+        return Ok(UpdateCheck::UpToDate(format!("commit {}", o.commit.as_deref().unwrap_or(""))));
+    }
+    let approval = approval_for(cfg, &repo, &fetched, progress)?;
+    if let Some(o) = &old
+        && o.info.id == approval.info.id && o.agent_hash == approval.agent_hash
+    {
+        return Ok(UpdateCheck::UpToDate(approval.info.short()));
+    }
+    let lines = match &old {
+        Some(o) => o.diff(&approval),
+        None => approval.describe(),
+    };
+    let preview = Preview { repo, fetched, approval, listed: None, notes: vec![] };
+    Ok(UpdateCheck::Changed(Box::new(Changed { old, preview, lines })))
+}
+
+/// Applies an update the contributor confirmed.
+pub fn apply_update(cfg: &mut Config, id: &str, approval: Approval) {
+    cfg.environments.insert(id.to_string(), approval);
+}

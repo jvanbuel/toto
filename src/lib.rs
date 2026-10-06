@@ -33,6 +33,7 @@ pub mod runner;
 pub mod sandbox;
 pub mod secrets;
 pub mod service;
+pub mod ui;
 
 use thiserror::Error;
 

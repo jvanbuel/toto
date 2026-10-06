@@ -220,6 +220,14 @@ impl Config {
         Ok(serde_json::from_slice(&std::fs::read(path)?)?)
     }
 
+    /// Writes the config atomically (a temp file renamed into place).
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
+        std::fs::rename(tmp, path)?;
+        Ok(())
+    }
+
     /// A safe starter config: strict policy and no projects, so nothing runs until the contributor
     /// adds one.
     pub fn starter(dir: &Path) -> Self {

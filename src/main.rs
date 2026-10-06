@@ -42,6 +42,13 @@ enum Cmd {
         #[arg(long, global = true)]
         config: Option<PathBuf>,
     },
+    /// Serve the local page (status, usage, projects, approvals) on loopback and print its URL.
+    Ui {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long, default_value = "127.0.0.1:7707")]
+        addr: String,
+    },
     /// The signed project directory: list it, or (maintainers) add, remove and sign entries.
     Directory {
         #[command(subcommand)]
@@ -238,13 +245,6 @@ enum ProjectsCmd {
     Remove { id: String },
 }
 
-fn save_config(path: &std::path::Path, cfg: &toto::config::Config) -> Result<(), Box<dyn std::error::Error>> {
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_string_pretty(cfg)?)?;
-    fs::rename(tmp, path)?;
-    Ok(())
-}
-
 /// Asks the contributor; `yes` answers for them, and without a terminal there is nobody to ask.
 fn confirm(question: &str, yes: bool) -> Result<bool, Box<dyn std::error::Error>> {
     use std::io::{BufRead, IsTerminal, Write};
@@ -264,22 +264,6 @@ fn confirm(question: &str, yes: bool) -> Result<bool, Box<dyn std::error::Error>
 fn github(api: &str, repo: &str, token_file: Option<&std::path::Path>) -> Result<toto::github_queue::GitHubQueue, Box<dyn std::error::Error>> {
     let token = token_file.map(toto::secrets::read_secret).transpose()?;
     Ok(toto::github_queue::GitHubQueue::new(api, repo, toto::github_queue::DEFAULT_LABEL, token))
-}
-
-/// Pulls or prebuilds the project's environment and assembles the approval the contributor is shown.
-fn approval_for(cfg: &toto::config::Config, repo: &str, f: &toto::projects::Fetched) -> Result<toto::projects::Approval, Box<dyn std::error::Error>> {
-    let bin = cfg.docker_bin().ok_or("project environments are container images: configure a docker or podman sandbox first")?;
-    let (image, info, prebuilt) = match &f.devcontainer.image {
-        Some(image) => (image.clone(), toto::image::inspect(bin, image, true)?, false),
-        None => {
-            let network = cfg.sandbox_network().ok_or("this project publishes no image, so it has to be prebuilt here, and a prebuild needs the fenced network: run `toto net-setup --apply` and set `network` in the sandbox config")?;
-            let pb = toto::prebuild::Prebuild { bin: bin.into(), cli: toto::prebuild::DEFAULT_CLI.into(), network: network.into(), work_dir: cfg.state_dir.join("prebuild") };
-            println!("prebuilding {repo} (build, onCreateCommand, updateContentCommand); this can take a while...");
-            let (tag, info) = pb.build(&format!("https://github.com/{repo}.git"), f.commit.as_deref(), &f.devcontainer.toto.id, &f.devcontainer_text, toto::devcontainer::PATH)?;
-            (tag, info, true)
-        }
-    };
-    Ok(toto::projects::Approval::new(&image, info, &f.agent_files, f.commit.clone(), prebuilt)?)
 }
 
 fn today() -> String {
@@ -399,6 +383,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             println!("public key: {}", hex::encode(key.verifying_key().to_bytes()));
         }
+        Cmd::Ui { config, addr } => {
+            let path = config_path(config);
+            toto::config::Config::load(&path)?;
+            toto::ui::serve(path, &addr).await?;
+        }
         Cmd::Directory { cmd } => match cmd {
             DirectoryCmd::List { config } => {
                 let cfg = toto::config::Config::load(&config_path(config))?;
@@ -467,7 +456,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 ProjectsCmd::Remove { id } => {
                     println!("{}", toto::projects::remove(&mut cfg, &id)?);
-                    save_config(&path, &cfg)?;
+                    cfg.save(&path)?;
                 }
                 ProjectsCmd::Inspect { repo, token_file, api } => {
                     let gh = github(&api, &repo, token_file.as_deref())?;
@@ -504,90 +493,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 ProjectsCmd::Update { id, token_file, api, yes } => {
-                    let repo = cfg.sources.get(&id).cloned().ok_or_else(|| format!("project `{id}` was not added with `toto projects add`"))?;
-                    let gh = github(&api, &repo, token_file.as_deref())?;
-                    let f = toto::projects::fetch(&gh)?;
-                    if cfg.projects.get(&id) != Some(&f.devcontainer.toto.public_key) {
-                        return Err(format!("{repo} now publishes a different key for `{id}`: if you trust the change, `toto projects remove {id}` and add it again").into());
-                    }
-                    let old = cfg.environments.get(&id).cloned();
-                    if let Some(old) = &old
-                        && old.prebuilt && old.commit.is_some() && old.commit == f.commit
-                    {
-                        println!("{id}: up to date (commit {})", old.commit.as_deref().unwrap_or(""));
-                        return Ok(());
-                    }
-                    let new = approval_for(&cfg, &repo, &f)?;
-                    match old {
-                        Some(old) if old.info.id == new.info.id && old.agent_hash == new.agent_hash => println!("{id}: up to date ({})", new.info.short()),
-                        old => {
+                    match toto::projects::preview_update(&cfg, &id, &api, token_file.as_deref(), &mut |m| println!("{m}"))? {
+                        toto::projects::UpdateCheck::UpToDate(detail) => println!("{id}: up to date ({detail})"),
+                        toto::projects::UpdateCheck::Changed(c) => {
                             println!("{id}: changed since you approved it");
-                            let lines = match &old {
-                                Some(old) => old.diff(&new),
-                                None => new.describe(),
-                            };
-                            for l in lines {
+                            for l in c.lines {
                                 println!("  {l}");
                             }
                             if !confirm("Approve this version?", yes)? {
                                 println!("nothing changed; tasks keep running what you approved");
                                 return Ok(());
                             }
-                            cfg.environments.insert(id.clone(), new);
-                            save_config(&path, &cfg)?;
+                            toto::projects::apply_update(&mut cfg, &id, c.preview.approval);
+                            cfg.save(&path)?;
                             println!("approved");
                         }
                     }
                 }
                 ProjectsCmd::Add { repo: arg, share, token_file, api, yes } => {
-                    // A name is looked up in the signed directory; `owner/name` is used as is but
-                    // still cross-checked against the directory when it is listed there.
-                    let listed = match fetch_directory(&cfg.directory) {
-                        Ok(d) => d.resolve(&arg).cloned(),
-                        Err(e) if arg.contains('/') => {
-                            println!("note: the project directory could not be checked ({e})");
-                            None
-                        }
-                        Err(e) => return Err(format!("`{arg}` is not `owner/name`, and the project directory could not be read to look it up: {e}").into()),
-                    };
-                    let repo = match (&listed, arg.contains('/')) {
-                        (Some(e), _) => e.repo.clone(),
-                        (None, true) => arg.clone(),
-                        (None, false) => return Err(format!("no project `{arg}` in the directory (`toto directory list` shows them; or give `owner/name`)").into()),
-                    };
-                    let gh = github(&api, &repo, token_file.as_deref())?;
-                    let f = toto::projects::fetch(&gh)?;
-                    let t = &f.devcontainer.toto;
-                    if let Some(e) = &listed {
-                        toto::directory::check_key(e, t)?;
-                    }
-                    println!("{} ({}), from github:{repo}\n{}\n", t.name, t.id, t.description);
-                    match &listed {
-                        Some(_) => println!("  key fingerprint  {} (matches the signed directory)", t.public_key.chars().take(16).collect::<String>()),
-                        None => println!("  key fingerprint  {} (not in the directory: compare it with what the project publishes)", t.public_key.chars().take(16).collect::<String>()),
+                    let p = toto::projects::preview_add(&cfg, &arg, &api, token_file.as_deref(), share, &mut |m| println!("{m}"))?;
+                    let t = &p.fetched.devcontainer.toto;
+                    println!("{} ({}), from github:{}\n{}\n", t.name, t.id, p.repo, t.description);
+                    let fp: String = t.public_key.chars().take(16).collect();
+                    match &p.listed {
+                        Some(_) => println!("  key fingerprint  {fp} (matches the signed directory)"),
+                        None => println!("  key fingerprint  {fp} (not in the directory: compare it with what the project publishes)"),
                     }
                     println!("  task kinds       {}", t.kinds.join(", "));
                     println!("  share            {}", share.max(1));
-                    for n in &f.devcontainer.notes {
+                    for n in &p.fetched.devcontainer.notes {
                         println!("  note: {n}");
                     }
-                    let approval = approval_for(&cfg, &repo, &f)?;
-                    let opts = toto::projects::AddOptions { share, token_file };
-                    let mut updated = cfg.clone();
-                    let notes = toto::projects::add(&mut updated, &repo, &f.devcontainer, approval.clone(), &opts)?;
                     println!("\nwhat you are approving:");
-                    for l in approval.describe() {
+                    for l in p.approval.describe() {
                         println!("  {l}");
                     }
-                    for n in &notes {
+                    for n in &p.notes {
                         println!("  {n}");
                     }
-                    println!("\n(`toto projects inspect {repo}` shows the files themselves)");
+                    println!("\n(`toto projects inspect {}` shows the files themselves)", p.repo);
                     if !confirm("Support this project and approve this environment and agent?", yes)? {
                         println!("nothing changed");
                         return Ok(());
                     }
-                    save_config(&path, &updated)?;
+                    toto::projects::apply_add(&mut cfg, &p, &toto::projects::AddOptions { share, token_file })?;
+                    cfg.save(&path)?;
                     println!("\nadded; run `toto doctor` to check the setup");
                 }
             }

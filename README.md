@@ -40,6 +40,7 @@ toto directory list                         # the signed list of projects
 toto projects add <name>                    # shows the image and the agent; you approve
 toto doctor                                 # what works, what is missing
 toto run --once                             # or: toto install-service
+toto ui                                     # the local page: status, usage, projects, approvals
 ```
 
 `config.json`, the parts you set:
@@ -69,6 +70,10 @@ Linux, macOS and Windows hosts with Docker Desktop, Docker Engine or Podman. Not
 ## Sandbox runtimes
 
 `DockerSandbox` works with Docker or Podman (`bin`), optionally under gVisor (`runtime = "runsc"`). `cargo test` runs live isolation checks for each combination and skips those whose daemon or image is missing. gVisor needs a runtime registered with `--network=none` (`/etc/docker/daemon.json`: `{"runtimes":{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--network=none"]}}}`); nested VMs without KVM need `--platform=ptrace`. gVisor cannot run Omnigent's nested sandbox, so projects with egress rules need the default runtime plus `nested_userns` (`profiles/README.md`).
+
+## The local page
+
+`toto ui` serves a page on loopback (default `127.0.0.1:7707`) and prints its URL with a session token. It shows the runner's status and pause reason, today's usage against the cap, the audit tail and every supported project with what was approved for it. It adds projects, checks and approves updates, removes projects and edits the policy through the same previews the CLI uses: nothing is approved that was not shown. Every call carries the token in a header, so other sites in your browser cannot drive it. See `ui/README.md`.
 
 ## The site
 

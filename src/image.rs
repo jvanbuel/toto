@@ -64,8 +64,15 @@ fn run(bin: &str, args: &[&str]) -> Result<String> {
 /// or id reference never moves, so it is only pulled if missing).
 pub fn inspect(bin: &str, image: &str, refresh: bool) -> Result<ImageInfo> {
     let by_content = image.contains('@') || image.starts_with("sha256:");
-    if (refresh && !by_content) || run(bin, &["image", "inspect", image]).is_err() {
-        run(bin, &["pull", "-q", image]).map_err(|e| Error::Sandbox(format!("could not pull `{image}`: {e}")))?;
+    let local = run(bin, &["image", "inspect", image]).is_ok();
+    if (refresh && !by_content) || !local {
+        // A tag is pulled again so a moved tag is seen; when the registry cannot be reached but
+        // the image is here, what is here is what would run, so that is what gets shown.
+        if let Err(e) = run(bin, &["pull", "-q", image])
+            && !local
+        {
+            return Err(Error::Sandbox(format!("could not pull `{image}`: {e}")));
+        }
     }
     let v: serde_json::Value = serde_json::from_str(&run(bin, &["image", "inspect", "--format", "{{json .}}", image])?)?;
     let repo = repo_of(image);

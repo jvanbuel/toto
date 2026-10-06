@@ -2407,6 +2407,129 @@ mod github_queue {
         assert!(!issue_closed(&p, 0));
     }
 
+    // ----------------------------------------------------------------- the local UI
+
+    /// `toto ui` on an ephemeral port: the token gate, the overview, policy edits, and the add,
+    /// check and remove flows through the same previews the CLI uses, against the fake GitHub.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_local_ui_shows_and_changes_what_the_cli_does() {
+        use crate::ui::{router, UiState, TOKEN_HEADER};
+        let p = project();
+        let have_docker = super::proxy_container::docker_has("alpine");
+        if have_docker {
+            let _ = std::process::Command::new("docker").args(["tag", "alpine", "localhost/env:dev"]).status();
+        }
+        publish(&p, &devcontainer_json(&p.key, "").replace("ghcr.io/acme/env:1.0", "localhost/env:dev"), &[("config.yaml", &agent_config("")), ("skills/triage/SKILL.md", "---\nname: triage\n---\n")]);
+        // The directory lives on the same fake GitHub, signed by a key the config trusts.
+        let maintainers = crate::manifest::generate_key();
+        let gh = p.fake.queue(None);
+        let f0 = projects::fetch(&gh).unwrap();
+        let mut d = crate::directory::Directory::default();
+        d.upsert(crate::directory::entry_from("org/proj", &f0, "2026-10-06").unwrap());
+        p.fake.state.lock().unwrap().files.push((crate::directory::DEFAULT_PATH.into(), serde_json::to_vec(&d.sign(&maintainers, "2026-10-06").unwrap()).unwrap()));
+
+        let f = super::fixture("ui");
+        let mut cfg = Config::starter(&f.dir);
+        cfg.directory = crate::config::DirectoryConfig { repo: "org/proj".into(), path: crate::directory::DEFAULT_PATH.into(), public_key: hex::encode(maintainers.verifying_key().to_bytes()), api_url: p.fake.api() };
+        std::fs::create_dir_all(&cfg.state_dir).unwrap();
+        crate::audit::AuditLog::new(cfg.state_dir.join("audit.jsonl")).append(&crate::audit::AuditEntry { ts: chrono::Local::now(), task_id: "t1".into(), project_id: "acme".into(), outcome: "submitted".into(), detail: "x".into(), tokens: 1234 }).unwrap();
+        let path = f.dir.join("config.json");
+        cfg.save(&path).unwrap();
+        let token = crate::ui::new_token();
+        let state = std::sync::Arc::new(UiState::new(path.clone(), token.clone()).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(axum::serve(listener, router(state)).into_future());
+
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let call = |method: &str, path: &str, tok: Option<String>, body: Option<serde_json::Value>| {
+            let (agent, url) = (agent.clone(), format!("{base}{path}"));
+            let method = method.to_string();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let mut req = match method.as_str() {
+                        "GET" => agent.get(&url).force_send_body(),
+                        "PUT" => agent.put(&url),
+                        _ => agent.post(&url),
+                    };
+                    if let Some(t) = tok {
+                        req = req.header(TOKEN_HEADER, &t);
+                    }
+                    let mut resp = match body {
+                        Some(b) => req.header("content-type", "application/json").send(b.to_string().as_bytes()).unwrap(),
+                        None => req.send_empty().unwrap(),
+                    };
+                    let status = resp.status().as_u16();
+                    let text = resp.body_mut().read_to_string().unwrap_or_default();
+                    (status, serde_json::from_str::<serde_json::Value>(&text).unwrap_or(serde_json::Value::Null))
+                })
+                .await
+                .unwrap()
+            }
+        };
+        let t = Some(token.clone());
+
+        // The page itself is served; the API is not without the token.
+        let (st, _) = call("GET", "/", None, None).await;
+        assert_eq!(st, 200);
+        assert_eq!(call("GET", "/api/overview", None, None).await.0, 401);
+        assert_eq!(call("GET", "/api/overview", Some("wrong".into()), None).await.0, 401);
+        let (st, ov) = call("GET", "/api/overview", t.clone(), None).await;
+        assert_eq!(st, 200, "{ov}");
+        assert_eq!((ov["used_today"].as_u64(), ov["projects"].as_u64(), ov["reserve_pct"].as_u64()), (Some(1234), Some(0), Some(20)));
+        assert_eq!(ov["audit"][0]["task_id"], "t1");
+        assert!(ov["status"].is_null(), "no daemon has run");
+
+        // Policy: edits are validated and saved.
+        let (st, _) = call("PUT", "/api/policy", t.clone(), Some(serde_json::json!({"daily_token_cap": 5000, "reserve_pct": 101, "quiet_hours": null, "project_shares": {}}))).await;
+        assert_eq!(st, 400);
+        let (st, pol) = call("PUT", "/api/policy", t.clone(), Some(serde_json::json!({"daily_token_cap": 5000, "reserve_pct": 30, "quiet_hours": [22, 7], "project_shares": {}}))).await;
+        assert_eq!((st, pol["reserve_pct"].as_u64()), (200, Some(30)));
+        let saved = Config::load(&path).unwrap();
+        assert_eq!((saved.policy.daily_token_cap, saved.policy.reserve_pct, saved.policy.quiet_hours), (5000, 30, Some((22, 7))));
+
+        if !have_docker {
+            eprintln!("skipping the add/check/remove flow: needs docker and alpine");
+            return;
+        }
+        // Add by directory name: a preview first, nothing saved yet.
+        let (st, pv) = call("POST", "/api/projects/preview", t.clone(), Some(serde_json::json!({"arg": "acme", "share": 2}))).await;
+        assert_eq!(st, 200, "{pv}");
+        assert_eq!((pv["repo"].as_str(), pv["listed"].as_bool(), pv["approval"]["harness"].as_str()), (Some("org/proj"), Some(true), Some("claude-sdk")));
+        assert!(pv["approval"]["skills"].as_array().unwrap().iter().any(|s| s == "triage"));
+        assert!(Config::load(&path).unwrap().projects.is_empty(), "a preview changes nothing");
+        let pending = pv["pending"].as_str().unwrap().to_string();
+        let (st, ap) = call("POST", &format!("/api/pending/{pending}/approve"), t.clone(), None).await;
+        assert_eq!(st, 200, "{ap}");
+        assert!(ap["message"].as_str().unwrap().contains("added `acme`"));
+        assert_eq!(call("POST", &format!("/api/pending/{pending}/approve"), t.clone(), None).await.0, 404, "a pending preview applies once");
+        let saved = Config::load(&path).unwrap();
+        assert_eq!((saved.projects.len(), saved.policy.project_shares["acme"], saved.environments["acme"].agent.skills.as_slice()), (1, 2, &["triage".to_string()][..]));
+
+        // The list and the detail show what was approved.
+        let (_, list) = call("GET", "/api/projects", t.clone(), None).await;
+        assert_eq!((list[0]["id"].as_str(), list[0]["share"].as_u64(), list[0]["approval"]["image"].as_str()), (Some("acme"), Some(2), Some("localhost/env:dev")));
+        let (_, det) = call("GET", "/api/projects/acme", t.clone(), None).await;
+        assert!(det["config_yaml"].as_str().unwrap().contains("claude-sdk") && det["files"].as_array().unwrap().len() == 2, "{det}");
+        assert_eq!(call("GET", "/api/projects/nope", t.clone(), None).await.0, 404);
+
+        // Check: nothing changed, then the agent changes and the diff is shown and approved.
+        let (st, ck) = call("POST", "/api/projects/acme/check", t.clone(), None).await;
+        assert_eq!((st, ck["state"].as_str()), (200, Some("up_to_date")), "{ck}");
+        publish(&p, &devcontainer_json(&p.key, "").replace("ghcr.io/acme/env:1.0", "localhost/env:dev"), &[("config.yaml", &agent_config("").replace("Fix docs.", "Fix docs carefully."))]);
+        let (st, ck) = call("POST", "/api/projects/acme/check", t.clone(), None).await;
+        assert_eq!((st, ck["state"].as_str()), (200, Some("changed")), "{ck}");
+        assert!(ck["lines"].as_array().unwrap().iter().any(|l| l.as_str().unwrap().contains("agent")), "{ck}");
+        let pending = ck["pending"].as_str().unwrap().to_string();
+        assert_eq!(call("POST", &format!("/api/pending/{pending}/approve"), t.clone(), None).await.0, 200);
+        assert!(Config::load(&path).unwrap().environments["acme"].agent.skills.is_empty(), "the new version has no skill");
+
+        // Remove.
+        assert_eq!(call("POST", "/api/projects/acme/remove", t.clone(), None).await.0, 200);
+        assert!(Config::load(&path).unwrap().projects.is_empty());
+        assert_eq!(call("POST", "/api/projects/acme/remove", t.clone(), None).await.0, 400);
+    }
+
     // ----------------------------------------------------------------- the signed directory
 
     #[test]

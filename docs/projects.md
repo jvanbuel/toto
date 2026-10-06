@@ -4,6 +4,8 @@ Contributors decide which projects their runner supports; nothing runs for a pro
 
 ## For contributors
 
+`toto ui` does all of the below from a local page; the commands:
+
 ```
 toto directory list
 toto projects add <name> | owner/name [--share 2] [--token-file gh.token] [--yes]
