@@ -17,5 +17,6 @@
 | 13 | [Reuse: dev container, Omnigent agent directory, hardened container runtime](0013-devcontainer-omnigent-reuse.md) | Accepted |
 | 14 | [Donate only unused capacity: pause at a reserve read from the provider's responses](0014-pause-at-the-reserve.md) | Accepted |
 | 15 | [The contributor's UI is a local page served by the toto binary](0015-local-ui-in-the-binary.md) | Accepted |
+| 16 | [Task intake, refinement and tracking through Inbound and Outbound connectors](0016-task-intake-refinement-and-tracking.md) | Proposed |
 
 ADRs 2 and 13 are load-bearing: together they guarantee credentials never leave the contributor's machine. Several ADRs list a simpler v1 option worth considering before building the full design.

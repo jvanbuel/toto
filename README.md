@@ -88,3 +88,4 @@ The daemon serves a page on loopback while it runs (`ui_addr`, default `127.0.0.
 - Project owners: [docs/project-owner-guide.md](docs/project-owner-guide.md), with a complete example in `docs/examples/project/`.
 - Queue: [docs/github-queue.md](docs/github-queue.md), [docs/queue-protocol.md](docs/queue-protocol.md).
 - Decisions: [docs/adr/README.md](docs/adr/README.md).
+- Plans: [docs/plans/intake-and-tracking.md](docs/plans/intake-and-tracking.md) (task intake by email and issue form, refinement by comment, boards).
