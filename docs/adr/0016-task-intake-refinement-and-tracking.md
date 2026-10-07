@@ -100,6 +100,8 @@ Where the implementation differs from the first sketch of this record, and why:
 - A signal that would change nothing is dropped silently. Toto's own closing of an issue comes back as such a signal on the next pass.
 - `TaskView` is `id, title, kind, state, attempt, attempt_cap, tokens_used, requester, request, latest_output, note, pr, attempt_issues, links`. Its fingerprint leaves out `links`, because publishing adds links.
 - Comments on a finished task reopen it ("a comment means it is not done").
+- The state branch is **one commit**, replaced each pass with `--force-with-lease` on the commit the pass read (still a compare-and-swap). One commit per pass would otherwise grow the history without bound, and every clone of the project downloads it. Old logs are pruned (`log_days`). `state_repo` puts the state in another, private repository.
+- **Privacy.** Requests are public in a public repository: they are the prompt, and manifests are public for runners to read. A private mirror would therefore hide nothing. What can be private is: mail addresses are never written (a sender's `name`, or a pseudonym keyed by the project's signing key); unknown senders are logged by domain; Message-IDs are hashed.
 
 ## Open questions
 

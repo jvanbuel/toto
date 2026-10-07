@@ -45,6 +45,8 @@ On GitHub a task is three kinds of object: the **request issue** (what was asked
 | `repo` | required | `owner/name` of the repository whose issues are the queue. |
 | `base` | `main` | Branch attempts start from and pull requests target. |
 | `state_branch` | `toto-state` | Where the sync keeps its state. Never the base branch. |
+| `state_repo` | this repository | Keep the state in another repository: `owner/name` (github.com) or a git URL. Needs `TOTO_STATE_TOKEN`. |
+| `log_days` | 30 | Days of sync log kept. |
 | `attempt_cap` | 5 | Attempts per task before each further one needs `/approve`. |
 | `daily_attempt_cap` | 20 | Attempts posted per UTC day across the project. |
 | `stale_days` | 14 | Idle tasks are closed after this long. |
@@ -66,6 +68,7 @@ A request's kind is a `[kind]` tag at the start of its title or subject, or the 
 ```toml
 [[senders]]
 address = "github:alice"      # a GitHub account, or a mail address in lower case
+name = "Alice"                # mail senders: how they are shown (default: a pseudonym, see Privacy)
 verify = "platform"           # github: platform; mail: dkim (default), secret-address or both
 kinds = ["docs"]              # empty: every kind
 default_kind = "docs"
@@ -114,16 +117,24 @@ tokens_field = "Tokens"
 
 Each task's request issue becomes a card. Its Status is set from the task's state, using the first option the board has: Draft is `Awaiting approval`, `Queued` or `Todo`; Queued is `Queued` or `Todo`; Running is `Running` or `In Progress`; AwaitingFeedback is `Awaiting feedback`, `In Review` or `In Progress`; Done is `Done`; Cancelled is `Cancelled` or `Done`. GitHub's default board works as it is. A missing field or option is an error naming it; it does not hold up the rest of the pass. The board only displays state: moving a card does nothing.
 
+## Privacy
+
+**What people ask for in a public repository is public.** A request becomes the prompt of its attempts. The prompt is in the signed task manifest, which sits on a public task issue because contributors' runners must read it. So the text of an issue, a comment or a mail ends up in public view, and mailed requests are also mirrored to an issue. Tell people who mail the inbox.
+
+**Mail addresses never are public.** Everything toto writes (issues, status comments, prompts, the state branch, the log) names a mail sender by their `name` from `.toto/intake.toml`, or by a pseudonym such as `sender-3f9a1c2b`. The pseudonym is derived from the address and the project's signing key: it stays the same for a sender, and nobody without the key can check a guessed address against it. Unknown senders are logged by their domain only (`an unknown sender at example.net`). Message-IDs, which can carry host names, are stored as hashes. GitHub logins are shown as they are, since GitHub already shows them.
+
 ## The state branch
 
-The workflow runs on a fresh machine each time, so the sync keeps everything on `toto-state`:
+The workflow runs on a fresh machine each time, so the sync keeps everything on one branch, `toto-state`:
 
 - `tasks/<id>.json`: each task, its conversation, attempts and links;
 - `cursors/<connector>.json`: where each inbound left off;
-- `senders/<address>.json`: today's count per sender;
+- `senders/<name>.json`: today's count per sender;
 - `cache/<connector>.json`: ids a board looked up;
-- `log/<date>.jsonl`: every decision and why (accept, hold, ignore, post, result, signal, cap, error).
+- `log/<date>.jsonl`: every decision and why (accept, hold, ignore, post, result, signal, stale, cap, error), kept for `log_days`.
 
-The branch is written with git plumbing, one commit per pass, and the default branch is never touched. If another pass pushed first, this pass stops and the next one redoes its work. That is safe because every step is idempotent: attempt ids are deterministic and looked up before posting, an attempt already on its branch is not applied again, and a received item already handled is skipped. The workflow's `concurrency` group makes such races rare in the first place.
+**The branch is one commit.** Each pass replaces it, writing with git plumbing (the checkout and the default branch are never touched), so it never accumulates history that every clone of the project would download. The replacement is pushed with `--force-with-lease` naming the commit the pass read, which works as a compare-and-swap. If another pass replaced it first, this pass stops and the next one redoes its work. That is safe because every step is idempotent: attempt ids are deterministic and looked up before posting, an attempt already on its branch is not applied again, and a received item already handled is skipped. The workflow's `concurrency` group makes such races rare in the first place. The cost: no history of the state itself. The log keeps what happened, for `log_days`.
 
-To see why a mail or comment did nothing, read that day's log on the `toto-state` branch.
+**For a public project, consider `state_repo`.** It points at a private repository, so tasks' state and the log stay out of public view and out of the project's clones (it does not make requests private: see Privacy). Create the repository, give a fine-grained token **Contents: read and write** on it, store the token as `TOTO_STATE_TOKEN`, and set `state_repo = "owner/name"`.
+
+To see why a mail or comment did nothing, read that day's log on the state branch.

@@ -46,4 +46,5 @@ jobs:
           TOTO_PROJECT_KEY: ${{ secrets.TOTO_PROJECT_KEY }}        # the hex seed from `toto project-key`
           TOTO_PROJECTS_TOKEN: ${{ secrets.TOTO_PROJECTS_TOKEN }}  # only with [projects_v2]
           TOTO_IMAP_PASSWORD: ${{ secrets.TOTO_IMAP_PASSWORD }}    # only with [email]
+          TOTO_STATE_TOKEN: ${{ secrets.TOTO_STATE_TOKEN }}        # only with state_repo
         run: toto project sync

@@ -205,6 +205,12 @@ pub fn strip_quoted(body: &str) -> String {
     out.join("\n")
 }
 
+/// A Message-ID as an item: hashed, since ids can carry host names and are written to the state
+/// branch. Replies name their thread by the same ids, so they hash to the same items.
+pub fn mail_ref(message_id: &str) -> ItemRef {
+    ItemRef::new(format!("mail:{}", &crate::archive::sha256_hex(message_id.trim().as_bytes())[..24]))
+}
+
 /// Parses a raw mail into what the connector reports. `None` if it is not a mail at all.
 pub fn parse(raw: &[u8], cfg: &Config, fallback_id: &str) -> Option<Mail> {
     let msg = MessageParser::default().parse(raw)?;
@@ -246,12 +252,12 @@ pub fn parse(raw: &[u8], cfg: &Config, fallback_id: &str) -> Option<Mail> {
     };
     let mut thread: Vec<ItemRef> = vec![];
     for i in id_list(msg.in_reply_to()).into_iter().chain(id_list(msg.references())) {
-        let r = ItemRef::new(format!("mail:{}", i.trim_matches(['<', '>'])));
+        let r = mail_ref(i.trim_matches(['<', '>']));
         if !thread.contains(&r) {
             thread.push(r);
         }
     }
-    let id = msg.message_id().map_or_else(|| ItemRef::new(format!("mail:{fallback_id}")), |m| ItemRef::new(format!("mail:{m}")));
+    let id = msg.message_id().map_or_else(|| ItemRef::new(format!("mail:{fallback_id}")), mail_ref);
     Some(Mail {
         id,
         dkim: dkim_aligned(&raw_headers(&msg, "authentication-results"), &cfg.authserv_id, domain_of(&from)),

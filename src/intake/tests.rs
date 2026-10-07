@@ -215,14 +215,20 @@ fn senders_are_accepted_within_their_limits_and_verification() {
     assert!(!p.is_maintainer(&forged), "only the platform vouches for maintainers");
 }
 
+impl IntakePolicy {
+    fn decide_signal_as(&self, login: &str, a: &Author, kind: SignalKind, t: &Task) -> Decision {
+        self.decide_signal(a, &format!("github:{login}"), kind, t)
+    }
+}
+
 #[test]
 fn signals_need_a_maintainer_or_whoever_asked() {
     let p = intake_policy();
     let t = new_task(true); // asked by github:alice
-    assert_eq!(p.decide_signal(&Author::platform("dave", true), SignalKind::Approve, &t), Decision::Accept);
-    assert!(matches!(p.decide_signal(&Author::platform("alice", false), SignalKind::Approve, &t), Decision::Ignore(_)));
-    assert_eq!(p.decide_signal(&Author::platform("alice", false), SignalKind::Done, &t), Decision::Accept);
-    assert!(matches!(p.decide_signal(&Author::platform("mallory", false), SignalKind::Cancel, &t), Decision::Ignore(_)));
+    assert_eq!(p.decide_signal_as("dave", &Author::platform("dave", true), SignalKind::Approve, &t), Decision::Accept);
+    assert!(matches!(p.decide_signal_as("alice", &Author::platform("alice", false), SignalKind::Approve, &t), Decision::Ignore(_)));
+    assert_eq!(p.decide_signal_as("alice", &Author::platform("alice", false), SignalKind::Done, &t), Decision::Accept);
+    assert!(matches!(p.decide_signal_as("mallory", &Author::platform("mallory", false), SignalKind::Cancel, &t), Decision::Ignore(_)));
     assert_eq!(SignalKind::from_command("  /done thanks\nmore"), Some(SignalKind::Done));
     assert_eq!(SignalKind::from_command("please /done"), None);
 }
@@ -260,7 +266,7 @@ pub(crate) fn repo(name: &str, files: &[(&str, &str)]) -> (std::path::PathBuf, s
 #[test]
 fn the_state_branch_round_trips_and_detects_a_concurrent_pass() {
     let (remote, work) = repo("store", &[("README", "hi")]);
-    let mut a = store::Store::open(&work, "toto-state").unwrap();
+    let mut a = store::Store::open(&work, store::Location::origin("toto-state")).unwrap();
     assert!(a.list("tasks/").is_empty());
     assert_eq!(a.commit_and_push("nothing").unwrap(), None, "no change, no commit");
     a.put("tasks/t-1.json", &serde_json::json!({"x": 1})).unwrap();
@@ -271,8 +277,8 @@ fn the_state_branch_round_trips_and_detects_a_concurrent_pass() {
     assert_eq!(git(&remote, &["rev-parse", "main"]), git(&work, &["rev-parse", "HEAD"]), "main is not written");
 
     // two passes read the same state; the second to push loses
-    let mut b = store::Store::open(&work, "toto-state").unwrap();
-    let mut c = store::Store::open(&work, "toto-state").unwrap();
+    let mut b = store::Store::open(&work, store::Location::origin("toto-state")).unwrap();
+    let mut c = store::Store::open(&work, store::Location::origin("toto-state")).unwrap();
     assert_eq!(b.get::<serde_json::Value>("tasks/t-1.json").unwrap().unwrap()["x"], 1);
     assert_eq!(b.raw("log/2026-10-07.jsonl").unwrap(), b"{\"a\":1}\n{\"a\":2}\n");
     b.put("tasks/t-1.json", &serde_json::json!({"x": 2})).unwrap();
@@ -280,10 +286,26 @@ fn the_state_branch_round_trips_and_detects_a_concurrent_pass() {
     b.commit_and_push("b").unwrap().unwrap();
     c.put("cursors/github.json", &serde_json::json!({})).unwrap();
     assert!(matches!(c.commit_and_push("c"), Err(crate::Error::Concurrent(_))));
-    let d = store::Store::open(&work, "toto-state").unwrap();
+    let d = store::Store::open(&work, store::Location::origin("toto-state")).unwrap();
     assert_eq!(d.get::<serde_json::Value>("tasks/t-1.json").unwrap().unwrap()["x"], 2);
     assert!(d.raw("cursors/github.json").is_none());
-    assert_eq!(git(&remote, &["rev-list", "--count", "toto-state"]), "2", "{}", git(&remote, &["log", "--oneline", "toto-state"]));
+    assert_eq!(git(&remote, &["rev-list", "--count", "toto-state"]), "1", "the branch is one commit, replaced each pass");
+
+    // Two first passes: the branch must not exist yet for either, and only one can create it.
+    let (_, work2) = repo("store-first", &[("README", "hi")]);
+    let mut e = store::Store::open(&work2, store::Location::origin("toto-state")).unwrap();
+    let mut f = store::Store::open(&work2, store::Location::origin("toto-state")).unwrap();
+    e.put("a.json", &1).unwrap();
+    f.put("b.json", &2).unwrap();
+    e.commit_and_push("e").unwrap().unwrap();
+    assert!(matches!(f.commit_and_push("f"), Err(crate::Error::Concurrent(_))));
+
+    // Removing a file (old logs are pruned) is a change too.
+    let mut g = store::Store::open(&work, store::Location::origin("toto-state")).unwrap();
+    g.remove("log/2026-10-07.jsonl");
+    assert!(g.has_changes());
+    g.commit_and_push("prune").unwrap().unwrap();
+    assert!(store::Store::open(&work, store::Location::origin("toto-state")).unwrap().raw("log/2026-10-07.jsonl").is_none());
 }
 
 #[test]
@@ -339,7 +361,7 @@ mod e2e {
 
     impl World {
         pub(super) fn secrets(&self) -> Secrets {
-            Secrets { api: self.fake.api(), github_token: TOKEN.into(), projects_token: Some("board-token".into()), imap_password: None }
+            Secrets { api: self.fake.api(), github_token: TOKEN.into(), projects_token: Some("board-token".into()), imap_password: None, state_token: None }
         }
         pub(super) fn pass(&self) -> Report {
             let r = sync_repo(&self.cfg, &self.work, &self.key, &self.secrets(), chrono::Utc::now()).unwrap();
@@ -347,7 +369,7 @@ mod e2e {
             r
         }
         pub(super) fn tasks(&self) -> Vec<super::super::task::Task> {
-            let s = super::super::store::Store::open(&self.work, "toto-state").unwrap();
+            let s = super::super::store::Store::open(&self.work, self.cfg.state_location(None)).unwrap();
             s.list("tasks/").iter().map(|p| s.get(p).unwrap().unwrap()).collect()
         }
         pub(super) fn task(&self) -> super::super::task::Task {
@@ -494,6 +516,35 @@ mod e2e {
                 assert!(st.issue(req).closed);
             }
         }
+    }
+
+    #[test]
+    fn state_can_live_in_another_repository_and_old_logs_are_pruned() {
+        let mut w = world("e2e-state-repo", "");
+        let private = w.work.parent().unwrap().join("private.git");
+        std::fs::create_dir_all(&private).unwrap();
+        git(&private, &["init", "-q", "--bare", "-b", "main"]);
+        w.cfg = IntakeConfig::parse(&format!("state_repo = \"{}\"\nlog_days = 7\n{BASE_CONFIG}\n[[senders]]\naddress = \"github:alice\"\n", private.display())).unwrap();
+        w.fake.state.lock().unwrap().open_issue("alice", "Fix it", FORM, &["toto:request"]);
+        let first = w.pass();
+        assert_eq!(first.posted.len(), 1);
+        assert_eq!(git(&w.remote, &["ls-remote", "--heads", ".", "toto-state"]), "", "nothing in the project repository");
+        assert!(git(&private, &["ls-tree", "-r", "--name-only", "toto-state"]).contains(&format!("tasks/{}.json", w.task().id)));
+        assert_eq!(w.pass().posted.len(), 0, "the next pass reads the state back from there");
+
+        // A pass 10 days later drops the logs older than log_days.
+        let today = chrono::Utc::now().format("log/%Y-%m-%d.jsonl").to_string();
+        let later = sync_repo(&w.cfg, &w.work, &w.key, &w.secrets(), chrono::Utc::now() + chrono::Duration::days(10)).unwrap();
+        assert!(later.commit.is_some());
+        let files = git(&private, &["ls-tree", "-r", "--name-only", "toto-state"]);
+        assert!(!files.contains(&today) && files.contains("tasks/"), "{files}");
+
+        // A remote state repository needs its own token.
+        let remote_cfg = IntakeConfig::parse(&format!("state_repo = \"acme/private\"\n{BASE_CONFIG}")).unwrap();
+        assert_eq!(remote_cfg.state_location(None).remote, "https://github.com/acme/private.git");
+        let e = sync_repo(&remote_cfg, &w.work, &w.key, &w.secrets(), chrono::Utc::now()).unwrap_err();
+        assert!(e.to_string().contains("TOTO_STATE_TOKEN"), "{e}");
+        assert!(IntakeConfig::parse(&format!("state_repo = \"not a repo\"\n{BASE_CONFIG}")).is_err());
     }
 
     #[test]
@@ -676,7 +727,7 @@ mod mail {
         let body = "Also the second one.\r\n\r\nOn Tue, 7 Oct 2026 at 09:00, toto <\r\ntoto@example.org> wrote:\r\n> earlier\r\n> text\r\n";
         let reply = parsed(&eml("alice@example.com", "toto@example.org", "Re: [docs] Fix it", "In-Reply-To: <first@mail.example>\r\nReferences: <root@mail.example> <first@mail.example>\r\n", body));
         assert_eq!(reply.body, "Also the second one.");
-        assert_eq!(reply.thread.iter().map(|t| t.0.as_str()).collect::<Vec<_>>(), ["mail:first@mail.example", "mail:root@mail.example"]);
+        assert_eq!(reply.thread, [mail_ref("first@mail.example"), mail_ref("root@mail.example")], "hashed, in order, once each");
         match reply.received() {
             Received::Message { thread: Some(t), author, .. } => {
                 assert_eq!(t.0.len(), 2);
@@ -797,16 +848,17 @@ mod mail_flow {
         let issues = GitHubIssues::new(&q, "toto:request");
         let mail = EmailInbound { cfg: w.cfg.email.clone().unwrap(), source: &inbox };
         let pass = || {
-            let r = run(&Pass { cfg: &w.cfg, queue: &q, key: &w.key, repo_dir: &w.work, inbounds: vec![&issues, &mail], outbounds: vec![&issues], now: chrono::Utc::now() }).unwrap();
+            let r = run(&Pass { cfg: &w.cfg, queue: &q, key: &w.key, repo_dir: &w.work, inbounds: vec![&issues, &mail], outbounds: vec![&issues], state: w.cfg.state_location(None), now: chrono::Utc::now() }).unwrap();
             assert!(r.errors.is_empty(), "{:?}", r.errors);
             r
         };
         let r = pass();
         assert_eq!(r.posted.len(), 1, "alice is pre-approved and DKIM passed: {:?}", r.log);
-        assert!(r.log.iter().any(|l| l.what == "ignore" && l.author.as_deref() == Some("eve@example.net")), "unknown senders are dropped: {:?}", r.log);
+        assert!(r.log.iter().any(|l| l.what == "ignore" && l.author.as_deref() == Some("an unknown sender at example.net")), "unknown senders are dropped, and logged by domain: {:?}", r.log);
         assert!(r.log.iter().any(|l| l.what == "ignore" && l.detail.contains("Auto-Submitted")), "{:?}", r.log);
         let t = w.task();
-        assert_eq!((t.kind.as_str(), t.title.as_str(), t.requester.as_str()), ("docs", "Fix the guide", "alice@example.com"));
+        assert_eq!((t.kind.as_str(), t.title.as_str()), ("docs", "Fix the guide"));
+        assert!(t.requester.starts_with("sender-") && t.requester.len() == 15, "a pseudonym, not the address: {}", t.requester);
         let mirror = t.request_issue().expect("mirrored to an issue");
         {
             let st = w.fake.state.lock().unwrap();
@@ -841,6 +893,22 @@ mod mail_flow {
         pass();
         assert_eq!(w.task().state, State::Done);
         assert!(w.fake.state.lock().unwrap().issue(mirror).closed);
+
+        // No mail address is written anywhere: issues, comments, manifests (prompts), the state.
+        let st = w.fake.state.lock().unwrap();
+        let mut public: Vec<String> = st.issues.iter().flat_map(|i| [i.title.clone(), i.body.clone()].into_iter().chain(i.comments.iter().map(|c| c.1.clone()))).collect();
+        for i in &st.issues {
+            if let Some(env) = i.body.split("```json\n").nth(1).and_then(|b| b.split("\n```").next()).and_then(|j| serde_json::from_str::<crate::dsse::Envelope>(j).ok()) {
+                public.push(String::from_utf8(env.payload_bytes().unwrap()).unwrap());
+            }
+        }
+        drop(st);
+        let s = super::super::store::Store::open(&w.work, w.cfg.state_location(None)).unwrap();
+        public.extend(s.list("").iter().map(|p| String::from_utf8_lossy(s.raw(p).unwrap()).to_string()));
+        for text in &public {
+            assert!(!text.contains("alice@") && !text.contains("eve@") && !text.contains("@mail.example"), "an address leaked: {text}");
+        }
+        assert!(public.iter().any(|t| t.contains("Request from sender-")), "prompts name the sender by pseudonym");
     }
 }
 

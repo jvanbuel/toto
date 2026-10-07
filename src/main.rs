@@ -466,6 +466,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 github_token,
                 projects_token: env(cfg.projects_v2.as_ref().map(|c| &c.token_env)),
                 imap_password: env(cfg.email.as_ref().map(|c| &c.password_env)),
+                state_token: env(Some(&"TOTO_STATE_TOKEN".to_string())),
             };
             let report = toto::intake::sync::sync_repo(&cfg, &repo_dir, &key, &secrets, chrono::Utc::now())?;
             for o in &report.pull_requests {

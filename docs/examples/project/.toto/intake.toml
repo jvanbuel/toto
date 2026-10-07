@@ -6,6 +6,7 @@ attempt_cap = 5                   # attempts per task before a maintainer must /
 daily_attempt_cap = 20            # attempts posted per UTC day, across the project
 stale_days = 14                   # a task with no activity for this long is closed
 max_open = 10                     # new toto pull requests wait while this many are open
+# state_repo = "acme/toto-state"  # keep state and logs in a private repository ($TOTO_STATE_TOKEN)
 
 # What a task of each kind becomes. The first kind is the default unless default_kind says otherwise.
 [kinds.docs]
@@ -26,6 +27,7 @@ per_day = 5
 
 [[senders]]
 address = "bob@example.com"
+name = "Bob"                      # how toto shows him; his address is never written anywhere
 verify = "dkim"                   # or "secret-address" / "both", with secret_sha256 from `toto project secret-address`
 kinds = ["docs"]
 max_estimate = 40000

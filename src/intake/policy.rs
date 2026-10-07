@@ -69,6 +69,10 @@ pub enum Verify {
 pub struct Sender {
     /// A mail address, or `github:<login>`.
     pub address: String,
+    /// How a mail sender is shown in everything toto writes (issues, prompts, state, logs), since
+    /// their address never is. Default: a pseudonym derived from the address and the project key.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Default: `platform` for `github:` senders, `dkim` for mail.
     #[serde(default)]
     pub verify: Option<Verify>,
@@ -164,6 +168,11 @@ impl IntakePolicy {
             if !github && !s.address.contains('@') {
                 return Err(format!("intake config: sender `{}` is neither a mail address nor `github:<login>`", s.address));
             }
+            if let Some(n) = &s.name
+                && (n.trim().is_empty() || n.contains('@') || n.starts_with("github:") || n.len() > 60)
+            {
+                return Err(format!("intake config: sender name `{n}`: a short label, without `@`"));
+            }
             if s.address != s.address.to_lowercase() {
                 return Err(format!("intake config: sender `{}`: write addresses in lower case", s.address));
             }
@@ -234,6 +243,15 @@ impl IntakePolicy {
         }
     }
 
+    /// How decisions name an author: a GitHub login as it is, a mail sender by their configured
+    /// name or not at all (their address is never written anywhere).
+    fn label(&self, author: &Author) -> String {
+        if author.address.starts_with("github:") {
+            return author.address.clone();
+        }
+        self.sender(&author.address).and_then(|s| s.name.clone()).unwrap_or_else(|| "the sender".into())
+    }
+
     pub fn is_maintainer(&self, author: &Author) -> bool {
         author.maintainer && author.verified == Verification::Platform
     }
@@ -243,7 +261,7 @@ impl IntakePolicy {
         match self.sender(&author.address) {
             None => Ok(None),
             Some(s) if self.verified_as(author, s.verify()) => Ok(Some(s)),
-            Some(s) => Err(format!("{} must be verified by {:?}; this message was {:?}", s.address, s.verify(), self.verification(author))),
+            Some(s) => Err(format!("{} must be verified by {:?}; this message was {:?}", self.label(author), s.verify(), self.verification(author))),
         }
     }
 
@@ -260,18 +278,18 @@ impl IntakePolicy {
         }
         let sender = match self.verified_sender(author) {
             Ok(Some(s)) => s,
-            Ok(None) => return hold_or_ignore(format!("{} is not a maintainer or a pre-approved sender", author.address)),
+            Ok(None) => return hold_or_ignore(format!("{} is not a maintainer or a pre-approved sender", self.label(author))),
             Err(why) => return Decision::Ignore(why),
         };
         let max = sender.max_estimate.unwrap_or_else(|| self.kinds.get(&ask.kind).map_or(0, |k| k.estimate));
         let why = if let Some(k) = &ask.unknown_kind {
             Some(format!("kind `{k}` is not configured"))
         } else if !sender.kinds.is_empty() && !sender.kinds.contains(&ask.kind) {
-            Some(format!("{} may not ask for `{}`", sender.address, ask.kind))
+            Some(format!("{} may not ask for `{}`", self.label(author), ask.kind))
         } else if ask.estimate > max {
-            Some(format!("estimate {} is above {}'s limit of {max}", ask.estimate, sender.address))
+            Some(format!("estimate {} is above {}'s limit of {max}", ask.estimate, self.label(author)))
         } else if used_today >= sender.per_day {
-            Some(format!("{} reached their limit of {} per day", sender.address, sender.per_day))
+            Some(format!("{} reached their limit of {} per day", self.label(author), sender.per_day))
         } else {
             None
         };
@@ -283,16 +301,17 @@ impl IntakePolicy {
         }
     }
 
-    /// `/approve` is for maintainers; `done`, `cancel` and `reopen` also for whoever asked.
-    pub fn decide_signal(&self, author: &Author, kind: SignalKind, task: &Task) -> Decision {
+    /// `/approve` is for maintainers; `done`, `cancel` and `reopen` also for whoever asked. `who`
+    /// is the author's public name, which is what the task records as its requester.
+    pub fn decide_signal(&self, author: &Author, who: &str, kind: SignalKind, task: &Task) -> Decision {
         if self.is_maintainer(author) {
             return Decision::Accept;
         }
-        let requester = author.address == task.requester && (author.verified == Verification::Platform || self.verified_sender(author).is_ok_and(|s| s.is_some()));
+        let requester = who == task.requester && (author.verified == Verification::Platform || self.verified_sender(author).is_ok_and(|s| s.is_some()));
         match kind {
-            SignalKind::Approve => Decision::Ignore(format!("{} may not approve: only maintainers can", author.address)),
+            SignalKind::Approve => Decision::Ignore(format!("{} may not approve: only maintainers can", self.label(author))),
             _ if requester => Decision::Accept,
-            _ => Decision::Ignore(format!("{} is neither a maintainer nor who asked", author.address)),
+            _ => Decision::Ignore(format!("{} is neither a maintainer nor who asked", self.label(author))),
         }
     }
 }

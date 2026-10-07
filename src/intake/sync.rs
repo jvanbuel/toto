@@ -36,6 +36,9 @@ fn d_input() -> u64 {
 fn d_prompt() -> usize {
     48_000
 }
+fn d_log_days() -> u32 {
+    30
+}
 fn d_true() -> bool {
     true
 }
@@ -76,6 +79,14 @@ pub struct IntakeConfig {
     pub base: String,
     #[serde(default = "d_state")]
     pub state_branch: String,
+    /// Keep the state in another repository (`owner/name`, or a git URL) instead of this one: a
+    /// private one keeps the sync log and task state out of public view and out of the project's
+    /// clones. Needs a token that can push to it (`TOTO_STATE_TOKEN`).
+    #[serde(default)]
+    pub state_repo: Option<String>,
+    /// Days of sync log kept on the state branch.
+    #[serde(default = "d_log_days")]
+    pub log_days: u32,
     /// Stop opening new pull requests while this many toto pull requests are open.
     #[serde(default = "d_max_open")]
     pub max_open: usize,
@@ -103,13 +114,31 @@ impl IntakeConfig {
         if !crate::directory::valid_repo(&c.repo) {
             return Err(format!("intake config: repo `{}` is not `owner/name`", c.repo));
         }
-        if c.state_branch == c.base {
+        if c.state_branch == c.base && c.state_repo.is_none() {
             return Err("intake config: state_branch must not be the base branch".into());
+        }
+        if let Some(r) = &c.state_repo
+            && !crate::directory::valid_repo(r)
+            && !r.contains("://")
+            && !r.starts_with('/')
+        {
+            return Err(format!("intake config: state_repo `{r}` is neither `owner/name` nor a git URL"));
         }
         if let Some(e) = &c.email {
             e.validate()?;
         }
         Ok(c)
+    }
+
+    /// Where the state branch is: `origin`, or `state_repo` (`owner/name` means github.com).
+    pub fn state_location(&self, token: Option<String>) -> super::store::Location {
+        match &self.state_repo {
+            None => super::store::Location::origin(&self.state_branch),
+            Some(r) => {
+                let remote = if crate::directory::valid_repo(r) && !r.starts_with('/') { format!("https://github.com/{r}.git") } else { r.clone() };
+                super::store::Location { remote, branch: self.state_branch.clone(), token }
+            }
+        }
     }
 
     pub fn trusted(&self, key: &SigningKey) -> TrustedProjects {
@@ -154,6 +183,8 @@ pub struct Pass<'a> {
     pub repo_dir: &'a Path,
     pub inbounds: Vec<&'a dyn Inbound>,
     pub outbounds: Vec<&'a dyn Outbound>,
+    /// Where the state branch is ([`IntakeConfig::state_location`]).
+    pub state: super::store::Location,
     pub now: DateTime<Utc>,
 }
 
@@ -171,7 +202,7 @@ struct State<'p, 'a> {
 }
 
 pub fn run(p: &Pass) -> Result<Report> {
-    let mut s = State { p, store: Store::open(p.repo_dir, &p.cfg.state_branch)?, tasks: BTreeMap::new(), report: Report::default() };
+    let mut s = State { p, store: Store::open(p.repo_dir, p.state.clone())?, tasks: BTreeMap::new(), report: Report::default() };
     for path in s.store.list("tasks/") {
         if let Some(t) = s.store.get::<Task>(&path)? {
             s.tasks.insert(t.id.clone(), t);
@@ -285,6 +316,17 @@ impl State<'_, '_> {
         self.tasks.values().find(|t| refs.iter().any(|r| t.links.contains(r))).map(|t| t.id.clone())
     }
 
+    /// How an author appears in everything toto writes. GitHub logins are public already. A mail
+    /// address never is: a pre-approved sender is their configured `name`, or a pseudonym keyed by
+    /// the project's signing key (stable, and not computable from a guessed address without the
+    /// key); an unknown sender is their domain.
+    fn public_name(&self, a: &Author) -> String {
+        if a.address.starts_with("github:") {
+            return a.address.clone();
+        }
+        public_name(&self.p.cfg.policy, self.p.key, &a.address)
+    }
+
     fn usage_path(author: &str) -> String {
         format!("senders/{}.json", file_key(author))
     }
@@ -294,13 +336,13 @@ impl State<'_, '_> {
         self.store.get::<Usage>(&Self::usage_path(author)).ok().flatten().filter(|u| u.day == today).map_or(0, |u| u.count)
     }
 
-    fn count(&mut self, author: &Author) -> Result<()> {
+    fn count(&mut self, author: &Author, who: &str) -> Result<()> {
         if self.p.cfg.policy.is_maintainer(author) {
             return Ok(());
         }
         let today = self.p.now.format("%Y-%m-%d").to_string();
-        let count = self.used_today(&author.address) + 1;
-        self.store.put(&Self::usage_path(&author.address), &Usage { day: today, count })
+        let count = self.used_today(who) + 1;
+        self.store.put(&Self::usage_path(who), &Usage { day: today, count })
     }
 
     fn handle(&mut self, item: Received) -> Result<()> {
@@ -309,6 +351,7 @@ impl State<'_, '_> {
         let now = self.p.now;
         match item {
             Received::Message { id, thread, author, subject, body } => {
+                let who = self.public_name(&author);
                 if self.tasks.values().any(|t| t.seen.contains(&id)) {
                     return Ok(()); // a repeated delivery
                 }
@@ -316,23 +359,23 @@ impl State<'_, '_> {
                 if let Some(tid) = resolved {
                     let t = &self.tasks[&tid];
                     let ask = super::policy::Ask { kind: t.kind.clone(), estimate: t.estimate, unknown_kind: None };
-                    let decision = policy.decide_message(&author, &ask, self.used_today(&author.address));
+                    let decision = policy.decide_message(&author, &ask, self.used_today(&who));
                     let approved = match &decision {
                         Decision::Ignore(why) => {
-                            self.log("ignore", Some(&tid), Some(&id), Some(&author.address), why.clone());
+                            self.log("ignore", Some(&tid), Some(&id), Some(&who), why.clone());
                             return Ok(());
                         }
                         Decision::Hold(why) => {
-                            self.log("hold", Some(&tid), Some(&id), Some(&author.address), format!("refinement: {why}"));
+                            self.log("hold", Some(&tid), Some(&id), Some(&who), format!("refinement: {why}"));
                             false
                         }
                         Decision::Accept => {
-                            self.log("accept", Some(&tid), Some(&id), Some(&author.address), "refinement");
-                            self.count(&author)?;
+                            self.log("accept", Some(&tid), Some(&id), Some(&who), "refinement");
+                            self.count(&author, &who)?;
                             true
                         }
                     };
-                    let turn = Turn { source: id, role: Role::Refinement, author: author.address.clone(), text: body, approved, at: now };
+                    let turn = Turn { source: id, role: Role::Refinement, author: who.clone(), text: body, approved, at: now };
                     return self.apply(&tid, Event::Refine(turn));
                 }
                 if thread.as_ref().is_some_and(|th| !th.0.is_empty() && th.0.iter().all(|r| r.0.starts_with("github:pr:"))) {
@@ -343,34 +386,36 @@ impl State<'_, '_> {
                     return Ok(());
                 }
                 let ask = policy.ask(&author, subject.as_deref(), &body);
-                let decision = policy.decide_message(&author, &ask, self.used_today(&author.address));
+                let decision = policy.decide_message(&author, &ask, self.used_today(&who));
                 let (approved, note) = match decision {
                     Decision::Ignore(why) => {
-                        self.log("ignore", None, Some(&id), Some(&author.address), why);
+                        self.log("ignore", None, Some(&id), Some(&who), why);
                         return Ok(());
                     }
                     Decision::Hold(why) => {
-                        self.log("hold", Some(&tid), Some(&id), Some(&author.address), why.clone());
+                        self.log("hold", Some(&tid), Some(&id), Some(&who), why.clone());
                         (false, Some(why))
                     }
                     Decision::Accept => {
-                        self.log("accept", Some(&tid), Some(&id), Some(&author.address), format!("new task, kind {}, estimate {}", ask.kind, ask.estimate));
-                        self.count(&author)?;
+                        self.log("accept", Some(&tid), Some(&id), Some(&who), format!("new task, kind {}, estimate {}", ask.kind, ask.estimate));
+                        self.count(&author, &who)?;
                         (true, None)
                     }
                 };
                 let title = subject.as_deref().map(clean_title).filter(|t| !t.is_empty()).or_else(|| body.lines().map(str::trim).find(|l| !l.is_empty()).map(clean_title)).unwrap_or_else(|| "untitled request".into());
-                let turn = Turn { source: id, role: Role::Request, author: author.address.clone(), text: body, approved, at: now };
+                let turn = Turn { source: id, role: Role::Request, author: who.clone(), text: body, approved, at: now };
                 let mut t = Task::new(&self.p.cfg.project_id, turn, &ask.kind, &title, ask.estimate, note, now);
                 t.start(rules);
                 self.tasks.insert(tid, t);
                 Ok(())
             }
             Received::Skipped { id, from, reason } => {
-                self.log("ignore", None, Some(&id), Some(&from), reason);
+                let who = if from.contains('@') { public_name(&self.p.cfg.policy, self.p.key, &from) } else { from };
+                self.log("ignore", None, Some(&id), Some(&who), reason);
                 Ok(())
             }
             Received::Signal { id, thread, author, kind } => {
+                let who = self.public_name(&author);
                 let Some(tid) = self.resolve(&thread.0) else { return Ok(()) };
                 if self.tasks[&tid].seen.contains(&id) {
                     return Ok(());
@@ -388,15 +433,15 @@ impl State<'_, '_> {
                 if probe == self.tasks[&tid] {
                     return Ok(());
                 }
-                match policy.decide_signal(&author, kind, &self.tasks[&tid]) {
+                match policy.decide_signal(&author, &who, kind, &self.tasks[&tid]) {
                     Decision::Accept => {
-                        self.log("signal", Some(&tid), Some(&id), Some(&author.address), format!("{kind:?}"));
+                        self.log("signal", Some(&tid), Some(&id), Some(&who), format!("{kind:?}"));
                         self.apply(&tid, ev)?;
                         if let Some(t) = self.tasks.get_mut(&tid) {
                             t.seen.insert(id);
                         }
                     }
-                    Decision::Hold(why) | Decision::Ignore(why) => self.log("ignore", Some(&tid), Some(&id), Some(&author.address), why),
+                    Decision::Hold(why) | Decision::Ignore(why) => self.log("ignore", Some(&tid), Some(&id), Some(&who), why),
                 }
                 Ok(())
             }
@@ -528,6 +573,10 @@ impl State<'_, '_> {
         for l in &self.report.log {
             self.store.append(&log, &serde_json::to_string(l)?);
         }
+        let oldest = (self.p.now - chrono::Duration::days(i64::from(self.p.cfg.log_days))).format("log/%Y-%m-%d.jsonl").to_string();
+        for old in self.store.list("log/").into_iter().filter(|p| *p < oldest) {
+            self.store.remove(&old);
+        }
         let msg = format!("toto sync: {} posted, {} published, {} log lines", self.report.posted.len(), self.report.published, self.report.log.len());
         self.report.commit = self.store.commit_and_push(&msg)?;
         Ok(self.report)
@@ -543,6 +592,8 @@ pub struct Secrets {
     pub projects_token: Option<String>,
     /// For the inbox, when configured (`email.password_env`).
     pub imap_password: Option<String>,
+    /// For `state_repo`, when configured (`TOTO_STATE_TOKEN`).
+    pub state_token: Option<String>,
 }
 
 /// One pass with the connectors `.toto/intake.toml` configures.
@@ -582,5 +633,23 @@ pub fn sync_repo(cfg: &IntakeConfig, repo_dir: &Path, key: &SigningKey, secrets:
     if let Some(b) = &board {
         outbounds.push(b);
     }
-    run(&Pass { cfg, queue: &queue, key, repo_dir, inbounds, outbounds, now })
+    if cfg.state_repo.as_deref().is_some_and(|r| !r.starts_with('/')) && secrets.state_token.is_none() {
+        return Err(Error::Policy("state_repo is configured but $TOTO_STATE_TOKEN is not set (a token that can push to it)".into()));
+    }
+    let state = cfg.state_location(secrets.state_token.clone());
+    run(&Pass { cfg, queue: &queue, key, repo_dir, inbounds, outbounds, state, now })
+}
+
+/// The public name of a mail address (see `State::public_name`).
+pub fn public_name(policy: &IntakePolicy, key: &SigningKey, address: &str) -> String {
+    let address = address.to_lowercase();
+    match policy.sender(&address) {
+        Some(s) => s.name.clone().unwrap_or_else(|| {
+            use sha2::{Digest, Sha256};
+            let salt = Sha256::digest([b"toto sender name\0".as_slice(), &key.to_bytes()].concat());
+            let h = Sha256::digest([salt.as_slice(), address.as_bytes()].concat());
+            format!("sender-{}", &hex::encode(h)[..8])
+        }),
+        None => format!("an unknown sender at {}", address.rsplit_once('@').map_or("?", |x| x.1)),
+    }
 }
