@@ -294,11 +294,11 @@ async fn approve(State(s): State<Arc<UiState>>, AxPath(pending): AxPath<String>)
     let applied = match p {
         Pending::Add { preview, share } => {
             let notes = projects::apply_add(&mut cfg, &preview, &AddOptions { share, token_file: None })?;
-            Applied { message: format!("added `{}`; restart the daemon to pick it up, and run `toto doctor`", preview.fetched.devcontainer.toto.id), notes }
+            Applied { message: format!("added `{}`; the daemon picks it up before its next task (run `toto doctor` to check the setup)", preview.fetched.devcontainer.toto.id), notes }
         }
         Pending::Update { id, approval } => {
             projects::apply_update(&mut cfg, &id, *approval);
-            Applied { message: format!("approved the new version of `{id}`; restart the daemon to pick it up"), notes: vec![] }
+            Applied { message: format!("approved the new version of `{id}`; the daemon runs it from its next task"), notes: vec![] }
         }
     };
     cfg.save(&s.config_path)?;

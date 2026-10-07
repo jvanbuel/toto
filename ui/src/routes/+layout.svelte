@@ -48,6 +48,6 @@
 	</main>
 	<footer class="border-t py-5 text-xs text-muted-foreground">
 		This page talks to the runner on this machine only. Changes to projects and policy take effect
-		when the daemon restarts.
+		before the runner's next task; a running task finishes as it started.
 	</footer>
 </div>

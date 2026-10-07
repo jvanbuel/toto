@@ -48,6 +48,9 @@ export type Status = {
 	paused_until: string | null;
 	pause_reason: string | null;
 	user_paused: boolean;
+	config_loaded: string | null;
+	reloads: number;
+	config_error: string | null;
 	updated: string;
 };
 

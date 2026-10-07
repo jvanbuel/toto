@@ -349,7 +349,12 @@ impl Config {
         let dir = self.state_dir.join("proxy");
         std::fs::create_dir_all(&dir)?;
         std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
-        Ok(Arc::new(crate::proxy::AuthProxy::start(&dir.join("p.sock"), upstream, provider.provider(), auth)?))
+        // One socket per proxy instance: on a config reload the old proxy is dropped after the new
+        // one starts, and dropping removes the old socket file.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let socket = dir.join(format!("p-{}-{n}.sock", std::process::id()));
+        Ok(Arc::new(crate::proxy::AuthProxy::start(&socket, upstream, provider.provider(), auth)?))
     }
 
     pub fn build_queue(&self) -> Result<Arc<dyn QueueClient>> {

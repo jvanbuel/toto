@@ -48,8 +48,12 @@ pub struct Runner<Q, H, S, R> {
     pub reviewer: R,
     pub audit: AuditLog,
     pub lease: Duration,
-    /// Task ids already refused, so a bad task is logged once rather than every tick.
+    /// Tasks refused by verification or policy, so a bad task is logged once rather than every
+    /// tick. Not carried across a config reload: the new policy decides afresh.
     refused: HashSet<String>,
+    /// Tasks this runner claimed and then aborted or failed. Never retried, also across reloads:
+    /// a retry would burn tokens on work that already went wrong once.
+    abandoned: HashSet<String>,
     /// Id of the task currently leased, shared with the daemon's heartbeat task.
     pub current_lease: Arc<Mutex<Option<String>>>,
     /// Whether the last tick paused, so a pause is logged once rather than every tick.
@@ -59,7 +63,17 @@ pub struct Runner<Q, H, S, R> {
 #[allow(clippy::too_many_arguments)]
 impl<Q: QueueClient, H: Harness, S: Sandbox, R: Reviewer> Runner<Q, H, S, R> {
     pub fn new(policy: Policy, trusted: TrustedProjects, key: SigningKey, queue: Q, harness: H, sandbox: S, reviewer: R, audit: AuditLog) -> Self {
-        Self { policy, trusted, key, queue, harness, sandbox, reviewer, audit, lease: Duration::from_secs(900), refused: HashSet::new(), current_lease: Arc::default(), paused: false }
+        Self { policy, trusted, key, queue, harness, sandbox, reviewer, audit, lease: Duration::from_secs(900), refused: HashSet::new(), abandoned: HashSet::new(), current_lease: Arc::default(), paused: false }
+    }
+
+    /// Tasks this runner abandoned (by a hash of their signed bytes), to hand to its successor.
+    pub fn abandoned(&self) -> &HashSet<String> {
+        &self.abandoned
+    }
+
+    /// Takes over a predecessor's abandoned tasks, so a config reload never retries one.
+    pub fn remember_abandoned(&mut self, keys: &HashSet<String>) {
+        self.abandoned.extend(keys.iter().cloned());
     }
 
     pub fn runner_id(&self) -> String {
@@ -90,7 +104,7 @@ impl<Q: QueueClient, H: Harness, S: Sandbox, R: Reviewer> Runner<Q, H, S, R> {
         let mut ok: Vec<(String, TaskManifest)> = Vec::new();
         for env in self.queue.available()? {
             let key = env.payload_bytes().map(|b| crate::archive::sha256_hex(&b)).unwrap_or_default();
-            if self.refused.contains(&key) {
+            if self.refused.contains(&key) || self.abandoned.contains(&key) {
                 continue;
             }
             let verdict = self.trusted.verify(&env).and_then(|m| {
@@ -121,7 +135,7 @@ impl<Q: QueueClient, H: Harness, S: Sandbox, R: Reviewer> Runner<Q, H, S, R> {
         *self.current_lease.lock().unwrap() = None;
         if let Ok(Tick::Dropped(_)) = &out {
             // Never retry a task this runner already aborted or failed: it would burn tokens in a loop.
-            self.refused.insert(key);
+            self.abandoned.insert(key);
         }
         out
     }

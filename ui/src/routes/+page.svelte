@@ -128,6 +128,14 @@
 			</CardSection>
 		</Card>
 	{/if}
+	{#if data.status?.config_error}
+		<Card class="mt-4">
+			<CardSection>
+				<p class="font-medium">Your latest config edit was not applied</p>
+				<p class="text-sm text-muted-foreground">{data.status.config_error}</p>
+			</CardSection>
+		</Card>
+	{/if}
 	{#if data.status?.last_error}
 		<Card class="mt-4">
 			<CardSection>

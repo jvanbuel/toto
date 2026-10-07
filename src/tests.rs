@@ -348,6 +348,86 @@ mod daemon {
         assert!(!st.user_paused && st.state == "stopped");
     }
 
+    /// Config edits apply between tasks without a restart: a policy change admits a task it
+    /// rejected; a broken edit is reported and the previous config keeps running; a reload
+    /// never retries a task the runner already abandoned.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_daemon_reloads_its_config_between_tasks() {
+        let f = fixture("daemon-reload");
+        let mut cfg = config(&f.dir, &f.key_a, SandboxConfig::Dir);
+        cfg.ui_addr = None;
+        cfg.policy.allowed_kinds.clear(); // nothing is admitted at first
+        let path = f.dir.join("config.json");
+        cfg.save(&path).unwrap();
+        let q = DirQueue::new(&cfg.queue_dir).unwrap();
+        q.post(&task("r1", "a", 1000, &f.key_a).sign(&f.key_a).unwrap()).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let state = cfg.state_dir.clone();
+        let handle = tokio::spawn(crate::daemon::run(cfg.clone(), Some(path.clone()), async { let _ = rx.await; }));
+        let log = || crate::audit::AuditLog::new(state.join("audit.jsonl")).entries().unwrap();
+        let status = || crate::daemon::Status::read(&state).unwrap_or_default();
+        async fn until(what: &str, mut ok: impl FnMut() -> bool) {
+            for _ in 0..150 {
+                if ok() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            panic!("timed out waiting for {what}");
+        }
+
+        until("the first rejection", || log().iter().any(|e| e.task_id == "r1" && e.outcome == "rejected")).await;
+        assert!(q.results().unwrap().is_empty());
+
+        // 1. The policy is edited (as the page or the CLI would): the rejected task now runs.
+        cfg.policy.allowed_kinds = vec!["summarise".into()];
+        cfg.save(&path).unwrap();
+        until("r1 submitted after the reload", || q.results().unwrap().len() == 1).await;
+        let st = status();
+        assert_eq!((st.reloads, st.config_error.as_deref()), (1, None), "{st:?}");
+
+        // 2. A task the runner abandons (its estimate is 0, so the meter aborts it at once).
+        q.post(&task("r2", "a", 0, &f.key_a).sign(&f.key_a).unwrap()).unwrap();
+        until("r2 aborted", || log().iter().any(|e| e.task_id == "r2" && e.outcome == "aborted")).await;
+
+        // 3. A broken edit: reported, and the previous config keeps running.
+        std::fs::write(&path, "{ not json").unwrap();
+        until("the config error", || status().config_error.is_some()).await;
+        assert!(status().config_error.unwrap().contains("previous config keeps running"));
+        q.post(&task("r3", "a", 10, &f.key_a).sign(&f.key_a).unwrap()).unwrap(); // within the day's cap
+        until("r3 submitted under the previous config", || q.results().unwrap().len() == 2).await;
+
+        // 4. A valid edit again: applied, the error clears, and r2 is not retried by the new runner.
+        cfg.poll_secs = 2;
+        cfg.save(&path).unwrap();
+        until("the second reload", || status().reloads == 2).await;
+        assert!(status().config_error.is_none());
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(log().iter().filter(|e| e.task_id == "r2" && e.outcome == "aborted").count(), 1, "an abandoned task is never retried, also across a reload");
+
+        tx.send(()).unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// Each credential proxy has its own socket, so dropping the old runner after a reload
+    /// cannot remove the new one's.
+    #[test]
+    fn each_proxy_gets_its_own_socket() {
+        let f = fixture("proxy-sockets");
+        let mut cfg = config(&f.dir, &f.key_a, SandboxConfig::Docker { bin: "docker".into(), runtime: None, nested_userns: false, network: None });
+        cfg.harness = HarnessConfig::Omnigent { provider: ProviderConfig::Anthropic, upstream: Some("http://127.0.0.1:9".into()), token_file: None, api_key_file: None };
+        std::fs::create_dir_all(&cfg.state_dir).unwrap();
+        crate::secrets::save_token(&cfg.token_path(), "T").unwrap();
+        let socks = || std::fs::read_dir(cfg.state_dir.join("proxy")).unwrap().count();
+        let old = cfg.build().unwrap();
+        let new = cfg.build().unwrap();
+        assert_eq!(socks(), 2);
+        drop(old);
+        assert_eq!(socks(), 1, "dropping the old proxy leaves the new one's socket");
+        drop(new);
+        assert_eq!(socks(), 0);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn daemon_processes_queue_and_stops_cleanly() {
         let f = fixture("daemon");

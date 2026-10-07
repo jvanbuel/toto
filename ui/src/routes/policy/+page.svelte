@@ -129,7 +129,7 @@
 			<CardSection class="flex items-center gap-3 border-t pt-4">
 				<Button type="submit">Save</Button>
 				{#if saved}<span class="text-sm text-muted-foreground"
-						>saved; restart the daemon to apply</span
+						>saved; the daemon applies it before its next task</span
 					>{/if}
 				{#if error}<span class="text-sm">{error}</span>{/if}
 			</CardSection>

@@ -7,7 +7,7 @@
 use crate::config::{Config, DaemonRunner};
 use crate::queue::QueueClient;
 use crate::runner::Tick;
-use crate::Result;
+use crate::{Error, Result};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -32,6 +32,14 @@ pub struct Status {
     /// The contributor paused the runner (`toto pause`, or the page); `state` is `paused`.
     #[serde(default)]
     pub user_paused: bool,
+    /// When the config in force was loaded, and how many times it was reloaded since start.
+    #[serde(default)]
+    pub config_loaded: Option<String>,
+    #[serde(default)]
+    pub reloads: u64,
+    /// Why the latest edit of the config file was not applied; the previous config keeps running.
+    #[serde(default)]
+    pub config_error: Option<String>,
     pub updated: String,
 }
 
@@ -61,6 +69,7 @@ pub async fn run(cfg: Config, config_path: Option<std::path::PathBuf>, shutdown:
     let runner = cfg.build()?;
     runner.sandbox.probe()?;
     runner.harness.probe()?;
+    let config_path_for_reload = config_path.clone();
     let ui = match (&cfg.ui_addr, config_path) {
         (Some(addr), Some(path)) => match crate::ui::bind(path, &cfg.state_dir, addr).await {
             Ok((listener, state, url)) => {
@@ -76,15 +85,24 @@ pub async fn run(cfg: Config, config_path: Option<std::path::PathBuf>, shutdown:
         },
         _ => None,
     };
-    let out = run_runner(runner, cfg, shutdown).await;
+    let out = run_runner(runner, cfg, config_path_for_reload, shutdown).await;
     if let Some(ui) = ui {
         ui.abort();
     }
     out
 }
 
-/// Sleeps `wait`, waking early when the contributor's pause marker appears or disappears.
-async fn wait_or_control(state_dir: &Path, wait: Duration) {
+/// What identifies a version of the config file: its modification time and size.
+type Stamp = Option<(std::time::SystemTime, u64)>;
+
+fn stamp(path: &Path) -> Stamp {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
+/// Sleeps `wait`, waking early when the contributor's pause marker appears or disappears, or
+/// when the config file changes from the version `watch` names.
+async fn wait_or_control(state_dir: &Path, watch: Option<(&Path, Stamp)>, wait: Duration) {
     let was = crate::control::is_paused(state_dir);
     let deadline = tokio::time::Instant::now() + wait;
     loop {
@@ -92,22 +110,73 @@ async fn wait_or_control(state_dir: &Path, wait: Duration) {
         if left.is_zero() {
             return;
         }
-        tokio::time::sleep(left.min(Duration::from_secs(2))).await;
-        if crate::control::is_paused(state_dir) != was {
+        tokio::time::sleep(left.min(Duration::from_secs(1))).await;
+        if crate::control::is_paused(state_dir) != was || watch.is_some_and(|(p, s)| stamp(p) != s) {
             return;
         }
     }
 }
 
-async fn run_runner(runner: DaemonRunner, cfg: Config, shutdown: impl Future<Output = ()>) -> Result<()> {
+/// Loads, builds and probes the edited config, off to the side: nothing is swapped unless all
+/// of it succeeds.
+fn reload(path: &Path, current: &Config) -> Result<(Config, DaemonRunner)> {
+    let cfg = Config::load(path)?;
+    if cfg.state_dir != current.state_dir {
+        return Err(Error::Policy("`state_dir` changed; restart the daemon to move its state".into()));
+    }
+    let runner = cfg.build()?;
+    runner.sandbox.probe()?;
+    runner.harness.probe()?;
+    Ok((cfg, runner))
+}
+
+async fn run_runner(runner: DaemonRunner, mut cfg: Config, config_path: Option<std::path::PathBuf>, shutdown: impl Future<Output = ()>) -> Result<()> {
     tokio::pin!(shutdown);
-    let (queue, runner_id, lease, current) = (runner.queue.clone(), runner.runner_id(), runner.lease, runner.current_lease.clone());
-    let heartbeat = tokio::spawn(heartbeat_loop(queue.clone(), runner_id.clone(), lease, current.clone()));
+    let (mut queue, mut runner_id, mut lease, mut current) = (runner.queue.clone(), runner.runner_id(), runner.lease, runner.current_lease.clone());
+    let mut heartbeat = tokio::spawn(heartbeat_loop(queue.clone(), runner_id.clone(), lease, current.clone()));
     let runner = Arc::new(Mutex::new(runner));
-    let (poll, mut status, mut backoff) = (Duration::from_secs(cfg.poll_secs.max(1)), Status::default(), Duration::ZERO);
+    let (mut poll, mut status, mut backoff) = (Duration::from_secs(cfg.poll_secs.max(1)), Status::default(), Duration::ZERO);
+    let mut loaded = config_path.as_deref().and_then(stamp);
+    status.config_loaded = Some(Local::now().to_rfc3339());
     status.write(&cfg.state_dir, "idle", None);
 
     'main: loop {
+        // A changed config file is applied here, between tasks: never while one runs.
+        if let Some(path) = &config_path
+            && stamp(path) != loaded
+        {
+            loaded = stamp(path);
+            status.write(&cfg.state_dir, "reloading", None);
+            let (p, cur) = (path.clone(), cfg.clone());
+            match tokio::task::spawn_blocking(move || reload(&p, &cur)).await.expect("reload panicked") {
+                Ok((new_cfg, mut new_runner)) => {
+                    if new_cfg.ui_addr != cfg.ui_addr {
+                        eprintln!("toto: `ui_addr` changed; the page moves when the daemon restarts");
+                    }
+                    {
+                        let mut r = runner.lock().unwrap();
+                        new_runner.remember_abandoned(r.abandoned());
+                        *r = new_runner; // drops the old runner, and with it the old proxy
+                        (queue, runner_id, lease, current) = (r.queue.clone(), r.runner_id(), r.lease, r.current_lease.clone());
+                    }
+                    heartbeat.abort();
+                    heartbeat = tokio::spawn(heartbeat_loop(queue.clone(), runner_id.clone(), lease, current.clone()));
+                    cfg = new_cfg;
+                    poll = Duration::from_secs(cfg.poll_secs.max(1));
+                    status.reloads += 1;
+                    status.config_error = None;
+                    status.config_loaded = Some(Local::now().to_rfc3339());
+                    status.write(&cfg.state_dir, "idle", None);
+                }
+                Err(e) => {
+                    eprintln!("toto: the edited config was not applied: {e}");
+                    status.config_error = Some(format!("{e}; the previous config keeps running"));
+                    status.write(&cfg.state_dir, "idle", None);
+                }
+            }
+        }
+        let watch = config_path.as_deref().map(|p| (p, loaded));
+
         // The contributor's pause comes before anything else: no task is taken while it holds.
         if crate::control::is_paused(&cfg.state_dir) {
             status.user_paused = true;
@@ -115,7 +184,7 @@ async fn run_runner(runner: DaemonRunner, cfg: Config, shutdown: impl Future<Out
             status.paused_until = None;
             status.write(&cfg.state_dir, "paused", None);
             tokio::select! {
-                _ = wait_or_control(&cfg.state_dir, Duration::from_secs(3600)) => continue 'main,
+                _ = wait_or_control(&cfg.state_dir, watch, Duration::from_secs(3600)) => continue 'main,
                 _ = &mut shutdown => break 'main,
             }
         }
@@ -175,7 +244,7 @@ async fn run_runner(runner: DaemonRunner, cfg: Config, shutdown: impl Future<Out
             }
         };
         tokio::select! {
-            _ = wait_or_control(&cfg.state_dir, wait) => {}
+            _ = wait_or_control(&cfg.state_dir, watch, wait) => {}
             _ = &mut shutdown => break 'main,
         }
     }
