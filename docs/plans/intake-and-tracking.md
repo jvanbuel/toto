@@ -2,6 +2,8 @@
 
 Decision record: [ADR 16](../adr/0016-task-intake-refinement-and-tracking.md). This page is the order of work. Each phase ends with something usable, tests, docs and a push.
 
+**Status (2026-10-07): Phases 0 to 4 are implemented** (`src/intake/`, tests in `src/intake/tests.rs`, user documentation in [docs/intake.md](../intake.md)). Phase 5 is still later. ADR 16's "As built" section lists where the code differs from this plan.
+
 Everything here runs on the **project side** (`toto project sync`), as a scheduled job on a fresh machine each time. That shapes the whole design: the job keeps no local state, every step is idempotent, and two passes running at once must not do anything twice. Contributors' runners change only in Phase 1, where they learn to ignore two new optional manifest fields.
 
 ## Phase 0: the core model (no connectors yet)

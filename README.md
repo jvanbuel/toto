@@ -78,6 +78,10 @@ Linux, macOS and Windows hosts with Docker Desktop, Docker Engine or Podman. Not
 
 The daemon serves a page on loopback while it runs (`ui_addr`, default `127.0.0.1:7707`); `toto ui` prints its URL, or serves the page itself when no daemon is running. It shows the runner's status and pause reason live, today's usage against the cap, the audit tail and every supported project with what was approved for it. It pauses and resumes the runner (`toto pause` and `toto resume` do the same from a terminal; a running task finishes first), adds projects, checks and approves updates, removes projects and edits the policy (the daemon picks changes up before its next task, from the page, the CLI or an editor alike), through the same previews the CLI uses: nothing is approved that was not shown. Every call carries a session token kept in `state/ui.token` (mode 600) in a header, so other users on the machine and other sites in your browser cannot drive it. The API is what a native app will talk to. See `ui/README.md`.
 
+## Asking for work
+
+On the project side, `toto project sync` runs in the project's own scheduled workflow. People ask for work with an issue form or by email. Maintainers and pre-approved senders are queued at once; anyone else waits for a maintainer's `/approve`. Each approved request becomes signed attempts for contributors' runners. Every task gets **one pull request**, and comments on it are refinements that run as further attempts on the same pull request. Progress shows as a status comment on the request and, optionally, on a GitHub Projects board. Its state lives on a `toto-state` branch. See [docs/intake.md](docs/intake.md) and ADR 16.
+
 ## The site
 
 `site/` is a static SvelteKit site built from the signed directory (what toto is, how to contribute, every listed project with the command to add it), published to GitHub Pages by `.github/workflows/site.yml` whenever the directory or the site changes. The build verifies the directory's signature first, as a runner does. See `site/README.md`.
@@ -88,4 +92,4 @@ The daemon serves a page on loopback while it runs (`ui_addr`, default `127.0.0.
 - Project owners: [docs/project-owner-guide.md](docs/project-owner-guide.md), with a complete example in `docs/examples/project/`.
 - Queue: [docs/github-queue.md](docs/github-queue.md), [docs/queue-protocol.md](docs/queue-protocol.md).
 - Decisions: [docs/adr/README.md](docs/adr/README.md).
-- Plans: [docs/plans/intake-and-tracking.md](docs/plans/intake-and-tracking.md) (task intake by email and issue form, refinement by comment, boards).
+- Project side: [docs/intake.md](docs/intake.md) (requests by issue form or email, refinement by comment, boards); plan: [docs/plans/intake-and-tracking.md](docs/plans/intake-and-tracking.md).

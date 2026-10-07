@@ -77,9 +77,19 @@ toto post-task --key project.key --config cfg.json --github acme/docs \
 
 `task.json` is the manifest (`docs/examples/project/task.json`): id, kind, prompt, tool requirements, resource limits, a **cost estimate in tokens** (a task is aborted when it overruns it by the runner's margin, so estimate generously), the output schema (`max_bytes` for the text answer, `max_artifact_bytes` for files; on a GitHub queue a result must fit about 480 KB) and `redundancy`. The command signs it with your key, uploads the bundle as a release asset and opens a task issue. **Resource limits:** a contributor's default ceiling is 1 CPU, 1 GiB of memory and 10 minutes per task; a task asking for more is refused unless that contributor raised `policy.max_profile`. Inputs are the files the task works on, packed from a directory; keep them small (contributors limit input size).
 
-## 5. Turn results into pull requests
+## 5. Accept requests and turn results into pull requests
 
-Copy `docs/examples/toto-results.yml` to `.github/workflows/toto-results.yml` and set the repository variable `TOTO_PROJECT` to `<id>=<hex public key>`. Every 15 minutes it opens one pull request per finished task. Review and merge like any contribution. File changes touching `.github/`, `.gitlab-ci.yml`, `.git/`, `CODEOWNERS` and similar are never applied automatically; a cap on open toto PRs stops a flood. Give the workflow a fine-grained token (`TOTO_TOKEN`) if the PRs should run CI. See `docs/github-queue.md`.
+Copy `docs/examples/project/.github/workflows/toto-sync.yml`, `.github/ISSUE_TEMPLATE/toto-task.yml` and `.toto/intake.toml` from the example, create the `toto:request` label, and add the secret `TOTO_PROJECT_KEY` (the hex seed `toto project-key` wrote). Every 15 minutes, and whenever an issue or comment changes, `toto project sync`:
+
+- reads requests from the issue form (and, if you configure it, from an inbox);
+- posts approved ones as signed tasks;
+- turns results into **one pull request per task**;
+- treats comments on the request or the pull request as refinements, each run as a further attempt on the same pull request;
+- keeps a status comment on each request.
+
+Maintainers' requests run at once; anyone else's waits for a maintainer's `/approve`, unless you list them as a pre-approved sender. **A pre-approved sender is a credential:** whoever controls that account or mailbox can spend contributors' tokens on your project, within the limits you give them. All of it is described in `docs/intake.md`.
+
+File changes touching `.github/`, `.gitlab-ci.yml`, `.git/`, `CODEOWNERS` and similar are never applied automatically, and a cap on open toto pull requests stops a flood. Review and merge like any contribution. Give the workflow a fine-grained token (`TOTO_TOKEN`) if the pull requests should run CI. The sync keeps its state on a `toto-state` branch and never writes your default branch. Without intake, `docs/examples/toto-results.yml` (`toto results-to-pr`) still turns results of tasks you post by hand into pull requests.
 
 ## Checklist before your first task
 
@@ -88,4 +98,4 @@ Copy `docs/examples/toto-results.yml` to `.github/workflows/toto-results.yml` an
 - [ ] `.toto/agent/config.yaml` names a harness and a model, and asks for the least network and tools it can.
 - [ ] No secrets in the image, the agent directory or the bundles (assume anything a task can read, a contributor can read).
 - [ ] You tried it yourself: `toto projects add` against your own repository, then `toto doctor`, then one task with `toto run --once`.
-- [ ] The results Action runs, and you know who reviews the PRs.
+- [ ] The sync workflow runs, the `toto:request` label exists, and you know who reviews the PRs and who may `/approve`.

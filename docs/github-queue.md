@@ -41,9 +41,9 @@ So this queue suits pilots and communities where the project can moderate. For a
 
 ## Results become pull requests, automatically
 
-Contributors only offer tokens; they never see the project or its repository. The project side is automated: `toto results-to-pr` (run on a schedule by a GitHub Action, `docs/examples/toto-results.yml`) handles every task issue that has a result:
+Contributors only offer tokens; they never see the project or its repository. The project side is automated: `toto project sync` (`docs/intake.md`, which also takes requests and refinements) or the narrower `toto results-to-pr` (`docs/examples/toto-results.yml`), run on a schedule by a GitHub Action, handles every task issue that has a result:
 
-- **File changes** become a branch `toto/<task>-<runner>` and a pull request on the default branch. The PR body carries the provenance (runner id, tokens used, output and artifact hashes) and the model's output inside a code fence that the output cannot close. Maintainers review and merge it like any contribution, with their usual CI, CODEOWNERS and approvals. The task issue gets a comment linking the PR and is closed.
+- **File changes** become a branch `toto/<task>` and a pull request on the default branch. A manifest that is an attempt of a task (`task` and `attempt` fields, ADR 16) lands on its task's branch: the first attempt opens the pull request (with `Closes #<request issue>` when the task has one), later attempts add a commit to it (a `Toto-Attempt: <id>` trailer marks each, so none is applied twice) and comment. One pull request per task; a standalone manifest is a task of one attempt. The PR body carries the provenance (runner id, tokens used, output and artifact hashes) and the model's output inside a code fence that the output cannot close. Maintainers review and merge it like any contribution, with their usual CI, CODEOWNERS and approvals. The task issue gets a comment linking the PR and is closed.
 - **Text-only results** (no files) are posted as a comment on the task issue, which is then closed.
 - **A result that changes nothing** is noted on the issue and the issue is closed.
 
@@ -54,7 +54,7 @@ Safeguards, because the content is model output:
 - A result that touches `.github/`, `.gitlab-ci.yml`, `.git/`, `CODEOWNERS`, `.gitmodules` or `.githooks/` (case-insensitive, extend with `--protect`) is **not** applied: it is noted on its issue and left open for a maintainer. A model must not be able to add a CI workflow.
 - `--max-open N` (default 10) stops opening PRs while N toto PRs are open, so a flooded queue cannot flood the repository; the rest wait for the next run.
 - The checkout must be clean, and `git add` only stages the paths the result touched.
-- Everything is idempotent (a marker comment on the issue, a branch per result). A failure of the network or `git push` aborts the run and the next run retries; only a bad *result* is refused and recorded.
+- Everything is idempotent (a marker comment on the issue, a trailer on each attempt's commit). A failure of the network or `git push` aborts the run and the next run retries; only a bad *result* is refused and recorded.
 
 Pushes made with the Action's default `GITHUB_TOKEN` do not trigger other workflows, so give the workflow a fine-grained token or a GitHub App token (`TOTO_TOKEN`) if the PRs should get CI.
 
@@ -62,7 +62,8 @@ Pushes made with the Action's default `GITHUB_TOKEN` do not trigger other workfl
 
 ```
 toto post-task --key project.key --config cfg.json --github org/project --github-token-file gh.token task.json [--bundle dir]
-toto results-to-pr org/project --project id=<hex pubkey> --base main      # PRs for finished tasks (normally on a schedule)
+toto project sync                                    # intake, attempts, PRs, status (docs/intake.md; normally on a schedule)
+toto results-to-pr org/project --project id=<hex pubkey> --base main      # only PRs for finished tasks
 toto github-results org/project --out results/      # verified results, one file each
 toto extract-result results/<id>.<runner>.json out/
 ```

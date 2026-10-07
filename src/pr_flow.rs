@@ -8,7 +8,7 @@
 //! inside a code fence. Review and merge are the project's usual PR process.
 
 use crate::archive::{valid_path, Record};
-use crate::github_queue::{handled_comment, Finished, GitHubQueue};
+use crate::github_queue::{handled_comment, handled_comment_pr, Finished, GitHubQueue};
 use crate::{Error, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -22,8 +22,12 @@ pub struct Options {
     pub base: String,
     pub branch_prefix: String,
     pub protected: Vec<String>,
-    /// Stop opening PRs while this many toto PRs are open.
+    /// Stop opening PRs while this many toto PRs are open (later attempts on an open one still land).
     pub max_open: usize,
+    /// The request issue of each task, for `Closes #<n>` in its pull request.
+    pub closes: std::collections::BTreeMap<String, u64>,
+    /// A title for each task's pull request.
+    pub titles: std::collections::BTreeMap<String, String>,
     pub git_name: String,
     pub git_email: String,
 }
@@ -36,6 +40,8 @@ impl Options {
             branch_prefix: "toto/".into(),
             protected: DEFAULT_PROTECTED.map(String::from).to_vec(),
             max_open: 10,
+            closes: Default::default(),
+            titles: Default::default(),
             git_name: "toto".into(),
             git_email: "toto@users.noreply.github.com".into(),
         }
@@ -167,25 +173,77 @@ fn handle(q: &GitHubQueue, repo: &str, f: &Finished, o: &Options, open: &mut usi
         q.comment(f.issue, &handled_comment("skip", &id, &runner, &format!("{info}\n\nNot turned into a pull request: the result {why}. A maintainer can apply it by hand.")))?;
         return Ok(Outcome::Refused { task: id, why });
     }
-    if *open >= o.max_open {
+    // One branch and one pull request per task (ADR 16): each attempt is a commit on it. A
+    // standalone manifest is a task of one attempt.
+    let task = f.manifest.task.clone().unwrap_or_else(|| id.clone());
+    let attempt = f.manifest.attempt.unwrap_or(1);
+    let branch = format!("{}{task}", o.branch_prefix);
+    let existing = q.open_pull_for(&branch)?;
+    if existing.is_none() && *open >= o.max_open {
         return Ok(Outcome::Deferred(id));
     }
-
-    let branch = format!("{}{id}-{}", o.branch_prefix, &runner[..8]);
-    if q.pull_exists(&branch)? {
+    if existing.is_none() && f.manifest.task.is_none() && q.pull_exists(&branch)? {
         q.comment(f.issue, &handled_comment("pr", &id, &runner, "A pull request for this result already exists."))?;
         return Ok(Outcome::AlreadyHandled(id));
     }
-    let dir = &o.repo_dir;
+
+    let msg = format!("toto: {task} attempt {attempt} ({})\n\nTask {id} from issue #{}, runner {runner}.\n\nToto-Attempt: {id}", f.manifest.kind, f.issue);
+    if !commit_records(&o.repo_dir, &branch, &records, &msg, &id, o)? {
+        q.comment(f.issue, &handled_comment("pr", &id, &runner, &format!("{info}\n\nThe result changes nothing in `{}`.", o.base)))?;
+        q.close_issue(f.issue)?;
+        return Ok(Outcome::NoChange(id));
+    }
+
+    let files: Vec<String> = records.iter().map(|r| match r {
+        Record::File { path, .. } => format!("- modified or added `{path}`"),
+        Record::Deleted { path } => format!("- deleted `{path}`"),
+    }).collect();
+    let details = format!("{info}\n\n**Changes**\n{}\n\n**Model output**\n\n{}", files.join("\n"), fenced(&body.output, 4000));
+    let number = match existing {
+        Some(n) => {
+            // Later attempts land on the same pull request; say so once per attempt.
+            let mark = format!("<!-- toto:attempt task={id} -->");
+            if !q.issue_comments(n)?.iter().any(|c| c.body.starts_with(&mark)) {
+                q.comment(n, &format!("{mark}\n**Attempt {attempt}** is on this branch now.\n\n{details}"))?;
+            }
+            n
+        }
+        None => {
+            let closes = o.closes.get(&task).map_or(String::new(), |n| format!("Closes #{n}\n\n"));
+            let title = o.titles.get(&task).map_or_else(|| format!("[toto] {}: {task}", f.manifest.kind), |t| format!("[toto] {t}"));
+            let n = q.open_pull(&branch, &o.base, &title, &format!("{closes}{details}\n\n<!-- toto:pr task={id} runner={runner} -->"))?;
+            *open += 1;
+            n
+        }
+    };
+    q.comment(f.issue, &handled_comment_pr(&id, &runner, number, &format!("Applied to pull request #{number}.")))?;
+    q.close_issue(f.issue)?;
+    Ok(Outcome::PullRequest { task: id, number })
+}
+
+/// Commits `records` on top of `branch` (or of the base branch when it does not exist yet) and
+/// pushes it. An attempt already on the branch (its `Toto-Attempt` trailer) is not applied again.
+/// Returns whether the branch carries the attempt's changes.
+fn commit_records(dir: &Path, branch: &str, records: &[Record], msg: &str, id: &str, o: &Options) -> Result<bool> {
     if !git(dir, &["status", "--porcelain"])?.is_empty() {
         return Err(Error::Queue(format!("{} has uncommitted changes; refusing to switch branches in it", dir.display())));
     }
     let origin_base = format!("origin/{}", o.base);
-    git(dir, &["fetch", "origin", &o.base])?;
-    git(dir, &["checkout", "-q", "--detach", &origin_base])?;
-    git(dir, &["checkout", "-q", "-B", &branch, &origin_base])?;
+    git(dir, &["fetch", "-q", "origin", &o.base])?;
+    let start = if crate::intake::git::remote_has(dir, branch)? {
+        git(dir, &["fetch", "-q", "origin", &format!("+refs/heads/{branch}:refs/remotes/origin/{branch}")])?;
+        let start = format!("origin/{branch}");
+        if git(dir, &["log", "--format=%B", &start, &format!("^{origin_base}")])?.lines().any(|l| l.trim() == format!("Toto-Attempt: {id}")) {
+            return Ok(true);
+        }
+        start
+    } else {
+        origin_base.clone()
+    };
+    git(dir, &["checkout", "-q", "--detach", &start])?;
+    git(dir, &["checkout", "-q", "-B", branch, &start])?;
     let work = (|| -> Result<bool> {
-        apply(dir, &records)?;
+        apply(dir, records)?;
         let paths = |deleted: bool| -> Vec<&str> {
             records.iter().filter_map(|r| match r {
                 Record::File { path, .. } if !deleted => Some(path.as_str()),
@@ -201,28 +259,14 @@ fn handle(q: &GitHubQueue, repo: &str, f: &Finished, o: &Options, open: &mut usi
         if Command::new("git").current_dir(dir).args(["diff", "--cached", "--quiet"]).status()?.success() {
             return Ok(false);
         }
-        let msg = format!("toto: {} ({})\n\nTask {} from issue #{}, runner {}.", id, f.manifest.kind, id, f.issue, runner);
-        git(dir, &["-c", &format!("user.name={}", o.git_name), "-c", &format!("user.email={}", o.git_email), "commit", "-q", "-m", &msg])?;
-        git(dir, &["push", "-q", "origin", &branch])?;
+        git(dir, &["-c", &format!("user.name={}", o.git_name), "-c", &format!("user.email={}", o.git_email), "commit", "-q", "-m", msg])?;
+        git(dir, &["push", "-q", "origin", branch])?;
         Ok(true)
     })();
     // Leave the checkout clean whatever happened.
+    let _ = git(dir, &["reset", "-q", "--hard"]);
+    let _ = git(dir, &["clean", "-q", "-fd"]); // the tree was clean before, so only our files go
     let _ = git(dir, &["checkout", "-q", "--detach", &origin_base]);
-    let _ = git(dir, &["branch", "-q", "-D", &branch]);
-    if !work? {
-        q.comment(f.issue, &handled_comment("pr", &id, &runner, &format!("{info}\n\nThe result changes nothing in `{}`.", o.base)))?;
-        q.close_issue(f.issue)?;
-        return Ok(Outcome::NoChange(id));
-    }
-
-    let files: Vec<String> = records.iter().map(|r| match r {
-        Record::File { path, .. } => format!("- modified or added `{path}`"),
-        Record::Deleted { path } => format!("- deleted `{path}`"),
-    }).collect();
-    let pr_body = format!("{info}\n\n**Changes**\n{}\n\n**Model output**\n\n{}\n\n<!-- toto:pr task={id} runner={runner} -->", files.join("\n"), fenced(&body.output, 4000));
-    let number = q.open_pull(&branch, &o.base, &format!("[toto] {}: {id}", f.manifest.kind), &pr_body)?;
-    q.comment(f.issue, &handled_comment("pr", &id, &runner, &format!("Opened pull request #{number}.")))?;
-    q.close_issue(f.issue)?;
-    *open += 1;
-    Ok(Outcome::PullRequest { task: id, number })
+    let _ = git(dir, &["branch", "-q", "-D", branch]);
+    work
 }

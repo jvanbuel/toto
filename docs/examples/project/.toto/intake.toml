@@ -1,0 +1,45 @@
+# .toto/intake.toml: what `toto project sync` accepts, and where it reports (docs/intake.md).
+project_id = "acme-docs"          # the id in customizations.toto; runners know your key by it
+repo = "acme/docs"                # the repository whose issues are the queue
+base = "main"
+attempt_cap = 5                   # attempts per task before a maintainer must /approve each further one
+daily_attempt_cap = 20            # attempts posted per UTC day, across the project
+stale_days = 14                   # a task with no activity for this long is closed
+max_open = 10                     # new toto pull requests wait while this many are open
+
+# What a task of each kind becomes. The first kind is the default unless default_kind says otherwise.
+[kinds.docs]
+estimate = 40000                  # tokens per attempt; contributors' runners check it against their caps
+max_artifact_bytes = 1048576
+
+[kinds.fix]
+estimate = 120000
+
+# Maintainers (write access to the repository) are always approved. Anyone else's request or comment
+# waits for a maintainer's /approve, unless they are a pre-approved sender, within these limits.
+# Each sender is a credential: whoever controls the account or mailbox can spend contributors'
+# tokens on this project, within the limits below.
+[[senders]]
+address = "github:alice"
+kinds = ["docs"]
+per_day = 5
+
+[[senders]]
+address = "bob@example.com"
+verify = "dkim"                   # or "secret-address" / "both", with secret_sha256 from `toto project secret-address`
+kinds = ["docs"]
+max_estimate = 40000
+per_day = 3
+
+# Requests by email (IMAP; the password comes from $TOTO_IMAP_PASSWORD).
+# [email]
+# address = "toto@acme.example"
+# imap_host = "imap.gmail.com"
+# authserv_id = "mx.google.com"   # whose Authentication-Results header to believe
+
+# A GitHub Projects board (the token comes from $TOTO_PROJECTS_TOKEN and needs the `project` scope).
+# [projects_v2]
+# owner = "acme"
+# number = 3
+# attempt_field = "Attempt"
+# tokens_field = "Tokens"

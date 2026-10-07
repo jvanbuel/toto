@@ -18,6 +18,7 @@ pub mod github_queue;
 pub mod harness;
 pub mod manifest;
 pub mod image;
+pub mod intake;
 pub mod meter;
 pub mod netfence;
 pub mod omnigent;
@@ -58,6 +59,10 @@ pub enum Error {
     /// not failed, and the runner pauses.
     #[error("paused for quota: {0}")]
     Quota(String),
+    /// Another pass of `toto project sync` moved the state branch first; this pass stops and the
+    /// next one redoes its work (every step is idempotent).
+    #[error("another sync pass changed the state first: {0}")]
+    Concurrent(String),
     #[error("result rejected by contributor")]
     ReviewRejected,
     #[error(transparent)]

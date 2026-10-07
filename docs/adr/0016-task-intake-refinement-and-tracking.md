@@ -1,6 +1,6 @@
 # 16. Task intake, refinement and tracking through Inbound and Outbound connectors
 
-- Status: Proposed
+- Status: Accepted (implemented 2026-10-07: `src/intake/`, `docs/intake.md`)
 - Date: 2026-10-07
 - Relates to: ADR 3 (signing), ADR 6 (redundancy), ADR 13; plan in `docs/plans/intake-and-tracking.md`
 
@@ -20,29 +20,39 @@ All of this happens on the **project side**, in the project's own automation, wh
 ```rust
 /// Where requests and feedback come from: an inbox, issue comments, a board.
 pub trait Inbound {
+    fn name(&self) -> &str;
     /// What arrived after `since`, and the cursor to pass next time. Never decides approval: it
-    /// reports facts. The cursor is opaque to core (a comment id, an IMAP UID) and is stored with the
+    /// reports facts. The cursor is opaque to core (comment ids, an IMAP UID) and is stored with the
     /// rest of the state, so a connector keeps nothing itself.
     fn receive(&self, since: &Cursor) -> Result<(Vec<Received>, Cursor)>;
 }
 
-/// Where a task's state is shown: a board, a work item. Idempotent: publishing the same view twice is a no-op.
+/// Where a task's state is shown. Core calls it only when the task's view changed.
 pub trait Outbound {
-    fn publish(&self, task: &TaskView) -> Result<ItemRef>;
+    fn name(&self) -> &str;
+    fn publish(&self, task: &TaskView) -> Result<Option<ItemRef>>;
+    fn cache(&self) -> Option<serde_json::Value> { None }   // ids worth keeping between passes
+    fn restore(&self, _: serde_json::Value) {}
 }
 
 pub enum Received {
-    /// `thread` is whatever the connector saw (an `In-Reply-To`, an issue number); core resolves it
-    /// against the task's links. Resolved: a refinement of that task. Unresolved or absent: a new task.
+    /// `thread` is what the connector saw (an issue number; `In-Reply-To` and `References`); core
+    /// resolves it against the tasks' links. Resolved: a refinement. Absent: a new task.
     Message { id: ReceivedRef, thread: Option<ThreadRef>, author: Author, subject: Option<String>, body: String },
-    /// An explicit state change by a person.
-    Signal { id: ReceivedRef, item: ItemRef, author: Author, kind: SignalKind },
+    /// An explicit state change by a person, or by the platform (a merged pull request).
+    Signal { id: ReceivedRef, thread: ThreadRef, author: Author, kind: SignalKind },
+    /// Something the connector will not report as a message (automated mail), so the log says why.
+    Skipped { id: ReceivedRef, from: String, reason: String },
 }
 
 pub enum SignalKind { Approve, Done, Reopen, Cancel }
 
-pub struct Author { pub address: String, pub verified: Verification }
-pub enum Verification { None, Dkim, SecretAddress, Both, Platform }
+pub struct Author {
+    pub address: String,              // `github:<login>` or a mail address
+    pub verified: Verification,       // None | Dkim | SecretAddress | Both | Platform
+    pub maintainer: bool,             // a platform fact: write access to the repository
+    pub tag_sha256: Option<String>,   // hash of a plus-address tag; core compares it with the sender's
+}
 ```
 
 - A connector may implement one trait or both. GitHub issues implement both, email only `Inbound`, and a Projects board only `Outbound`. One task can be linked to several items: the email thread it came from, its board card, its PR.
@@ -79,7 +89,18 @@ pub enum Verification { None, Dkim, SecretAddress, Both, Platform }
 - The prompt of a refinement attempt contains text from people other than maintainers. That text was already possible through `post-task`; now it arrives faster. It is shown in fences, it is never executable configuration, and the agent's sandbox is unchanged.
 - Board connectors only display state, so a board that is wrong or is edited by hand cannot cause work to run. Moving a card can at most send a `Signal`, which goes through the same policy.
 
+## As built
+
+Where the implementation differs from the first sketch of this record, and why:
+
+- A `Signal` carries a `ThreadRef`, not an `ItemRef`: a "done" reply by mail only knows the thread it answers.
+- `Received::Skipped` exists so that automated or oversized mail shows up in the sync log with its reason, instead of disappearing.
+- `Author.maintainer` is a fact the platform reports (repository permission). Core only believes it with `Verification::Platform`.
+- The GitHub inbound's cursor moves by GitHub's own `updated_at` times, not the job's clock, so a pass with nothing new commits nothing.
+- A signal that would change nothing is dropped silently. Toto's own closing of an issue comes back as such a signal on the next pass.
+- `TaskView` is `id, title, kind, state, attempt, attempt_cap, tokens_used, requester, request, latest_output, note, pr, attempt_issues, links`. Its fingerprint leaves out `links`, because publishing adds links.
+- Comments on a finished task reopen it ("a comment means it is not done").
+
 ## Open questions
 
-- The exact `TaskView` shape that every board can show (title, state, attempt, tokens used as the sum of `tokens_used` over the accepted results, links). It will be settled with the first two outbound connectors, not before.
 - Replying to email: confirmations and "result ready" mails need an SMTP sender, which needs its own credential and its own anti-loop rules. Deferred until after the first email intake works.

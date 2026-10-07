@@ -1,0 +1,49 @@
+# .github/workflows/toto-sync.yml: one `toto project sync` pass on a schedule and whenever a
+# request, comment or pull request changes (docs/intake.md). It replaces toto-results.yml.
+name: toto sync
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  issues:
+    types: [opened, closed, reopened]
+  issue_comment:
+    types: [created]
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+
+# Passes queue instead of overlapping. A pass started some other way that races one of these loses
+# its state push and leaves its work to the next pass.
+concurrency:
+  group: toto-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write        # the toto-state branch and the toto/* task branches
+  pull-requests: write   # one pull request per task
+  issues: write          # task issues, status comments, closing requests
+
+jobs:
+  sync:
+    # Comments made with the default GITHUB_TOKEN do not start workflows, so toto's own status
+    # comments never trigger a pass.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Pushes made with the default GITHUB_TOKEN do not start other workflows, so the toto PRs
+          # would get no CI. Use a fine-grained token or a GitHub App token if you want CI on them.
+          token: ${{ secrets.TOTO_TOKEN || secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install toto
+        run: cargo install --locked --git https://github.com/jvanbuel/toto toto-runner
+      - name: Sync
+        env:
+          GITHUB_TOKEN: ${{ secrets.TOTO_TOKEN || secrets.GITHUB_TOKEN }}
+          TOTO_PROJECT_KEY: ${{ secrets.TOTO_PROJECT_KEY }}        # the hex seed from `toto project-key`
+          TOTO_PROJECTS_TOKEN: ${{ secrets.TOTO_PROJECTS_TOKEN }}  # only with [projects_v2]
+          TOTO_IMAP_PASSWORD: ${{ secrets.TOTO_IMAP_PASSWORD }}    # only with [email]
+        run: toto project sync

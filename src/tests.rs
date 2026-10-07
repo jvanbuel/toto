@@ -13,8 +13,13 @@ fn task(id: &str, project: &str, cost: u64, _key: &SigningKey) -> TaskManifest {
     TaskManifest {
         id: id.into(), project_id: project.into(), kind: "summarise".into(), inputs: "0".repeat(64),
         prompt: "hi".into(), tool_requirements: vec!["echo".into()], sandbox_profile: SandboxProfile::default(),
-        cost_estimate: cost, output_schema: OutputSchema { format: "text".into(), max_bytes: 100, max_artifact_bytes: 0 }, redundancy: 1,
+        cost_estimate: cost, output_schema: OutputSchema { format: "text".into(), max_bytes: 100, max_artifact_bytes: 0 }, redundancy: 1, task: None, attempt: None,
     }
+}
+
+/// A manifest for tests elsewhere in the crate.
+pub(crate) fn github_queue_task(id: &str) -> TaskManifest {
+    task(id, "a", 10, &crate::manifest::generate_key())
 }
 
 fn policy() -> Policy {
@@ -1856,7 +1861,7 @@ mod multi_queue {
     }
 }
 
-mod github_queue {
+pub(crate) mod github_queue {
     use crate::github_queue::*;
     use crate::manifest::peek_manifest;
     use crate::queue::QueueClient;
@@ -1866,42 +1871,84 @@ mod github_queue {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    const TOKEN: &str = "gh-test-token";
+    pub(crate) const TOKEN: &str = "gh-test-token";
+    pub(crate) const BOARD_TOKEN: &str = "board-token";
+    /// Who the token acts as: the workflow's own bot.
+    pub(crate) const BOT: &str = "github-actions[bot]";
 
     #[derive(Default)]
-    struct Issue {
-        number: u64,
-        title: String,
-        body: String,
-        labels: Vec<String>,
-        pr: bool,
-        closed: bool,
-        comments: Vec<(u64, String, i64, i64)>, // id, body, created, updated (unix secs)
+    pub(crate) struct Issue {
+        pub(crate) number: u64,
+        pub(crate) title: String,
+        pub(crate) body: String,
+        pub(crate) labels: Vec<String>,
+        pub(crate) pr: bool,
+        pub(crate) closed: bool,
+        pub(crate) merged: bool,
+        pub(crate) author: String,
+        /// Last change (unix secs), for `updated_at` and `since`.
+        pub(crate) updated: i64,
+        pub(crate) comments: Vec<(u64, String, i64, i64)>, // id, body, created, updated (unix secs)
     }
 
     #[derive(Default)]
-    struct State {
-        issues: Vec<Issue>,
-        assets: Vec<(u64, String, Vec<u8>)>,
-        release: bool,
-        next_id: u64,
-        not_modified: u64,
-        requests: u64,
-        pulls: Vec<(u64, String, String, String, String)>, // number, head, base, title, body
-        files: Vec<(String, Vec<u8>)>,
-        head: String,
+    pub(crate) struct State {
+        pub(crate) issues: Vec<Issue>,
+        pub(crate) assets: Vec<(u64, String, Vec<u8>)>,
+        pub(crate) release: bool,
+        pub(crate) next_id: u64,
+        pub(crate) not_modified: u64,
+        pub(crate) requests: u64,
+        pub(crate) pulls: Vec<(u64, String, String, String, String)>, // number, head, base, title, body
+        pub(crate) files: Vec<(String, Vec<u8>)>,
+        pub(crate) head: String,
+        /// Comment authors by comment id (the token's comments are the bot's).
+        pub(crate) comment_authors: std::collections::HashMap<u64, String>,
+        /// Repository permission by login; anyone else has `read`.
+        pub(crate) permissions: std::collections::HashMap<String, String>,
+        /// GraphQL requests received (`query`, `variables`).
+        pub(crate) graphql: Vec<Value>,
+        /// Projects board fields the fake GraphQL reports: (name, options).
+        pub(crate) board_fields: Vec<(String, Vec<String>)>,
+    }
+
+    impl State {
+        /// A person opens an issue.
+        pub(crate) fn open_issue(&mut self, login: &str, title: &str, body: &str, labels: &[&str]) -> u64 {
+            let number = self.issues.len() as u64 + 1;
+            let updated = chrono::Utc::now().timestamp();
+            self.issues.push(Issue { number, title: title.into(), body: body.into(), labels: labels.iter().map(|l| l.to_string()).collect(), author: login.into(), updated, ..Default::default() });
+            number
+        }
+        /// A person comments.
+        pub(crate) fn say(&mut self, issue: u64, login: &str, body: &str) -> u64 {
+            self.next_id += 1;
+            let id = self.next_id;
+            let t = chrono::Utc::now().timestamp();
+            let i = self.issues.iter_mut().find(|i| i.number == issue).expect("issue");
+            i.comments.push((id, body.into(), t, t));
+            i.updated = t;
+            self.comment_authors.insert(id, login.into());
+            id
+        }
+        pub(crate) fn issue(&self, number: u64) -> &Issue {
+            self.issues.iter().find(|i| i.number == number).expect("issue")
+        }
+        pub(crate) fn issue_mut(&mut self, number: u64) -> &mut Issue {
+            self.issues.iter_mut().find(|i| i.number == number).expect("issue")
+        }
     }
 
     /// A tiny stand-in for the parts of GitHub's REST API the queue uses. `advance` moves its clock.
-    struct Fake {
+    pub(crate) struct Fake {
         addr: std::net::SocketAddr,
-        state: Arc<Mutex<State>>,
+        pub(crate) state: Arc<Mutex<State>>,
         offset: Arc<AtomicI64>,
         stop: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl Fake {
-        fn start() -> Fake {
+        pub(crate) fn start() -> Fake {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let addr = listener.local_addr().unwrap();
@@ -1924,13 +1971,13 @@ mod github_queue {
             });
             Fake { addr, state, offset, stop }
         }
-        fn api(&self) -> String {
+        pub(crate) fn api(&self) -> String {
             format!("http://{}", self.addr)
         }
         fn advance(&self, secs: i64) {
             self.offset.fetch_add(secs, Ordering::Relaxed);
         }
-        fn queue(&self, token: Option<&str>) -> GitHubQueue {
+        pub(crate) fn queue(&self, token: Option<&str>) -> GitHubQueue {
             GitHubQueue::new(&self.api(), "org/proj", DEFAULT_LABEL, token.map(String::from))
         }
     }
@@ -1982,28 +2029,38 @@ mod github_queue {
         let mut st = st.lock().unwrap();
         st.requests += 1;
         let writes_need_token = method != "GET";
-        let (status, ctype, out): (u16, &str, Vec<u8>) = if writes_need_token && auth != format!("Bearer {TOKEN}") {
+        // The Projects board has its own token, valid for GraphQL only.
+        let board_ok = path == "/graphql" && auth == format!("Bearer {BOARD_TOKEN}");
+        let (status, ctype, out): (u16, &str, Vec<u8>) = if writes_need_token && auth != format!("Bearer {TOKEN}") && !board_ok {
             (401, "application/json", br#"{"message":"Bad credentials"}"#.to_vec())
         } else {
-            let comment_json = |c: &(u64, String, i64, i64)| json!({"id": c.0, "body": c.1, "created_at": iso(c.2), "updated_at": iso(c.3)});
+            let authors = st.comment_authors.clone();
+            let comment_json = |c: &(u64, String, i64, i64)| {
+                let login = authors.get(&c.0).cloned().unwrap_or_else(|| BOT.into());
+                json!({"id": c.0, "body": c.1, "created_at": iso(c.2), "updated_at": iso(c.3), "user": {"login": login, "type": if login.ends_with("[bot]") { "Bot" } else { "User" }}})
+            };
+            let issue_json = |i: &Issue| {
+                let mut v = json!({"number": i.number, "title": i.title, "body": i.body, "comments": i.comments.len(), "state": if i.closed { "closed" } else { "open" },
+                    "node_id": format!("I_{}", i.number), "updated_at": iso(i.updated),
+                    "user": {"login": i.author, "type": if i.author.ends_with("[bot]") { "Bot" } else { "User" }}});
+                if i.pr {
+                    v["pull_request"] = json!({"url": "x", "merged_at": if i.merged { json!(iso(t)) } else { Value::Null }});
+                }
+                v
+            };
             match (method.as_str(), parts.as_slice()) {
                 ("GET", ["repos", "org", "proj", "issues"]) => {
                     let label = q("labels").unwrap_or_default();
                     let state_q = q("state").unwrap_or_default();
-                    let all: Vec<Value> = st.issues.iter().filter(|i| i.labels.contains(&label) && (state_q == "all" || !i.closed)).map(|i| {
-                        let mut v = json!({"number": i.number, "title": i.title, "body": i.body, "comments": i.comments.len()});
-                        if i.pr {
-                            v["pull_request"] = json!({"url": "x"});
-                        }
-                        v
-                    }).collect();
+                    let since = q("since").and_then(|s| chrono::DateTime::parse_from_rfc3339(&s.replace("%3A", ":")).ok()).map_or(i64::MIN, |d| d.timestamp());
+                    let all: Vec<Value> = st.issues.iter().filter(|i| i.labels.contains(&label) && (state_q == "all" || (state_q == "closed") == i.closed) && i.updated >= since).map(issue_json).collect();
                     (200, "application/json", serde_json::to_vec(&all.into_iter().skip((page - 1) * per).take(per).collect::<Vec<_>>()).unwrap())
                 }
                 ("POST", ["repos", "org", "proj", "issues"]) => {
                     let v = json_body();
                     st.next_id += 1;
                     let number = st.issues.len() as u64 + 1;
-                    st.issues.push(Issue { number, title: v["title"].as_str().unwrap_or("").into(), body: v["body"].as_str().unwrap_or("").into(), labels: v["labels"].as_array().map(|l| l.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(), ..Default::default() });
+                    st.issues.push(Issue { number, title: v["title"].as_str().unwrap_or("").into(), body: v["body"].as_str().unwrap_or("").into(), labels: v["labels"].as_array().map(|l| l.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(), author: BOT.into(), updated: t, ..Default::default() });
                     (201, "application/json", json!({"number": number}).to_string().into_bytes())
                 }
                 ("GET", ["repos", "org", "proj", "issues", n, "comments"]) => {
@@ -2021,6 +2078,7 @@ mod github_queue {
                     match st.issues.iter_mut().find(|i| i.number == n) {
                         Some(i) => {
                             i.comments.push((id, text.clone(), t, t));
+                            i.updated = t;
                             (201, "application/json", json!({"id": id}).to_string().into_bytes())
                         }
                         None => (404, "application/json", b"{}".to_vec()),
@@ -2054,12 +2112,60 @@ mod github_queue {
                     st.assets.push((id, name, body.clone()));
                     (201, "application/json", json!({"id": id}).to_string().into_bytes())
                 }
+                ("GET", ["repos", "org", "proj", "issues", n]) => match st.issues.iter().find(|i| i.number.to_string() == *n) {
+                    Some(i) => (200, "application/json", issue_json(i).to_string().into_bytes()),
+                    None => (404, "application/json", b"{}".to_vec()),
+                },
+                ("GET", ["repos", "org", "proj", "collaborators", login, "permission"]) => {
+                    let perm = st.permissions.get(*login).cloned().unwrap_or_else(|| "read".into());
+                    (200, "application/json", json!({"permission": perm}).to_string().into_bytes())
+                }
+                ("PATCH", ["repos", "org", "proj", "pulls", n]) => {
+                    let n: u64 = n.parse().unwrap_or(0);
+                    let closing = json_body()["state"] == "closed";
+                    match st.issues.iter_mut().find(|i| i.number == n && i.pr) {
+                        Some(i) => {
+                            i.closed = closing;
+                            i.updated = t;
+                            (200, "application/json", json!({"number": n}).to_string().into_bytes())
+                        }
+                        None => (404, "application/json", b"{}".to_vec()),
+                    }
+                }
+                ("POST", ["graphql"]) => {
+                    let v = json_body();
+                    st.graphql.push(v.clone());
+                    let q = v["query"].as_str().unwrap_or("");
+                    let out = if q.contains("projectV2(number") {
+                        let nodes: Vec<Value> = st.board_fields.iter().map(|(name, opts)| {
+                            let mut f = json!({"id": format!("F_{name}"), "name": name});
+                            if !opts.is_empty() {
+                                f["options"] = Value::Array(opts.iter().map(|o| json!({"id": format!("O_{o}"), "name": o})).collect());
+                            }
+                            f
+                        }).collect();
+                        json!({"data": {"owner": {"projectV2": {"id": "PVT_1", "fields": {"nodes": nodes}}}}})
+                    } else if q.contains("addProjectV2ItemById") {
+                        json!({"data": {"addProjectV2ItemById": {"item": {"id": format!("PVTI_{}", v["variables"]["content"].as_str().unwrap_or(""))}}}})
+                    } else if q.contains("updateProjectV2ItemFieldValue") {
+                        let field = v["variables"]["field"].as_str().unwrap_or("").to_string();
+                        if st.board_fields.iter().any(|(n, _)| format!("F_{n}") == field) {
+                            json!({"data": {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": v["variables"]["item"]}}}})
+                        } else {
+                            json!({"errors": [{"message": format!("field {field} not found")}]})
+                        }
+                    } else {
+                        json!({"errors": [{"message": "unknown query"}]})
+                    };
+                    (200, "application/json", out.to_string().into_bytes())
+                }
                 ("PATCH", ["repos", "org", "proj", "issues", n]) => {
                     let n: u64 = n.parse().unwrap_or(0);
                     let closing = json_body()["state"] == "closed";
                     match st.issues.iter_mut().find(|i| i.number == n) {
                         Some(i) => {
                             i.closed = closing;
+                            i.updated = t;
                             (200, "application/json", json!({"number": n}).to_string().into_bytes())
                         }
                         None => (404, "application/json", b"{}".to_vec()),
@@ -2068,13 +2174,16 @@ mod github_queue {
                 ("GET", ["repos", "org", "proj", "pulls"]) => {
                     let head = q("head").unwrap_or_default().replace("%3A", ":");
                     let want = head.split_once(':').map(|x| x.1.to_string());
-                    let list: Vec<Value> = st.pulls.iter().filter(|p| want.as_ref().is_none_or(|w| &p.1 == w)).map(|p| json!({"number": p.0, "head": {"ref": p.1}, "base": {"ref": p.2}, "title": p.3, "body": p.4})).collect();
+                    let open_only = q("state").as_deref() == Some("open");
+                    let list: Vec<Value> = st.pulls.iter().filter(|p| want.as_ref().is_none_or(|w| &p.1 == w)).filter(|p| !open_only || st.issues.iter().any(|i| i.number == p.0 && !i.closed)).map(|p| json!({"number": p.0, "head": {"ref": p.1}, "base": {"ref": p.2}, "title": p.3, "body": p.4})).collect();
                     (200, "application/json", serde_json::to_vec(&list).unwrap())
                 }
                 ("POST", ["repos", "org", "proj", "pulls"]) => {
                     let v = json_body();
                     let number = 500 + st.pulls.len() as u64;
                     st.pulls.push((number, v["head"].as_str().unwrap_or("").into(), v["base"].as_str().unwrap_or("").into(), v["title"].as_str().unwrap_or("").into(), v["body"].as_str().unwrap_or("").into()));
+                    // A pull request is also an issue (comments, labels, state).
+                    st.issues.push(Issue { number, title: v["title"].as_str().unwrap_or("").into(), body: v["body"].as_str().unwrap_or("").into(), labels: vec!["toto".into()], pr: true, author: BOT.into(), updated: t, ..Default::default() });
                     (201, "application/json", json!({"number": number}).to_string().into_bytes())
                 }
                 ("POST", ["repos", "org", "proj", "issues", _, "labels"]) => (200, "application/json", b"[]".to_vec()),
@@ -2410,7 +2519,7 @@ mod github_queue {
         let out = to_prs(&q, "org/proj", &trusted(&p), &Options::new(&work, "main")).unwrap();
         assert_eq!(out, [Outcome::PullRequest { task: "pr-1".into(), number: 500 }]);
 
-        let branch = format!("toto/pr-1-{}", &rid[..8]);
+        let branch = "toto/pr-1".to_string();
         let show = |path: &str| Command::new("git").current_dir(&remote).args(["show", &format!("{branch}:{path}")]).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&show("src/a.txt").stdout), "new");
         assert_eq!(String::from_utf8_lossy(&show("docs/new.md").stdout), "# new");

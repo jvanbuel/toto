@@ -50,6 +50,13 @@ pub struct TaskManifest {
     pub cost_estimate: u64,
     pub output_schema: OutputSchema,
     pub redundancy: u32,
+    /// The task this manifest is an attempt of (ADR 16), inside the signed payload so a result is
+    /// tied to its task without trusting an issue body. Absent on standalone manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// Which attempt of `task` this is, from 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
 }
 
 /// DSSE payload type of a signed task manifest.

@@ -1,0 +1,31 @@
+# Ask for work done with contributors' donated AI capacity. The label must exist in the repository
+# (GitHub only applies labels that exist): create `toto:request` once.
+name: Ask toto for work
+description: A task for contributors' donated AI capacity. A maintainer approves it unless you are a pre-approved sender.
+labels: ["toto:request"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe one change, as you would to a new contributor. A model works on it in this project's dev container and the result comes back as a pull request. Comment on this issue or on the pull request to refine it; a maintainer can `/approve`, `/done` or `/cancel`.
+  - type: textarea
+    id: request
+    attributes:
+      label: What should be done?
+      description: The change, where it is, and how to tell it is right.
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      options:
+        - docs
+        - fix
+    validations:
+      required: true
+  - type: input
+    id: estimate
+    attributes:
+      label: Estimate
+      description: Tokens per attempt, if the default for the kind is too low or too high.

@@ -36,24 +36,79 @@ fn qerr(e: impl std::fmt::Display) -> Error {
 
 // ------------------------------------------------------------------------------ pure format code
 
-#[derive(Debug, Deserialize, Clone)]
-struct Issue {
-    number: u64,
-    #[serde(default)]
-    body: Option<String>,
-    #[serde(default)]
-    comments: u64,
-    #[serde(default)]
-    pull_request: Option<serde_json::Value>,
+/// The author of an issue or comment.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default)]
+pub struct User {
+    pub login: String,
+    /// `User` or `Bot`.
+    #[serde(default, rename = "type")]
+    pub kind: String,
 }
 
+impl User {
+    pub fn is_bot(&self) -> bool {
+        self.kind == "Bot" || self.login.ends_with("[bot]")
+    }
+}
+
+/// An issue or pull request as the issues API lists it.
 #[derive(Debug, Deserialize, Clone)]
-struct Comment {
-    id: u64,
+pub struct IssueInfo {
+    pub number: u64,
     #[serde(default)]
-    body: String,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
+    pub title: String,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub comments: u64,
+    #[serde(default)]
+    pub user: Option<User>,
+    #[serde(default)]
+    pub node_id: String,
+    #[serde(default)]
+    pub pull_request: Option<serde_json::Value>,
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+impl IssueInfo {
+    pub fn is_pull(&self) -> bool {
+        self.pull_request.is_some()
+    }
+    pub fn closed(&self) -> bool {
+        self.state == "closed"
+    }
+    /// For a pull request: whether it was merged (the issues API carries `merged_at`).
+    pub fn merged(&self) -> bool {
+        self.pull_request.as_ref().is_some_and(|p| p.get("merged_at").is_some_and(|m| !m.is_null()))
+    }
+}
+
+type Issue = IssueInfo;
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Comment {
+    pub id: u64,
+    #[serde(default)]
+    pub body: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub user: Option<User>,
+}
+
+/// What the project side recorded on an attempt's task issue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptReport {
+    pub issue: u64,
+    pub closed: bool,
+    /// The first verified result, if any.
+    pub result: Option<crate::result::TaskResult>,
+    /// `pr` (handled: a pull request, a text answer or no change) or `skip` (refused), with the
+    /// marker's values (`pr=<n>`) and the comment text.
+    pub handled: Option<(String, HashMap<String, String>, String)>,
 }
 
 /// The envelope in an issue body: the first fenced code block after the `toto:task` marker.
@@ -187,6 +242,16 @@ pub struct Finished {
 /// Marker for the comment the project leaves once it has dealt with a result.
 pub fn handled_comment(kind: &str, task_id: &str, runner: &str, text: &str) -> String {
     format!("<!-- toto:{kind} task={task_id} runner={runner} -->\n{text}")
+}
+
+/// The same, naming the pull request the result went into.
+pub fn handled_comment_pr(task_id: &str, runner: &str, pr: u64, text: &str) -> String {
+    format!("<!-- toto:pr task={task_id} runner={runner} pr={pr} -->\n{text}")
+}
+
+/// Whether a text is one toto wrote (every toto comment and issue body starts with a marker).
+pub fn is_toto_text(body: &str) -> bool {
+    body.trim_start().starts_with("<!-- toto:")
 }
 
 #[derive(Default)]
@@ -402,6 +467,104 @@ impl GitHubQueue {
 
     pub fn close_issue(&self, issue: u64) -> Result<()> {
         self.send_json("PATCH", &self.api_url(&format!("/issues/{issue}")), &serde_json::json!({"state": "closed", "state_reason": "completed"})).map(|_| ())
+    }
+
+    pub fn reopen_issue(&self, issue: u64) -> Result<()> {
+        self.send_json("PATCH", &self.api_url(&format!("/issues/{issue}")), &serde_json::json!({"state": "open"})).map(|_| ())
+    }
+
+    pub fn close_pull(&self, number: u64) -> Result<()> {
+        self.send_json("PATCH", &self.api_url(&format!("/pulls/{number}")), &serde_json::json!({"state": "closed"})).map(|_| ())
+    }
+
+    pub fn edit_comment(&self, id: u64, body: &str) -> Result<()> {
+        self.send_json("PATCH", &format!("{}/repos/{}/issues/comments/{id}", self.api, self.repo), &serde_json::json!({"body": body})).map(|_| ())
+    }
+
+    /// Opens an issue and returns its number.
+    pub fn create_issue(&self, title: &str, body: &str, labels: &[&str]) -> Result<u64> {
+        let v = self.send_json("POST", &self.api_url("/issues"), &serde_json::json!({"title": title, "body": body, "labels": labels}))?;
+        v["number"].as_u64().ok_or_else(|| qerr("GitHub did not return an issue number"))
+    }
+
+    /// One issue or pull request.
+    pub fn issue(&self, number: u64) -> Result<IssueInfo> {
+        Ok(serde_json::from_slice(&self.get(&self.api_url(&format!("/issues/{number}")))?.0)?)
+    }
+
+    /// Issues and pull requests with `label` (`state`: open, closed or all), updated at or after
+    /// `since` if given.
+    pub fn list_issues(&self, label: &str, state: &str, since: Option<DateTime<Utc>>) -> Result<Vec<IssueInfo>> {
+        let since = since.map_or(String::new(), |t| format!("&since={}", t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)));
+        Ok(self.pages(&self.api_url(&format!("/issues?labels={label}&state={state}&sort=created&direction=asc{since}")))?.0)
+    }
+
+    pub fn issue_comments(&self, number: u64) -> Result<Vec<Comment>> {
+        Ok(self.comments(number)?.0)
+    }
+
+    /// The account's permission on the repository: `admin`, `write`, `read` or `none`.
+    pub fn permission(&self, login: &str) -> Result<String> {
+        let (status, body, _) = self.request("GET", &self.api_url(&format!("/collaborators/{login}/permission")), None, "application/json", "application/vnd.github+json", None)?;
+        match status {
+            200 => Ok(serde_json::from_slice::<serde_json::Value>(&body)?["permission"].as_str().unwrap_or("none").to_string()),
+            404 => Ok("none".into()),
+            _ => Err(Self::fail(status, "GET", &body)),
+        }
+    }
+
+    /// A GraphQL request (Projects v2 has no REST API). Errors in the response are errors here.
+    pub fn graphql(&self, query: &str, variables: serde_json::Value) -> Result<serde_json::Value> {
+        let url = match self.api.strip_suffix("/api/v3") {
+            Some(host) => format!("{host}/api/graphql"),
+            None => format!("{}/graphql", self.api),
+        };
+        let v = self.send_json("POST", &url, &serde_json::json!({"query": query, "variables": variables}))?;
+        if let Some(errors) = v.get("errors").and_then(|e| e.as_array()).filter(|e| !e.is_empty()) {
+            let msgs: Vec<&str> = errors.iter().filter_map(|e| e["message"].as_str()).collect();
+            return Err(qerr(format!("GitHub GraphQL: {}", msgs.join("; "))));
+        }
+        Ok(v["data"].clone())
+    }
+
+    /// Issues carrying a task the project signed, by manifest id (any state): `(issue number,
+    /// closed)`. Forged issues are left out, so nobody can pre-post an attempt id to block it.
+    pub fn task_index(&self, trusted: &crate::manifest::TrustedProjects) -> Result<HashMap<String, (u64, bool)>> {
+        let mut out = HashMap::new();
+        for (i, env, id) in self.task_issues("all")? {
+            if trusted.verify(&env).is_ok() {
+                out.entry(id).or_insert((i.number, i.closed()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// What the project side recorded on the task issue of `id`: its first verified result (of a
+    /// task the project itself signed) and the handled marker.
+    pub fn attempt_report(&self, trusted: &crate::manifest::TrustedProjects, issue: u64, id: &str) -> Result<AttemptReport> {
+        let info = self.issue(issue)?;
+        let env = info.body.as_deref().and_then(parse_task).ok_or_else(|| qerr(format!("issue #{issue} carries no task")))?;
+        let manifest = trusted.verify(&env)?;
+        if manifest.id != id {
+            return Err(qerr(format!("issue #{issue} carries `{}`, not `{id}`", manifest.id)));
+        }
+        let comments = if info.comments > 0 { self.comments(issue)?.0 } else { vec![] };
+        let result = results_in(&comments, id).into_iter().next().map(|r| r.open()).transpose()?;
+        let handled = comments.iter().find_map(|c| match marker(&c.body) {
+            Some((k @ ("pr" | "skip"), kv)) if kv.get("task") == Some(&id) => {
+                let text = c.body.split_once('\n').map_or("", |x| x.1).to_string();
+                Some((k.to_string(), kv.into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(), text))
+            }
+            _ => None,
+        });
+        Ok(AttemptReport { issue, closed: info.closed(), result, handled })
+    }
+
+    /// The open pull request whose head is `branch`, if any.
+    pub fn open_pull_for(&self, branch: &str) -> Result<Option<u64>> {
+        let owner = self.repo.split('/').next().unwrap_or_default();
+        let (body, _) = self.get(&self.api_url(&format!("/pulls?state=open&head={owner}:{branch}")))?;
+        Ok(serde_json::from_slice::<Vec<serde_json::Value>>(&body)?.first().and_then(|p| p["number"].as_u64()))
     }
 
     /// Whether a pull request (open or closed) already exists for the head branch.

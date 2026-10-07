@@ -65,7 +65,7 @@ impl Default for Directory {
     }
 }
 
-fn valid_repo(repo: &str) -> bool {
+pub fn valid_repo(repo: &str) -> bool {
     matches!(repo.split('/').collect::<Vec<_>>().as_slice(), [o, n] if !o.is_empty() && !n.is_empty() && repo.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/')))
 }
 

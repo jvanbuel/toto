@@ -103,6 +103,11 @@ enum Cmd {
     },
     /// Project side: generate a project signing key (hex seed, mode 0600) and print its public key.
     ProjectKey { out: PathBuf },
+    /// Project side: task intake and tracking (`.toto/intake.toml`, docs/intake.md).
+    Project {
+        #[command(subcommand)]
+        cmd: ProjectCmd,
+    },
     /// Project side: sign a task manifest (JSON, no signature) with a project key and post it.
     PostTask {
         #[arg(long)]
@@ -170,6 +175,34 @@ enum Cmd {
     },
     /// Run one signed task end to end against an in-memory queue and an echo harness.
     Demo,
+}
+
+#[derive(Subcommand)]
+enum ProjectCmd {
+    /// One pass: results to pull requests, requests and comments in, attempts out, boards
+    /// updated, state committed to the state branch. Run it from the project's scheduled workflow.
+    Sync {
+        /// A checkout of the project repository with push access to `origin`.
+        #[arg(long, default_value = ".")]
+        repo_dir: PathBuf,
+        /// Default: `<repo-dir>/.toto/intake.toml`.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// The project's signing key (hex seed); default: the TOTO_PROJECT_KEY environment variable.
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+        /// Default: the GITHUB_TOKEN environment variable.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        #[arg(long, default_value = toto::github_queue::DEFAULT_API)]
+        api: String,
+    },
+    /// Make a secret plus-address for a pre-approved mail sender: prints the address to give them
+    /// and the `secret_sha256` for their entry in `.toto/intake.toml`.
+    SecretAddress {
+        /// The project's inbox, e.g. `toto@example.org`.
+        inbox: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -403,6 +436,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 key
             };
             println!("public key: {}", hex::encode(key.verifying_key().to_bytes()));
+        }
+        Cmd::Project { cmd: ProjectCmd::SecretAddress { inbox } } => {
+            let (local, domain) = inbox.rsplit_once('@').ok_or("the inbox must be a mail address")?;
+            let tag = hex::encode(toto::manifest::generate_key().to_bytes())[..32].to_string();
+            println!("give the sender:   {local}+{tag}@{domain}");
+            println!("in their [[senders]] entry: verify = \"both\" (or \"secret-address\")");
+            println!("                            secret_sha256 = \"{}\"", toto::archive::sha256_hex(tag.as_bytes()));
+            println!("The address is the secret: anyone who learns it can ask within that sender's limits.");
+        }
+        Cmd::Project { cmd: ProjectCmd::Sync { repo_dir, config, key_file, token_file, api } } => {
+            let path = config.unwrap_or_else(|| repo_dir.join(".toto/intake.toml"));
+            let cfg = toto::intake::sync::IntakeConfig::parse(&fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?)?;
+            let key = match key_file {
+                Some(f) => load_signing_key(&f)?,
+                None => {
+                    let seed = std::env::var("TOTO_PROJECT_KEY").map_err(|_| "no project key: pass --key-file or set TOTO_PROJECT_KEY")?;
+                    let seed: [u8; 32] = hex::decode(seed.trim()).ok().and_then(|b| b.try_into().ok()).ok_or("TOTO_PROJECT_KEY must be a 32-byte hex seed")?;
+                    ed25519_dalek::SigningKey::from_bytes(&seed)
+                }
+            };
+            let github_token = match &token_file {
+                Some(f) => toto::secrets::read_secret(f)?,
+                None => std::env::var("GITHUB_TOKEN").map_err(|_| "no token: pass --token-file or set GITHUB_TOKEN")?,
+            };
+            let env = |name: Option<&String>| name.and_then(|n| std::env::var(n).ok()).filter(|v| !v.trim().is_empty());
+            let secrets = toto::intake::sync::Secrets {
+                api,
+                github_token,
+                projects_token: env(cfg.projects_v2.as_ref().map(|c| &c.token_env)),
+                imap_password: env(cfg.email.as_ref().map(|c| &c.password_env)),
+            };
+            let report = toto::intake::sync::sync_repo(&cfg, &repo_dir, &key, &secrets, chrono::Utc::now())?;
+            for o in &report.pull_requests {
+                println!("result: {o:?}");
+            }
+            for l in &report.log {
+                println!("{:<7} {} {} {}", l.what, l.task.as_deref().unwrap_or("-"), l.author.as_deref().unwrap_or(""), l.detail);
+            }
+            println!("posted {}, published {}, state {}", report.posted.len(), report.published, report.commit.as_deref().map_or("unchanged".to_string(), |c| format!("committed {}", &c[..12])));
+            if !report.errors.is_empty() {
+                for e in &report.errors {
+                    eprintln!("error: {e}");
+                }
+                return Err(format!("{} errors (the next pass retries them)", report.errors.len()).into());
+            }
         }
         Cmd::Ui { config, addr } => {
             let path = config_path(config);
@@ -697,7 +775,7 @@ fn demo() -> Result<(), Box<dyn std::error::Error>> {
             sandbox_profile: SandboxProfile::default(),
             cost_estimate: 500,
             output_schema: OutputSchema { format: "text".into(), max_bytes: 4096, max_artifact_bytes: 0 },
-            redundancy: 1,
+            redundancy: 1, task: None, attempt: None,
         }
         .sign(&project_key)?,
     );
