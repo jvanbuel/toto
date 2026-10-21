@@ -1325,16 +1325,33 @@ mod omnigent_in_container {
         dir
     }
 
-    /// The same pipeline on NVIDIA OpenShell (docs/spikes/openshell.md). Runs only when
-    /// `TOTO_OPENSHELL_BIN` names an `openshell` CLI whose active gateway uses the Docker driver.
+    /// toto's OpenShell sandbox with its managed gateway on `port`, from the binaries in
+    /// `TOTO_OPENSHELL_BIN_DIR`. `TOTO_OPENSHELL_IMAGES=<supervisor>,<sandbox>` runs local images
+    /// instead of the pinned ones; `TOTO_OPENSHELL_UPSTREAM=<url>[,<ca bundle>]` sends sandbox
+    /// egress through the host's HTTP proxy (by hostname).
+    fn openshell_sandbox(port: u16) -> Option<crate::config::SandboxConfig> {
+        let dir = std::env::var("TOTO_OPENSHELL_BIN_DIR").ok().filter(|d| std::path::Path::new(d).join("openshell-gateway").is_file())?;
+        let images = std::env::var("TOTO_OPENSHELL_IMAGES").ok().and_then(|v| {
+            let (supervisor, sandbox_runtime) = v.split_once(',')?;
+            Some(crate::openshell_pin::Images { supervisor: supervisor.into(), sandbox_runtime: sandbox_runtime.into() })
+        });
+        let upstream_proxy = std::env::var("TOTO_OPENSHELL_UPSTREAM").ok().map(|v| {
+            let (url, ca) = v.split_once(',').map_or((v.as_str(), None), |(u, c)| (u, Some(c.into())));
+            crate::openshell_gateway::UpstreamProxy { url: url.into(), ca_bundle: ca, connect_by_hostname: true }
+        });
+        Some(crate::config::SandboxConfig::Openshell { bin_dir: Some(dir.into()), gateway: None, port, upstream_proxy, images, proxy_bind: None })
+    }
+
+    /// The same pipeline on NVIDIA OpenShell, through the gateway toto runs itself (ADR 17).
+    /// Runs only when `TOTO_OPENSHELL_BIN_DIR` is set (see `openshell_sandbox`).
     #[test]
     fn the_same_pipeline_runs_on_openshell() {
         use crate::archive::{self, Record};
-        use crate::config::{Config, HarnessConfig, ProviderConfig, SandboxConfig};
+        use crate::config::{Config, HarnessConfig, ProviderConfig};
         use crate::queue::DirQueue;
         use chrono::Local;
-        let Some(bin) = std::env::var("TOTO_OPENSHELL_BIN").ok().filter(|b| std::path::Path::new(b).exists()) else {
-            eprintln!("skipping: set TOTO_OPENSHELL_BIN to an openshell CLI with a running gateway");
+        let Some(sandbox) = openshell_sandbox(17817) else {
+            eprintln!("skipping: set TOTO_OPENSHELL_BIN_DIR to a directory with `openshell` and `openshell-gateway`");
             return;
         };
         if !docker_has("toto-omnigent-test") {
@@ -1347,7 +1364,7 @@ mod omnigent_in_container {
             ("mcp__omnigent__sys_os_shell", serde_json::json!({"command": "cat calc.txt; echo fixed > calc.txt; ls /tmp/toto-agent/skills; id -u; pwd; echo secret-check=${ANTHROPIC_AUTH_TOKEN:-unset}; python3 -c 'import urllib.request as u; u.urlopen(\"https://example.com\", timeout=5)' 2>&1 | tail -1"})),
         ]);
         let mut cfg = Config::starter(&f.dir);
-        cfg.sandbox = SandboxConfig::Openshell { bin, gateway: None, proxy_bind: None };
+        cfg.sandbox = sandbox;
         cfg.harness = HarnessConfig::Omnigent { provider: ProviderConfig::Anthropic, upstream: Some(url), token_file: None, api_key_file: None };
         cfg.policy = super::policy();
         cfg.policy.daily_token_cap = 10_000_000;
@@ -1395,15 +1412,15 @@ mod omnigent_in_container {
     }
 
     /// A networked project on OpenShell: its Omnigent egress rules become OpenShell rules that
-    /// allow exactly the listed method and path, on any OS. Needs `TOTO_OPENSHELL_BIN` and
+    /// allow exactly the listed method and path, on any OS. Needs `TOTO_OPENSHELL_BIN_DIR` and
     /// `TOTO_OPENSHELL_NET=1` (the gateway must reach pypi.org).
     #[test]
     fn a_projects_egress_rules_are_enforced_by_openshell() {
-        use crate::config::{Config, HarnessConfig, ProviderConfig, SandboxConfig};
+        use crate::config::{Config, HarnessConfig, ProviderConfig};
         use crate::queue::DirQueue;
         use chrono::Local;
-        let Some(bin) = std::env::var("TOTO_OPENSHELL_BIN").ok().filter(|b| std::path::Path::new(b).exists() && std::env::var("TOTO_OPENSHELL_NET").is_ok_and(|v| v == "1")) else {
-            eprintln!("skipping: set TOTO_OPENSHELL_BIN and TOTO_OPENSHELL_NET=1");
+        let Some(sandbox) = openshell_sandbox(17827).filter(|_| std::env::var("TOTO_OPENSHELL_NET").is_ok_and(|v| v == "1")) else {
+            eprintln!("skipping: set TOTO_OPENSHELL_BIN_DIR and TOTO_OPENSHELL_NET=1");
             return;
         };
         let f = fixture("omni-openshell-net");
@@ -1413,7 +1430,7 @@ mod omnigent_in_container {
             ("mcp__omnigent__sys_os_shell", serde_json::json!({"command": format!("python3 -c \"$(printf '%s' '{}' | base64 -d)\"", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, probe))})),
         ]);
         let mut cfg = Config::starter(&f.dir);
-        cfg.sandbox = SandboxConfig::Openshell { bin, gateway: None, proxy_bind: None };
+        cfg.sandbox = sandbox;
         cfg.harness = HarnessConfig::Omnigent { provider: ProviderConfig::Anthropic, upstream: Some(url), token_file: None, api_key_file: None };
         cfg.policy = super::policy();
         cfg.policy.daily_token_cap = 10_000_000;
@@ -3713,5 +3730,138 @@ mod openshell_unit {
         let mut bad = Workspace::docker("t", vec!["openshell".into()]);
         bad.style = ExecStyle::OpenShell;
         assert!(bad.with_env(&envs).is_err());
+    }
+}
+
+mod openshell_release {
+    use crate::openshell_gateway::{label_for, Settings, UpstreamProxy};
+    use crate::openshell_pin::{find, install, unpack_verified, Asset, Lock};
+
+    fn tar_gz(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut b = tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()));
+        let mut h = tar::Header::new_gnu();
+        h.set_size(data.len() as u64);
+        h.set_mode(0o755);
+        h.set_cksum();
+        b.append_data(&mut h, format!("./{name}"), data).unwrap();
+        b.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("toto-osrel-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn the_shipped_lock_pins_images_by_digest_and_every_platform_ships_cli_and_gateway() {
+        let l = Lock::embedded();
+        assert!(l.version.starts_with("0.") && l.release_url.ends_with(&format!("/v{}", l.version)), "{l:?}");
+        for p in ["x86_64-linux", "aarch64-linux", "aarch64-macos"] {
+            let a = l.assets(p).unwrap();
+            for b in crate::openshell_pin::BINARIES {
+                assert!(a[b].asset.starts_with(b) && a[b].asset.ends_with(".tar.gz"), "{p}: {b}");
+            }
+        }
+        assert!(l.assets("sparc-solaris").unwrap_err().to_string().contains("no build for sparc-solaris"));
+        let unpinned = crate::openshell_pin::LOCK.replace("@sha256:", ":latest-");
+        assert!(Lock::parse(&unpinned).unwrap_err().to_string().contains("pinned by digest"), "a tag is not a pin");
+    }
+
+    #[test]
+    fn an_archive_is_installed_only_if_it_matches_the_pinned_checksum() {
+        let dest = tmp("unpack");
+        let archive = tar_gz("openshell", b"#!/bin/sh\necho hi\n");
+        let good = Asset { asset: "openshell-x.tar.gz".into(), sha256: crate::archive::sha256_hex(&archive) };
+        let bad = Asset { sha256: "0".repeat(64), ..good.clone() };
+        assert!(unpack_verified(&archive, &bad, "openshell", &dest).unwrap_err().to_string().contains("does not match"));
+        assert!(!dest.join("openshell").exists(), "nothing written on a mismatch");
+        let path = unpack_verified(&archive, &good, "openshell", &dest).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"#!/bin/sh\necho hi\n");
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&path).unwrap().permissions()) & 0o777, 0o755);
+        assert!(unpack_verified(&archive, &good, "openshell-gateway", &dest).unwrap_err().to_string().contains("holds no"));
+    }
+
+    #[test]
+    fn install_refuses_an_unpinned_lock_and_find_says_how_to_install() {
+        let mut l = Lock::embedded();
+        for a in l.binaries.values_mut().flat_map(|m| m.values_mut()) {
+            a.sha256 = String::new();
+        }
+        let dest = tmp("install");
+        assert!(!l.pinned("x86_64-linux"));
+        assert!(install(&l, "x86_64-linux", &dest, false).unwrap_err().to_string().contains("refusing to install unverified"));
+        let state = tmp("find");
+        let e = find(&l, Some(&dest), &state).unwrap_err().to_string();
+        assert!(e.contains("no `openshell`"), "{e}");
+        std::fs::write(dest.join("openshell"), b"").unwrap();
+        std::fs::write(dest.join("openshell-gateway"), b"").unwrap();
+        assert_eq!(find(&l, Some(&dest), &state).unwrap().dir, dest);
+    }
+
+    #[test]
+    fn install_downloads_checks_and_unpacks_each_archive() {
+        use std::io::{Read, Write};
+        let files: Vec<(String, Vec<u8>)> = crate::openshell_pin::BINARIES.iter().map(|b| (format!("{b}-test.tar.gz"), tar_gz(b, b.as_bytes()))).collect();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = files.clone();
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let mut buf = [0u8; 2048];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = req.split_whitespace().nth(1).unwrap_or("").rsplit('/').next().unwrap_or("").to_string();
+                match served.iter().find(|(n, _)| *n == path) {
+                    Some((_, body)) => {
+                        let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                        let _ = s.write_all(body);
+                    }
+                    None => {
+                        let _ = s.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    }
+                }
+            }
+        });
+        let mut l = Lock::embedded();
+        l.release_url = format!("http://127.0.0.1:{port}/v{}", l.version);
+        let mut assets = std::collections::BTreeMap::new();
+        for (b, (name, data)) in crate::openshell_pin::BINARIES.iter().zip(&files) {
+            assets.insert(b.to_string(), Asset { asset: name.clone(), sha256: crate::archive::sha256_hex(data) });
+        }
+        l.binaries.insert("test-plat".into(), assets);
+        let dest = tmp("download");
+        let got = install(&l, "test-plat", &dest, false).unwrap();
+        assert_eq!(got.len(), 2, "the VM driver only on request");
+        assert_eq!(std::fs::read(dest.join("openshell-gateway")).unwrap(), b"openshell-gateway");
+        install(&l, "test-plat", &dest, true).unwrap();
+        assert!(dest.join("openshell-driver-vm").is_file());
+        l.binaries.get_mut("test-plat").unwrap().get_mut("openshell").unwrap().sha256 = "f".repeat(64);
+        assert!(install(&l, "test-plat", &dest, false).unwrap_err().to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn the_managed_gateway_is_private_pinned_and_lets_toto_cap_disk() {
+        let lock = Lock::embedded();
+        let s = Settings { label: label_for(std::path::Path::new("/home/x/.toto/state")), port: 17717, images: lock.images.clone(), upstream_proxy: None };
+        let t = s.gateway_toml();
+        let v: toml::Value = toml::from_str(&t).unwrap();
+        let gw = &v["openshell"]["gateway"];
+        assert_eq!(v["openshell"]["version"].as_integer(), Some(2));
+        assert_eq!(gw["bind_address"].as_str(), Some("127.0.0.1:17717"), "loopback only");
+        assert_eq!(gw["health_bind_address"].as_str(), Some("127.0.0.1:17718"));
+        let d = &v["openshell"]["drivers"]["docker"];
+        assert_eq!(d["supervisor_image"].as_str(), Some(lock.images.supervisor.as_str()));
+        assert_eq!(d["sandbox_runtime_image"].as_str(), Some(lock.images.sandbox_runtime.as_str()));
+        assert_eq!(d["allow_driver_config"].as_bool(), Some(true));
+        assert!(d.get("https_proxy").is_none() && d.get("no_proxy").is_none(), "OpenShell rejects no_proxy without https_proxy");
+        let label = d["sandbox_label"].as_str().unwrap();
+        assert!(label.starts_with("toto-") && label != label_for(std::path::Path::new("/home/y/.toto/state")), "one label per installation");
+        let with = Settings { upstream_proxy: Some(UpstreamProxy { url: "http://proxy:3128".into(), ca_bundle: Some("/etc/ca \"x\".pem".into()), connect_by_hostname: true }), ..s };
+        let v: toml::Value = toml::from_str(&with.gateway_toml()).unwrap();
+        let d = &v["openshell"]["drivers"]["docker"];
+        assert_eq!((d["https_proxy"].as_str(), d["proxy_ca_bundle"].as_str(), d["proxy_connect_by_hostname"].as_bool()), (Some("http://proxy:3128"), Some("/etc/ca \"x\".pem"), Some(true)));
+        assert!(d["no_proxy"].as_str().unwrap().contains("host.openshell.internal"), "toto's proxy is never reached through the upstream one");
     }
 }

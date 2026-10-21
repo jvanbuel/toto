@@ -75,10 +75,26 @@ pub fn run_all(cfg: &Config) -> Vec<Check> {
 
     match &cfg.sandbox {
         SandboxConfig::Dir => c.push(Check::new(Level::Warn, "sandbox", "`dir` gives no isolation (development only)")),
-        SandboxConfig::Openshell { bin, .. } => {
-            c.push(Check::new(Level::Warn, "sandbox", "OpenShell is experimental in toto (docs/spikes/openshell.md)"));
-            match cfg.build_sandbox().probe() {
-                Ok(()) => c.push(Check::new(Level::Ok, "sandbox", format!("{bin}: gateway reachable"))),
+        SandboxConfig::Openshell { bin_dir, gateway, images, .. } => {
+            let lock = crate::openshell_pin::Lock::embedded();
+            match crate::openshell_pin::find(&lock, bin_dir.as_deref(), &cfg.state_dir) {
+                Ok(b) => c.push(Check::new(Level::Ok, "openshell", format!("{} in {}", lock.version, b.dir.display()))),
+                Err(e) => c.push(Check::new(Level::Fail, "openshell", e.to_string())),
+            }
+            if images.is_some() {
+                c.push(Check::new(Level::Warn, "openshell", "`images` overrides the pinned OpenShell images (development only)"));
+            }
+            if let Some(g) = gateway {
+                c.push(Check::new(Level::Warn, "openshell", format!("using your own gateway `{g}`: toto does not check its version, images or settings")));
+            }
+            #[cfg(target_os = "linux")]
+            match std::fs::read_to_string("/sys/kernel/security/lsm") {
+                Ok(l) if l.split(',').any(|m| m.trim() == "landlock") => c.push(Check::new(Level::Ok, "landlock", "enabled")),
+                Ok(_) => c.push(Check::new(Level::Fail, "landlock", "not enabled in this kernel: OpenShell sandboxes require it")),
+                Err(_) => c.push(Check::new(Level::Warn, "landlock", "could not read /sys/kernel/security/lsm")),
+            }
+            match cfg.build_sandbox().and_then(|s| s.probe()) {
+                Ok(()) => c.push(Check::new(Level::Ok, "sandbox", if gateway.is_some() { "OpenShell gateway reachable" } else { "toto's OpenShell gateway started and answering" })),
                 Err(e) => c.push(Check::new(Level::Fail, "sandbox", e.to_string())),
             }
             for (id, a) in &cfg.environments {
@@ -90,8 +106,9 @@ pub fn run_all(cfg: &Config) -> Vec<Check> {
             }
         }
         SandboxConfig::Docker { bin, runtime, nested_userns, network } => {
+            c.push(Check::new(Level::Warn, "sandbox", "the `docker` sandbox is deprecated and goes in the next release; switch to `openshell` (ADR 17)"));
             // `probe` covers the daemon, every approved image and the network fence.
-            match cfg.build_sandbox().probe() {
+            match cfg.build_sandbox().and_then(|s| s.probe()) {
                 Ok(()) => c.push(Check::new(Level::Ok, "sandbox", format!("{bin}{}", runtime.as_deref().map_or(String::new(), |r| format!(" (runtime {r})"))))),
                 Err(e) => c.push(Check::new(Level::Fail, "sandbox", e.to_string())),
             }

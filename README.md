@@ -10,14 +10,14 @@
 
 ## How it fits together
 
-toto reuses what exists and adds as little as it can (ADR 13):
+toto reuses what exists and adds as little as it can (ADR 13, ADR 17):
 
 | Piece | Comes from | toto's part |
 |---|---|---|
 | Environment | the project's `.devcontainer/devcontainer.json` (the [dev container spec](https://containers.dev)) | reads `customizations.toto`; pulls the published image, or prebuilds the file with the reference CLI |
 | Agent, tools, skills, prompt | the project's [Omnigent](https://github.com/omnigent-ai/omnigent) agent directory (`.toto/agent`) | shows it to the contributor, hashes it, runs it as is |
-| Egress rules | Omnigent's own sandbox (`os_env.sandbox`, bubblewrap) inside the container | an opt-in seccomp profile so the nested sandbox can start |
-| Isolation | Docker or Podman, optionally gVisor | hardened flags: read-only, no capabilities, unprivileged user, no network unless fenced |
+| Egress rules | the agent's Omnigent config (`os_env.sandbox.egress_rules`) | turns them into OpenShell policy rules, enforced per request (method and path) |
+| Isolation | [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell): Landlock, seccomp, a policy-mediated network | ships the pinned release and runs a private gateway; nothing to set up |
 | Credential | your subscription token or API key | a host-side proxy that adds it to model calls; the container never holds it |
 | Queue | GitHub issues in the project's repository | signed tasks in, signed results out, results opened as pull requests |
 
@@ -25,7 +25,7 @@ A contributor approves exactly what will run: the image by digest (or by id when
 
 ## Status
 
-A working runner, tested end to end with fake model APIs: Omnigent with the Claude and Codex harnesses inside a hardened container, the credential proxy, project egress rules enforced by the nested sandbox, prebuilds with the dev container CLI, GitHub issues as the queue, results as pull requests. Not yet run with a real credential. See [docs/design.md](docs/design.md) and the ADRs.
+A working runner, tested end to end with fake model APIs: Omnigent with the Claude and Codex harnesses inside an OpenShell sandbox, the credential proxy, project egress rules enforced by OpenShell, prebuilds with the dev container CLI, GitHub issues as the queue, results as pull requests. Not yet run with a real credential. See [docs/design.md](docs/design.md) and the ADRs.
 
 ```
 cargo test --workspace
@@ -35,7 +35,9 @@ cargo run -- demo
 ## Contributor quick start
 
 ```
-cargo build --release
+curl -fsSL https://raw.githubusercontent.com/jvanbuel/togra/main/scripts/install.sh | sh
+                                            # toto plus its pinned OpenShell; needs Docker
+                                            # (from source: cargo build --release && toto openshell install)
 toto init                                   # ~/.config/toto: runner key, strict starter config
 toto login                                  # Anthropic subscription token (or api_key_file for OpenAI)
 toto directory list                         # the signed list of projects
@@ -49,18 +51,19 @@ toto pause                                  # take no new tasks until `toto resu
 `config.json`, the parts you set:
 
 ```json
-"sandbox": {"kind": "docker"},
+"sandbox": {"kind": "openshell"},
 "harness": {"kind": "omnigent", "provider": "anthropic"}
 ```
 
-Add `"bin": "podman"` for Podman, `"runtime": "runsc"` for gVisor, `"nested_userns": true` for projects whose agent uses Omnigent's own sandbox (egress rules), and `"network": "toto-egress"` after `toto net-setup --apply` for agents that need a network. For OpenAI: `"provider": "openai", "api_key_file": "/path"`. `{"kind": "dir"}` with `{"kind": "echo"}` is for development only. Details: [docs/first-live-run.md](docs/first-live-run.md), [docs/projects.md](docs/projects.md).
+Behind an HTTP proxy, add `"upstream_proxy": {"url": "http://proxy:3128", "ca_bundle": "/path/ca.pem"}` to the sandbox. For OpenAI: `"provider": "openai", "api_key_file": "/path"`. `{"kind": "dir"}` with `{"kind": "echo"}` is for development only. Details: [docs/first-live-run.md](docs/first-live-run.md), [docs/projects.md](docs/projects.md).
 
 ## What a task gets
 
-- the project's image, started read-only with all capabilities dropped, `no-new-privileges`, uid 65534, a 512 MB writable `/workspace`, pid, CPU, memory and time limits from the manifest, `--network none` unless the agent needs a network and you fenced one;
+- the project's image, run by OpenShell as uid 65534 with Landlock (required) and seccomp: the whole image read-only, a 512 MB `/work` and a 256 MB `/tmp`, CPU, memory and time limits from the manifest;
+- no network except toto's credential proxy and, for an agent that declares them, the project's approved egress rules, each enforced per request by OpenShell's supervisor;
 - the project's agent directory at `/tmp/toto-agent`, run with `omnigent run`; the task prompt from the manifest;
-- model calls through `127.0.0.1:8080` in the container, where a small Python relay (written in over `docker exec`, no mount) carries them over the exec stream to the proxy on your host, which adds your credential and counts tokens; the usage meter aborts a task that overruns its estimate;
-- the task's input bundle unpacked into `/workspace`; only files the agent changed come back, as a signed artifact tar (deletions as whiteouts), capped by the task.
+- model calls to toto's proxy on your host, with a per-run key instead of a credential; the proxy checks the key, adds your credential and counts tokens; the usage meter aborts a task that overruns its estimate;
+- the task's input bundle unpacked into `/work`; only files the agent changed come back, as a signed artifact tar (deletions as whiteouts), capped by the task.
 
 ## Only unused capacity
 
@@ -68,13 +71,13 @@ The proxy sees every provider response, so it reads the rate-limit headers the p
 
 ## Platforms
 
-Linux, macOS and Windows hosts with Docker Desktop, Docker Engine or Podman. Nothing is mounted into a task container and it needs no network, so the relay works through Docker Desktop's VM as well. The network fence is Linux-only (iptables on the docker host): on macOS and Windows, projects whose agents need a network, and projects without a published image (which need the fence to prebuild), are refused; published images and offline agents work. `toto doctor` says which applies.
+Linux (x86_64, arm64) and macOS (Apple silicon) with Docker: OpenShell's Docker driver runs the sandboxes. Egress rules are enforced the same way on both, so projects whose agents need a network run on macOS too. The macOS path has not been run yet (ADR 17). Projects that publish no image are prebuilt on your machine, which still needs the deprecated `docker` sandbox and its Linux network fence for now.
 
-## Sandbox runtimes
+## The sandbox
 
-`DockerSandbox` works with Docker or Podman (`bin`), optionally under gVisor (`runtime = "runsc"`). `cargo test` runs live isolation checks for each combination and skips those whose daemon or image is missing. gVisor needs a runtime registered with `--network=none` (`/etc/docker/daemon.json`: `{"runtimes":{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--network=none"]}}}`); nested VMs without KVM need `--platform=ptrace`. gVisor cannot run Omnigent's nested sandbox, so projects with egress rules need the default runtime plus `nested_userns` (`profiles/README.md`).
+toto runs its sandboxes on [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell) (ADR 17), at the exact version, binaries and images pinned in [`openshell.lock.toml`](openshell.lock.toml), each checked by SHA-256 or digest. The daemon starts a private OpenShell gateway on `127.0.0.1:17717` and stops it on exit. Its state lives under toto's state directory, and an OpenShell you run yourself is never touched. `toto openshell status` shows the pinned version, where the binaries are and whether the gateway answers; `toto doctor` checks the rest. Options under `"sandbox"`: `bin_dir`, `port`, `upstream_proxy`, and `gateway` to use a gateway you run instead (toto then checks neither its version nor its images).
 
-**Experimental: NVIDIA OpenShell** (`{"kind": "openshell"}`). Tasks run in an OpenShell sandbox: Landlock and seccomp inside the project's image, a size-capped `/work`, and every connection checked by OpenShell's policy. That lets projects whose agents need a network run with their egress rules enforced per request on any OS. toto's credential proxy stays in the path. See [docs/spikes/openshell.md](docs/spikes/openshell.md) for what was tested and what a contributor sets up.
+**Deprecated:** `{"kind": "docker"}`, toto's earlier hardened `docker run` with an iptables network fence and Omnigent's nested bubblewrap, works for one more release and is then removed. Its options (`bin`, `runtime`, `nested_userns`, `network`) are described in [docs/first-live-run.md](docs/first-live-run.md).
 
 ## The local page
 

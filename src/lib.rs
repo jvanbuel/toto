@@ -23,6 +23,8 @@ pub mod meter;
 pub mod netfence;
 pub mod omnigent;
 pub mod openshell;
+pub mod openshell_gateway;
+pub mod openshell_pin;
 pub mod policy;
 pub mod prebuild;
 pub mod pr_flow;

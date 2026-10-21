@@ -7,7 +7,8 @@
 //! the sandbox's policy allows exactly that one endpoint (`host.openshell.internal`), and the agent
 //! presents the key instead of a credential. No provider credential is ever given to OpenShell.
 //!
-//! Driven through the `openshell` CLI against a gateway the contributor runs locally.
+//! Driven through the `openshell` CLI, against the private gateway toto runs itself
+//! (`crate::openshell_gateway`) or, if configured, one the contributor runs.
 
 use crate::manifest::{SandboxProfile, TaskManifest};
 use crate::sandbox::{collect_via_exec, exec_io, Environment, ExecStyle, ProxyEndpoint, Sandbox, Workspace};
@@ -32,6 +33,10 @@ pub struct OpenShellSandbox {
     pub bin: String,
     /// Gateway to use (`--gateway <name>`); default: the CLI's active gateway.
     pub gateway: Option<String>,
+    /// Environment for every CLI call (the managed gateway's isolated CLI config).
+    pub env: Vec<(String, String)>,
+    /// Keeps toto's managed gateway running while this sandbox exists.
+    pub managed: Option<std::sync::Arc<crate::openshell_gateway::ManagedGateway>>,
     /// The approved environment per project id.
     pub environments: HashMap<String, Environment>,
     /// The approved agent's Omnigent egress rules per project id (`METHODS host/path`).
@@ -45,7 +50,7 @@ pub struct OpenShellSandbox {
 
 impl OpenShellSandbox {
     pub fn new(bin: &str, scratch: PathBuf) -> Self {
-        Self { bin: bin.into(), gateway: None, environments: HashMap::new(), egress: HashMap::new(), proxy: None, scratch, baselines: Mutex::default() }
+        Self { bin: bin.into(), gateway: None, env: vec![], managed: None, environments: HashMap::new(), egress: HashMap::new(), proxy: None, scratch, baselines: Mutex::default() }
     }
 
     pub fn sandbox_name(task_id: &str) -> String {
@@ -55,6 +60,7 @@ impl OpenShellSandbox {
 
     fn cli(&self) -> Command {
         let mut c = Command::new(&self.bin);
+        c.envs(self.env.iter().map(|(k, v)| (k, v)));
         if let Some(g) = &self.gateway {
             c.args(["--gateway", g]);
         }
@@ -134,7 +140,12 @@ impl OpenShellSandbox {
     }
 
     fn exec_prefix(&self, name: &str) -> Vec<String> {
-        let mut p = vec![self.bin.clone()];
+        let mut p = vec![];
+        if !self.env.is_empty() {
+            p.push("env".into());
+            p.extend(self.env.iter().map(|(k, v)| format!("{k}={v}")));
+        }
+        p.push(self.bin.clone());
         if let Some(g) = &self.gateway {
             p.extend(["--gateway".into(), g.clone()]);
         }
@@ -145,7 +156,12 @@ impl OpenShellSandbox {
 
 impl Sandbox for OpenShellSandbox {
     fn probe(&self) -> Result<()> {
-        self.run(&["status"]).map(|_| ()).map_err(|e| Error::Sandbox(format!("no OpenShell gateway reachable ({e}); install OpenShell and start its gateway")))
+        if let Some(g) = &self.managed
+            && !g.healthy()
+        {
+            return Err(Error::Sandbox(format!("toto's OpenShell gateway is not answering: {}", g.log_tail())));
+        }
+        self.run(&["status"]).map(|_| ()).map_err(|e| Error::Sandbox(format!("no OpenShell gateway reachable ({e})")))
     }
 
     fn create(&self, task: &TaskManifest, profile: &SandboxProfile) -> Result<Workspace> {
@@ -168,7 +184,7 @@ impl Sandbox for OpenShellSandbox {
             "--driver-config-json", &driver, "--cpu", &cpu, "--memory", &mem, "--label", "toto=task", "--detach", "--", "sleep", &timeout,
         ])
         .map_err(|e| match e.to_string().contains("allow_driver_config") {
-            true => Error::Sandbox("the OpenShell gateway must allow driver config (`allow_driver_config = true` under [openshell.drivers.docker]) so toto can cap the task's disk use".into()),
+            true => Error::Sandbox("the OpenShell gateway must allow driver config (`allow_driver_config = true` under [openshell.drivers.docker]) so toto can cap the task's disk use; toto's managed gateway does".into()),
             false => e,
         })?;
         let ws = Workspace { task_id: task.id.clone(), path: PathBuf::new(), exec_prefix: self.exec_prefix(&name), style: ExecStyle::OpenShell, workdir: WORKDIR.into(), proxy: self.proxy.clone().unwrap_or_default() };

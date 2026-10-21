@@ -17,6 +17,31 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum OpenshellCmd {
+    /// Download this toto's pinned OpenShell binaries for this machine, check each against its
+    /// pinned SHA-256, and install them into toto's state directory. Not needed with the release
+    /// archive, which ships them next to toto.
+    Install {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Also install the MicroVM driver.
+        #[arg(long)]
+        vm: bool,
+        /// Install into this directory instead (packaging: the release archive puts them next to toto).
+        #[arg(long)]
+        dest: Option<PathBuf>,
+        /// Platform to install for (`x86_64-linux`, `aarch64-linux`, `aarch64-macos`); default: this one.
+        #[arg(long)]
+        platform: Option<String>,
+    },
+    /// Show the pinned version, where the binaries are, and whether toto's gateway answers.
+    Status {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum Cmd {
     /// Generate a runner keypair (hex seed, mode 0600) and print the runner id.
     Keygen { out: PathBuf },
@@ -59,6 +84,11 @@ enum Cmd {
     Doctor {
         #[arg(long)]
         config: Option<PathBuf>,
+    },
+    /// The OpenShell release toto runs its sandboxes on (ADR 17).
+    Openshell {
+        #[command(subcommand)]
+        cmd: OpenshellCmd,
     },
     /// Create (and with --apply, install) the firewalled docker network that agents needing a
     /// network run on: no route to private ranges, other containers or this host. Needs root.
@@ -408,6 +438,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if !toto::doctor::passed(&checks) {
                 std::process::exit(1);
+            }
+        }
+        Cmd::Openshell { cmd: OpenshellCmd::Install { config, vm, dest, platform } } => {
+            let lock = toto::openshell_pin::Lock::embedded();
+            let dest = match dest {
+                Some(d) => d,
+                None => lock.install_dir(&toto::config::Config::load(&config_path(config))?.state_dir),
+            };
+            for p in toto::openshell_pin::install(&lock, &platform.unwrap_or_else(toto::openshell_pin::Lock::platform), &dest, vm)? {
+                println!("installed {}", p.display());
+            }
+            println!("OpenShell {} (checksums verified)", lock.version);
+        }
+        Cmd::Openshell { cmd: OpenshellCmd::Status { config } } => {
+            let cfg = toto::config::Config::load(&config_path(config))?;
+            let lock = toto::openshell_pin::Lock::embedded();
+            println!("pinned: OpenShell {} ({})", lock.version, if lock.pinned(&toto::openshell_pin::Lock::platform()) { "checksums pinned" } else { "checksums NOT pinned in this build" });
+            println!("supervisor image: {}\nsandbox runtime image: {}", lock.images.supervisor, lock.images.sandbox_runtime);
+            match &cfg.sandbox {
+                toto::config::SandboxConfig::Openshell { bin_dir, gateway, port, .. } => {
+                    match toto::openshell_pin::find(&lock, bin_dir.as_deref(), &cfg.state_dir) {
+                        Ok(b) => println!("binaries: {}", b.dir.display()),
+                        Err(e) => println!("binaries: {e}"),
+                    }
+                    match gateway {
+                        Some(g) => println!("gateway: your own, `{g}`"),
+                        None => println!("gateway: toto's, 127.0.0.1:{port}, {}", if toto::openshell_gateway::health(port + 1) { "running (the daemon runs it)" } else { "not running (the daemon starts it)" }),
+                    }
+                }
+                other => println!("sandbox: this config uses `{}`, not OpenShell", serde_json::to_value(other)?["kind"].as_str().unwrap_or("?")),
             }
         }
         Cmd::NetSetup { name, subnet, bin, apply, remove } => {

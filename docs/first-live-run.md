@@ -1,17 +1,24 @@
 # First live run
 
-Goal: run one task through the real chain (daemon, hardened container, the project's Omnigent agent in the project's image, credential proxy, your own subscription or API key) and confirm what only a real credential can test. About 20 minutes, a few cents of usage. Anthropic's terms restrict third-party products from offering claude.ai login (ADR 11, "Terms and risk"); this test uses your own login on your own machine.
+Goal: run one task through the real chain (daemon, OpenShell sandbox, the project's Omnigent agent in the project's image, credential proxy, your own subscription or API key) and confirm what only a real credential can test. About 20 minutes, a few cents of usage. Anthropic's terms restrict third-party products from offering claude.ai login (ADR 11, "Terms and risk"); this test uses your own login on your own machine.
 
 ## Prerequisites
 
-- Rust, Docker (or Podman) running, and for the subscription path the `claude` CLI installed (only `claude setup-token` is used).
-- Linux or macOS (Windows with Docker Desktop should work the same, untested). On macOS, use a project with a published image and an agent that needs no network: the fence is Linux-only.
+- Docker running (OpenShell's Docker driver runs the sandboxes), and for the subscription path the `claude` CLI installed (only `claude setup-token` is used).
+- Linux (x86_64, arm64) with Landlock enabled (any recent distribution kernel), or macOS on Apple silicon with Docker Desktop. macOS is the first run of that path: note anything that differs.
 
-## 1. Build
+## 1. Install
+
+From a release: `curl -fsSL https://raw.githubusercontent.com/jvanbuel/togra/main/scripts/install.sh | sh` installs toto with its pinned OpenShell.
+
+From source:
 
 ```
+scripts/pin-openshell.sh 0.1.5   # once, until a release has filled openshell.lock.toml's checksums
 cargo build --release
 ```
+
+and after `toto init` below, `toto openshell install` downloads the pinned OpenShell binaries and checks each against the lock.
 
 ## 2. Configure
 
@@ -23,11 +30,11 @@ toto init                      # ~/.config/toto (or $XDG_CONFIG_HOME/toto)
 In `~/.config/toto/config.json`:
 
 ```json
-"sandbox": {"kind": "docker"},
+"sandbox": {"kind": "openshell"},
 "harness": {"kind": "omnigent", "provider": "anthropic"}
 ```
 
-Podman: add `"bin": "podman"`. gVisor: add `"runtime": "runsc"` (README). OpenAI instead of Anthropic: `"provider": "openai", "api_key_file": "/path/to/key"` (mode 600).
+`toto init` writes this already. Behind an HTTP proxy, add `"upstream_proxy": {"url": "http://proxy:3128"}` (plus `"ca_bundle"` for a TLS-intercepting one) to the sandbox. OpenAI instead of Anthropic: `"provider": "openai", "api_key_file": "/path/to/key"` (mode 600).
 
 ```
 toto login                     # Anthropic: runs `claude setup-token`; paste the token when asked
@@ -35,14 +42,14 @@ toto login                     # Anthropic: runs `claude setup-token`; paste the
 
 ## 3. A project to run
 
-Use a real project (`toto projects add owner/name --token-file gh.token`, see `docs/projects.md`) or make a scratch one from the example: copy `docs/examples/project/` into a repository of your own, put the public key from `toto project-key ./pilot.key` into `customizations.toto.public_key`, build and push the image named in `customizations.toto.image` (or drop `image` and let toto prebuild it; that needs the fenced network, below), and add it:
+Use a real project (`toto projects add owner/name --token-file gh.token`, see `docs/projects.md`) or make a scratch one from the example: copy `docs/examples/project/` into a repository of your own, put the public key from `toto project-key ./pilot.key` into `customizations.toto.public_key`, build and push the image named in `customizations.toto.image` (dropping `image` makes toto prebuild it, which for now needs the deprecated `docker` sandbox and its network fence, below), and add it:
 
 ```
 toto projects add you/scratch --token-file gh.token
 toto doctor
 ```
 
-`doctor` checks the runner key, the projects, the policy, the queue, the sandbox (including each approved image: does it contain `omnigent`, `python3`, `tar`, and `bwrap` if the agent needs it), the network fence, the nested-sandbox prerequisites and the credential, and exits 1 on any `FAIL`.
+`doctor` checks the runner key, the projects, the policy, the queue, the OpenShell binaries, Landlock, toto's gateway (it starts it if the daemon is not running), each networked agent's egress rules, and the credential, and exits 1 on any `FAIL`.
 
 ## 4. Post a task and run
 
@@ -56,7 +63,7 @@ toto audit ~/.config/toto/state/audit.jsonl
 
 ## Variant: an agent with egress rules
 
-If the project's agent uses Omnigent's own sandbox (`os_env.sandbox.type: linux_bwrap` with `egress_rules`), the agent's tools reach only those hosts, enforced inside the container. The contributor side needs two things, which `toto projects add` tells you about (Linux only; the fence is iptables on the docker host): as root, `toto net-setup --apply` creates the fenced bridge `toto-egress` (no route to private ranges, other containers or this host), then set `"network": "toto-egress"` and `"nested_userns": true` in the sandbox config. `toto doctor` refuses to pass if the fence does not hold. `toto net-setup --remove --apply` undoes it. Without `network`, projects whose agent needs one are refused; without `nested_userns`, their tools fail.
+If the project's agent declares egress rules (`os_env.sandbox` with `allow_network: true` and `egress_rules`, such as `GET pypi.org/simple/**`), toto turns them into OpenShell policy rules: the agent's requests reach exactly those methods and paths over HTTPS, and everything else is refused with `policy_denied`. Nothing to set up on your side. An agent that needs a network but lists no rules is refused.
 
 ## What to look for
 
@@ -66,10 +73,15 @@ Things this run is meant to settle (note what you see):
 
 1. **Does Anthropic accept the subscription token through the proxy?** The proxy adds the token and the OAuth beta flag itself. Failure shows as `authentication_failed` or a 401 in the harness error. If it fails, compare with an API key (`api_key_file`).
 2. **Is the usage figure right?** Compare `tokens=` in the audit line with what your account shows.
-3. **Did anything touch your personal profile?** Your own `~/.claude` should be unchanged; the agent runs in the container with `HOME=/tmp/home`.
+3. **Did anything touch your personal profile?** Your own `~/.claude` should be unchanged; the agent runs in the sandbox with `HOME=/tmp/home`.
 4. **Limits.** `toto status` after a task should show nothing paused while your usage is below the reserve (`policy.reserve_pct`, default 20%). If you run a task while your subscription window is nearly used up, the runner should pause with the reason and the reset time, and the task should reappear in the queue rather than fail. The headers this relies on (`anthropic-ratelimit-unified-*` for subscriptions, `anthropic-ratelimit-*` for API keys) are read from real responses only here, so note what `toto status` and the audit log say.
-5. **Isolation spot-check.** While a task runs: `docker ps` shows one `toto-<task>` container; `docker inspect toto-<task> --format '{{json .Mounts}}'` shows no mounts at all; `docker exec toto-<task> env` shows no token.
+5. **Isolation spot-check.** While a task runs: `toto openshell status` shows the gateway running; `docker ps` shows the sandbox and its supervisor, labelled `openshell.sandbox_namespace=toto-…`; no container's environment (`docker inspect … --format '{{json .Config.Env}}'`) holds your token.
+6. **macOS only:** does the sandbox start under Docker Desktop, and do the egress rules hold? The gateway's log is `~/.config/toto/state/openshell/gateway/gateway.log`.
 
 ## If it fails
 
-Send back: the full output of `toto run --once` and `toto doctor`, `~/.config/toto/state/audit.jsonl`, `~/.config/toto/state/status.json`, and `docker image inspect <image> --format '{{.Id}}'`. Clean up afterwards: `docker rm -f toto-<task>`, and revoke the token if you do not want to keep it.
+Send back: the full output of `toto run --once`, `toto doctor` and `toto openshell status`, `~/.config/toto/state/audit.jsonl`, `~/.config/toto/state/status.json`, the gateway log above, and `docker image inspect <image> --format '{{.Id}}'`. toto deletes its sandboxes and stops its gateway itself; revoke the token if you do not want to keep it.
+
+## Appendix: the deprecated `docker` sandbox
+
+`{"kind": "docker"}` is toto's earlier sandbox, kept for one release (ADR 17). Options: `"bin": "podman"` for Podman, `"runtime": "runsc"` for gVisor, `"nested_userns": true` for agents that use Omnigent's own bubblewrap sandbox, and `"network": "toto-egress"` for agents that need a network. That network is created as root with `toto net-setup --apply`, Linux only (iptables on the Docker host), and removed with `toto net-setup --remove --apply`. Prebuilds of projects without a published image use the same fence.

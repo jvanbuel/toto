@@ -23,6 +23,7 @@ pub enum SandboxConfig {
     /// A plain directory. **No isolation**; development and tests only.
     Dir,
     /// Docker or Podman; set `runtime` to `runsc` for gVisor. Tasks run in each project's approved image.
+    /// **Deprecated** (ADR 17): kept for one release as a fallback; use `openshell`.
     Docker {
         #[serde(default = "docker_bin")]
         bin: String,
@@ -36,24 +37,43 @@ pub enum SandboxConfig {
         #[serde(default)]
         network: Option<String>,
     },
-    /// NVIDIA OpenShell (experimental; docs/spikes/openshell.md): Landlock, seccomp and a policy-
-    /// mediated network path, through a locally running OpenShell gateway.
+    /// NVIDIA OpenShell (ADR 17), toto's sandbox: Landlock, seccomp and a policy-mediated network
+    /// path. toto runs its own private gateway with the pinned release; nothing to set up.
     Openshell {
-        #[serde(default = "openshell_bin")]
-        bin: String,
-        /// Gateway name for `openshell --gateway`; default: the CLI's active gateway.
+        /// Directory holding `openshell` and `openshell-gateway`. Default: next to the toto
+        /// executable, then where `toto openshell install` puts them.
+        #[serde(default)]
+        bin_dir: Option<PathBuf>,
+        /// Use a gateway you run yourself (its name for `openshell --gateway`) instead of toto's.
+        /// It must allow driver config; toto does not check its images.
         #[serde(default)]
         gateway: Option<String>,
+        /// Loopback port of toto's gateway; its health endpoint uses the next one.
+        #[serde(default = "openshell_port")]
+        port: u16,
+        /// The HTTP proxy sandbox egress must go through, if the host has one.
+        #[serde(default)]
+        upstream_proxy: Option<crate::openshell_gateway::UpstreamProxy>,
+        /// Development only: run these images instead of the pinned ones.
+        #[serde(default)]
+        images: Option<crate::openshell_pin::Images>,
         /// Host address toto's credential proxy listens on for sandboxes: where a sandbox's
         /// `host.openshell.internal` lands. Default `127.0.0.1`: with the Docker driver the
-        /// supervisor shares the host's network and connects to loopback (measured in the spike).
+        /// supervisor shares the host's network and connects to loopback.
         #[serde(default)]
         proxy_bind: Option<String>,
     },
 }
 
-fn openshell_bin() -> String {
-    "openshell".into()
+impl SandboxConfig {
+    /// toto's default sandbox: OpenShell with its managed gateway.
+    pub fn openshell() -> Self {
+        SandboxConfig::Openshell { bin_dir: None, gateway: None, port: openshell_port(), upstream_proxy: None, images: None, proxy_bind: None }
+    }
+}
+
+fn openshell_port() -> u16 {
+    crate::openshell_gateway::DEFAULT_PORT
 }
 
 fn docker_bin() -> String {
@@ -263,7 +283,7 @@ impl Config {
             queues: vec![],
             poll_secs: default_poll(),
             ui_addr: default_ui_addr(),
-            sandbox: SandboxConfig::Docker { bin: docker_bin(), runtime: None, nested_userns: false, network: None },
+            sandbox: SandboxConfig::openshell(),
             harness: HarnessConfig::Omnigent { provider: ProviderConfig::Anthropic, upstream: None, token_file: None, api_key_file: None },
             policy: Policy {
                 daily_token_cap: 100_000,
@@ -304,10 +324,13 @@ impl Config {
         self.state_dir.join("claude.token")
     }
 
+    /// The container CLI that pulls and inspects project images. OpenShell's Docker driver runs
+    /// them on the same Docker.
     pub fn docker_bin(&self) -> Option<&str> {
         match &self.sandbox {
             SandboxConfig::Docker { bin, .. } => Some(bin),
-            SandboxConfig::Dir | SandboxConfig::Openshell { .. } => None,
+            SandboxConfig::Openshell { .. } => Some("docker"),
+            SandboxConfig::Dir => None,
         }
     }
 
@@ -329,15 +352,35 @@ impl Config {
         }
     }
 
-    pub fn build_sandbox(&self) -> Box<dyn Sandbox> {
+    pub fn build_sandbox(&self) -> Result<Box<dyn Sandbox>> {
         self.build_sandbox_with(None, None)
     }
 
-    fn build_sandbox_with(&self, proxy_socket: Option<PathBuf>, proxy_tcp: Option<crate::sandbox::ProxyEndpoint>) -> Box<dyn Sandbox> {
-        match &self.sandbox {
-            SandboxConfig::Openshell { bin, gateway, .. } => {
-                let mut s = crate::openshell::OpenShellSandbox::new(bin, self.state_dir.join("openshell"));
-                s.gateway = gateway.clone();
+    fn build_sandbox_with(&self, proxy_socket: Option<PathBuf>, proxy_tcp: Option<crate::sandbox::ProxyEndpoint>) -> Result<Box<dyn Sandbox>> {
+        Ok(match &self.sandbox {
+            SandboxConfig::Openshell { bin_dir, gateway, port, upstream_proxy, images, .. } => {
+                use crate::openshell_pin::{find, Lock};
+                let lock = Lock::embedded();
+                let found = find(&lock, bin_dir.as_deref(), &self.state_dir);
+                let mut s = match gateway {
+                    // The contributor's own gateway: their `openshell` on PATH unless toto has one.
+                    Some(g) => {
+                        let bin = found.map(|b| b.cli.to_string_lossy().into_owned()).unwrap_or_else(|_| "openshell".into());
+                        let mut s = crate::openshell::OpenShellSandbox::new(&bin, self.state_dir.join("openshell").join("policies"));
+                        s.gateway = Some(g.clone());
+                        s
+                    }
+                    None => {
+                        let bins = found?;
+                        let settings = crate::openshell_gateway::Settings { label: crate::openshell_gateway::label_for(&self.state_dir), port: *port, images: images.clone().unwrap_or_else(|| lock.images.clone()), upstream_proxy: upstream_proxy.clone() };
+                        let g = crate::openshell_gateway::ManagedGateway::shared(&bins, &self.state_dir, &settings)?;
+                        let mut s = crate::openshell::OpenShellSandbox::new(&bins.cli.to_string_lossy(), self.state_dir.join("openshell").join("policies"));
+                        s.gateway = Some(crate::openshell_gateway::NAME.into());
+                        s.env = g.cli_env();
+                        s.managed = Some(g);
+                        s
+                    }
+                };
                 s.environments = self.environments.iter().map(|(k, a)| (k.clone(), Environment { image: a.pinned(), network: a.agent.needs_network })).collect();
                 s.egress = self.environments.iter().map(|(k, a)| (k.clone(), a.agent.egress_rules.clone())).collect();
                 s.proxy = proxy_tcp;
@@ -359,7 +402,7 @@ impl Config {
                 s.proxy_socket = proxy_socket;
                 Box::new(s)
             }
-        }
+        })
     }
 
     /// Starts the credential proxy. The secret stays in this process.
@@ -437,7 +480,7 @@ impl Config {
             self.load_or_create_key()?,
             queue,
             harness,
-            self.build_sandbox_with(proxy_socket, proxy_tcp),
+            self.build_sandbox_with(proxy_socket, proxy_tcp)?,
             Box::new(NoReview),
             AuditLog::new(self.state_dir.join("audit.jsonl")),
         ))

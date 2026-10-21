@@ -1,0 +1,72 @@
+# Builds a release on a `v*` tag: one archive per platform holding toto and the OpenShell release it
+# is pinned to (openshell.lock.toml, ADR 17), plus a SHA256SUMS file. toto itself downloads the
+# OpenShell archives and checks each against the lock, so a release never ships a binary the lock
+# does not name.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { platform: x86_64-linux, os: ubuntu-24.04 }
+          - { platform: aarch64-linux, os: ubuntu-24.04-arm }
+          - { platform: aarch64-macos, os: macos-14 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: The OpenShell pin is complete
+        run: scripts/pin-openshell.sh --check
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package toto with its OpenShell
+        run: |
+          set -euo pipefail
+          name="toto-${GITHUB_REF_NAME}-${{ matrix.platform }}"
+          mkdir -p "dist/$name"
+          cp target/release/toto "dist/$name/"
+          ./target/release/toto openshell install --vm --platform "${{ matrix.platform }}" --dest "dist/$name"
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' openshell.lock.toml)"
+          mkdir -p "dist/$name/licenses/openshell"
+          for f in LICENSE NOTICE; do
+            curl -fsSL "https://raw.githubusercontent.com/NVIDIA/OpenShell/v${version}/$f" -o "dist/$name/licenses/openshell/$f" || [ "$f" = NOTICE ]
+          done
+          cp README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: dist/*.tar.gz
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum *.tar.gz > SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS --title "$GITHUB_REF_NAME" --generate-notes

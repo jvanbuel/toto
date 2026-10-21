@@ -99,7 +99,7 @@ A task is a self-contained, signed manifest plus an input bundle; runners need n
 | Queue client | Authenticates the runner (its own keypair, not the AI account), claims leases, renews heartbeats, submits results |
 | Manifest verifier | Checks project signature, schema and that the sandbox profile is within contributor policy |
 | Harness (Omnigent) | A `Harness` trait; as built, it runs the project's own Omnigent agent directory inside the project's image, behind the credential proxy (ADR 13) |
-| Sandbox manager | Starts a hardened container per task from the project's approved dev container image, unpacks inputs, applies limits; no network unless the agent needs one and the contributor fenced it (ADR 13) |
+| Sandbox manager | Starts an OpenShell sandbox per task from the project's approved dev container image (Landlock, seccomp, read-only image), unpacks inputs, applies limits; no network but toto's credential proxy and the agent's approved egress rules, enforced per request (ADR 17) |
 | Usage meter | Tracks tokens/minutes per task against caps; hard-stops a task that exceeds its estimate by a set margin |
 | Result packager | Validates output against `output_schema`, hashes it, signs it with the runner key, attaches run metadata |
 | Local audit log | Append-only record of every task, project and cost (`toto audit`) |
@@ -133,12 +133,12 @@ Treat every task as hostile: an agent executing a stranger's instructions on a c
 | Threat | Mitigation |
 | --- | --- |
 | Prompt injection tells the agent to read `~/.ssh`, browser data or AI tokens | No host filesystem in the sandbox; inputs mounted read-only; credentials never mounted (see Credential handling) |
-| Exfiltration over the network | Default-deny egress; per-task allowlist (e.g. package registries) capped by contributor policy |
+| Exfiltration over the network | Default-deny egress; the project's approved egress rules (method, host, path) enforced by OpenShell's supervisor |
 | Resource abuse (crypto mining, fork bombs) | CPU, RAM, disk and wall-clock limits per task |
 | Quota draining | Usage meter hard caps; per-task cost estimate with abort margin |
 | Malicious or compromised project | Signed manifests, project suspension, contributor allowlists, reputation |
 | Tampered results or fake runners | Signed results, redundancy, reputation, later zkTLS proofs |
-| Sandbox escape | Prefer microVMs (Firecracker, gVisor) over plain containers; auto-update the runner |
+| Sandbox escape | Landlock and seccomp on an unprivileged, capability-less workload (OpenShell); its MicroVM driver next; auto-update the runner |
 
 `toto` should ship with the strictest profile on by default; contributors can only loosen it per project.
 

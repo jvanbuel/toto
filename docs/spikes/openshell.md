@@ -1,8 +1,9 @@
 # Spike: NVIDIA OpenShell as toto's sandbox
 
 - Date: 2026-10-21
-- Result: **it works.** toto's full pipeline runs on OpenShell unchanged, including a networked project whose egress rules OpenShell enforces per request. Recommended as an experimental backend now (`"sandbox": {"kind": "openshell"}`), and as the default on macOS once it has run on a Mac.
-- Code: `src/openshell.rs`, the `openshell` sandbox kind in `src/config.rs`, the proxy's keyed TCP listener in `src/proxy.rs`, `agent::with_external_egress`. Tests: `openshell_unit` (always), `the_same_pipeline_runs_on_openshell` and `a_projects_egress_rules_are_enforced_by_openshell` (live, behind `TOTO_OPENSHELL_BIN` and `TOTO_OPENSHELL_NET=1`).
+- Result: **it works.** toto's full pipeline runs on OpenShell unchanged, including a networked project whose egress rules OpenShell enforces per request.
+- Outcome: ADR 17 makes OpenShell toto's one sandbox, shipped with toto and run through a private gateway toto manages. The contributor setup described below is now done by toto (`src/openshell_gateway.rs`); this page records the spike as it was.
+- Code: `src/openshell.rs`, the `openshell` sandbox kind in `src/config.rs`, the proxy's keyed TCP listener in `src/proxy.rs`, `agent::with_external_egress`. Tests: `openshell_unit` (always), `the_same_pipeline_runs_on_openshell` and `a_projects_egress_rules_are_enforced_by_openshell` (live, behind `TOTO_OPENSHELL_BIN_DIR` and `TOTO_OPENSHELL_NET=1`; see `openshell_sandbox` in `src/tests.rs`).
 
 ## Why look at it
 
