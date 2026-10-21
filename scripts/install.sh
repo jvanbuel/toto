@@ -4,12 +4,12 @@
 # (~/.local/share/toto/<version>) and only `toto` is linked into ~/.local/bin, so an OpenShell
 # you installed yourself is never replaced.
 #
-#   curl -fsSL https://raw.githubusercontent.com/jvanbuel/togra/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/jvanbuel/toto/main/scripts/install.sh | sh
 #
 # TOTO_VERSION=v0.2.0 picks a release; TOTO_BIN_DIR and TOTO_HOME other directories. Needs curl
 # and tar, and Docker (OpenShell runs sandboxes on it).
 set -eu
-REPO="${TOTO_REPO:-jvanbuel/togra}"
+REPO="${TOTO_REPO:-jvanbuel/toto}"
 BIN_DIR="${TOTO_BIN_DIR:-$HOME/.local/bin}"
 TOTO_HOME="${TOTO_HOME:-$HOME/.local/share/toto}"
 

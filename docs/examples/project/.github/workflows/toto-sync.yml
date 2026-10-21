@@ -39,7 +39,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install toto
-        run: cargo install --locked --git https://github.com/jvanbuel/togra toto-runner
+        run: cargo install --locked --git https://github.com/jvanbuel/toto toto-runner
       - name: Sync
         env:
           GITHUB_TOKEN: ${{ secrets.TOTO_TOKEN || secrets.GITHUB_TOKEN }}

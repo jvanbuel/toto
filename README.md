@@ -35,7 +35,7 @@ cargo run -- demo
 ## Contributor quick start
 
 ```
-curl -fsSL https://raw.githubusercontent.com/jvanbuel/togra/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/jvanbuel/toto/main/scripts/install.sh | sh
                                             # toto plus its pinned OpenShell; needs Docker
                                             # (from source: cargo build --release && toto openshell install)
 toto init                                   # ~/.config/toto: runner key, strict starter config

@@ -9,7 +9,7 @@ Goal: run one task through the real chain (daemon, OpenShell sandbox, the projec
 
 ## 1. Install
 
-From a release: `curl -fsSL https://raw.githubusercontent.com/jvanbuel/togra/main/scripts/install.sh | sh` installs toto with its pinned OpenShell.
+From a release: `curl -fsSL https://raw.githubusercontent.com/jvanbuel/toto/main/scripts/install.sh | sh` installs toto with its pinned OpenShell.
 
 From source:
 
