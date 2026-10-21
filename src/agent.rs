@@ -197,3 +197,27 @@ pub fn unpack(tar: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
 pub fn hash(tar: &[u8]) -> String {
     archive::sha256_hex(tar)
 }
+
+/// The approved agent directory as a sandbox that enforces the egress rules itself runs it
+/// (OpenShell): Omnigent's own network sandbox (`os_env.sandbox`) is replaced by `{type: none}`
+/// (with `allow_network: true` for a networked agent), because a nested bubblewrap cannot start there and the very
+/// same rules are enforced from outside the workload instead. Everything else stays byte for byte
+/// as approved. Returns the tar unchanged when the agent has no `os_env.sandbox`.
+pub fn with_external_egress(tar: &[u8]) -> Result<Vec<u8>> {
+    let mut records = archive::from_bytes(tar, archive::Limits::new(MAX_BYTES)).map_err(Error::Policy)?;
+    let Some(archive::Record::File { data, .. }) = records.iter_mut().find(|r| matches!(r, archive::Record::File { path, .. } if path == "config.yaml")) else {
+        return Err(Error::Policy("agent directory: no config.yaml".into()));
+    };
+    let mut v: serde_yaml_ng::Value = serde_yaml_ng::from_slice(data).map_err(|e| Error::Policy(format!("agent config.yaml: {e}")))?;
+    let Some(sandbox) = v.get_mut("os_env").and_then(|o| o.get_mut("sandbox")) else { return Ok(tar.to_vec()) };
+    let allow = sandbox.get("allow_network").and_then(serde_yaml_ng::Value::as_bool).unwrap_or(false);
+    let mut replaced = serde_yaml_ng::Mapping::new();
+    replaced.insert("type".into(), "none".into());
+    if allow {
+        // Omnigent rejects `allow_network: false` with `type: none` ("cannot restrict network").
+        replaced.insert("allow_network".into(), true.into());
+    }
+    *sandbox = serde_yaml_ng::Value::Mapping(replaced);
+    *data = serde_yaml_ng::to_string(&v).map_err(|e| Error::Policy(e.to_string()))?.into_bytes();
+    archive::to_bytes(&records).map_err(Error::Policy)
+}

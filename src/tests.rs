@@ -298,7 +298,7 @@ mod daemon {
     #[test]
     fn exec_times_out_and_captures_output() {
         let f = fixture("exec");
-        let ws = Workspace { task_id: "x".into(), path: f.dir.clone(), exec_prefix: vec![] };
+        let ws = Workspace::host("x", f.dir.clone());
         let ok = exec(&ws, &["sh", "-c", "echo hi"], Duration::from_secs(5)).unwrap();
         assert_eq!(String::from_utf8_lossy(&ok.stdout).trim(), "hi");
         let started = std::time::Instant::now();
@@ -926,6 +926,38 @@ mod proxy {
     const SSE: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":999,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":20}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
+    fn the_tcp_listener_serves_only_requests_carrying_its_key() {
+        use std::io::{Read, Write};
+        let f = fixture("px-tcp");
+        let (url, seen) = upstream(200, "application/json", b"{}".to_vec());
+        let p = start(&f, &url, Auth::ApiKey("REAL-KEY".into()));
+        let key = "k".repeat(40);
+        assert!(p.listen_tcp("127.0.0.1:0".parse().unwrap(), "short").is_err(), "a guessable key is refused");
+        let addr = p.listen_tcp("127.0.0.1:0".parse().unwrap(), &key).unwrap();
+        let send = |hdr: &str| {
+            let mut c = std::net::TcpStream::connect(addr).unwrap();
+            c.write_all(&post("/v1/messages", hdr, "{}")).unwrap();
+            let mut out = vec![];
+            c.read_to_end(&mut out).unwrap();
+            String::from_utf8_lossy(&out).split_whitespace().nth(1).unwrap_or("").parse::<u16>().unwrap_or(0)
+        };
+        assert_eq!(send(""), 403, "no key");
+        assert_eq!(send("authorization: Bearer wrong-key-wrong-key-wrong-key-wrong\r\n"), 403);
+        assert!(seen.lock().unwrap().is_empty(), "nothing reached the provider");
+        assert_eq!(send(&format!("authorization: Bearer {key}\r\n")), 200);
+        assert_eq!(send(&format!("x-api-key: {key}\r\n")), 200);
+        let s = seen.lock().unwrap();
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].header("x-api-key"), ["REAL-KEY"], "the sandbox's key is replaced, never forwarded");
+        assert!(!format!("{:?}", s[0].headers).contains(&key));
+        drop(s);
+        let (st, _) = call(p.socket(), &post("/v1/messages", "", "{}"));
+        assert_eq!(st, 200, "the relay's Unix socket still needs no key");
+        p.stop();
+        assert!(std::net::TcpStream::connect(addr).is_err(), "stopping closes the TCP listener too");
+    }
+
+    #[test]
     fn real_credential_replaces_whatever_the_client_sends() {
         let f = fixture("px-auth");
         let (url, seen) = upstream(200, "application/json", b"{}".to_vec());
@@ -1293,6 +1325,125 @@ mod omnigent_in_container {
         dir
     }
 
+    /// The same pipeline on NVIDIA OpenShell (docs/spikes/openshell.md). Runs only when
+    /// `TOTO_OPENSHELL_BIN` names an `openshell` CLI whose active gateway uses the Docker driver.
+    #[test]
+    fn the_same_pipeline_runs_on_openshell() {
+        use crate::archive::{self, Record};
+        use crate::config::{Config, HarnessConfig, ProviderConfig, SandboxConfig};
+        use crate::queue::DirQueue;
+        use chrono::Local;
+        let Some(bin) = std::env::var("TOTO_OPENSHELL_BIN").ok().filter(|b| std::path::Path::new(b).exists()) else {
+            eprintln!("skipping: set TOTO_OPENSHELL_BIN to an openshell CLI with a running gateway");
+            return;
+        };
+        if !docker_has("toto-omnigent-test") {
+            eprintln!("skipping: needs the toto-omnigent-test image");
+            return;
+        }
+        let f = fixture("omni-openshell");
+        let (url, seen) = fake_scripted(vec![
+            ("ToolSearch", serde_json::json!({"query": "select:mcp__omnigent__sys_os_shell", "max_results": 1})),
+            ("mcp__omnigent__sys_os_shell", serde_json::json!({"command": "cat calc.txt; echo fixed > calc.txt; ls /tmp/toto-agent/skills; id -u; pwd; echo secret-check=${ANTHROPIC_AUTH_TOKEN:-unset}; python3 -c 'import urllib.request as u; u.urlopen(\"https://example.com\", timeout=5)' 2>&1 | tail -1"})),
+        ]);
+        let mut cfg = Config::starter(&f.dir);
+        cfg.sandbox = SandboxConfig::Openshell { bin, gateway: None, proxy_bind: None };
+        cfg.harness = HarnessConfig::Omnigent { provider: ProviderConfig::Anthropic, upstream: Some(url), token_file: None, api_key_file: None };
+        cfg.policy = super::policy();
+        cfg.policy.daily_token_cap = 10_000_000;
+        cfg.projects.insert("a".into(), hex::encode(f.key_a.verifying_key().to_bytes()));
+        let files = agent_dir("claude-sdk", "claude-fake", NO_SANDBOX, &[("triage", "---\nname: triage\ndescription: t\n---\nTriage.")]);
+        cfg.environments.insert("a".into(), approval("toto-omnigent-test", &files));
+        std::fs::create_dir_all(&cfg.state_dir).unwrap();
+        crate::secrets::save_token(&cfg.token_path(), "REAL-SECRET-TOKEN").unwrap();
+
+        // 4.5 MB of unchanged input exercises the chunked transfer (OpenShell's stdin takes 4 MiB).
+        let big: Vec<u8> = (0..4_500_000u32).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect();
+        let q = DirQueue::new(&cfg.queue_dir).unwrap();
+        let inputs = q.post_bundle(&archive::to_bytes(&[Record::File { path: "calc.txt".into(), mode: 0o644, data: b"bug\n".to_vec() }, Record::File { path: "data/big.bin".into(), mode: 0o644, data: big }]).unwrap()).unwrap();
+        let mut t = task("os1", "a", 100000, &f.key_a);
+        t.prompt = "RUN-THE-TOOL".into();
+        t.inputs = inputs;
+        t.sandbox_profile.timeout_secs = 170;
+        t.output_schema.max_artifact_bytes = 1 << 20;
+        t.output_schema.max_bytes = 10_000;
+        q.post(&t.sign(&f.key_a).unwrap()).unwrap();
+
+        let mut runner = cfg.build().unwrap();
+        runner.sandbox.probe().unwrap();
+        let started = std::time::Instant::now();
+        let tick = runner.tick(Local::now()).unwrap();
+        eprintln!("FACT openshell pipeline took {:?}", started.elapsed());
+        assert_eq!(tick, crate::runner::Tick::Submitted("os1".into()), "audit: {:?}", runner.audit.entries().unwrap());
+        let results = q.results().unwrap();
+        let body = results[0].open().unwrap();
+        assert!(body.output.contains("DONE-FROM-FAKE-API"), "{}", body.output);
+        eprintln!("FACT openshell output {:?}", body.output);
+        let recs = results[0].artifact_records(1 << 22).unwrap();
+        assert_eq!(recs, vec![Record::File { path: "calc.txt".into(), mode: 0o644, data: b"fixed\n".to_vec() }], "only the changed input comes back");
+        let bodies = seen.lock().unwrap().clone();
+        let last = bodies.iter().map(|(_, b)| b.as_str()).filter(|b| b.contains("tool_result")).max_by_key(|b| b.matches("tool_result").count()).expect("tool results reached the model");
+        let shown = &last[last.find("tool_result").unwrap_or(0)..];
+        for want in ["bug", "triage", "65534", "/work", "secret-check=", "ermission denied"] {
+            assert!(shown.contains(want), "the agent should have seen {want:?} in: {}", &shown[..shown.len().min(900)]);
+        }
+        assert!(!shown.contains("secret-check=not-a-credential") && !shown.contains("secret-check=unset"), "the agent holds the proxy's key: {}", &shown[..shown.len().min(900)]);
+        assert!(bodies.iter().filter(|(h, _)| h.iter().any(|(k, v)| k == "path" && v.starts_with("/v1/messages"))).all(|(h, _)| h.iter().any(|(k, v)| k == "authorization" && v == "Bearer REAL-SECRET-TOKEN")), "every model call carried the proxy's credential");
+        let log = runner.audit.entries().unwrap();
+        assert!(log[0].outcome == "submitted" && log[0].tokens > 50, "metered by the proxy: {log:?}");
+        assert!(!bodies.iter().any(|(_, b)| b.contains("REAL-SECRET")));
+    }
+
+    /// A networked project on OpenShell: its Omnigent egress rules become OpenShell rules that
+    /// allow exactly the listed method and path, on any OS. Needs `TOTO_OPENSHELL_BIN` and
+    /// `TOTO_OPENSHELL_NET=1` (the gateway must reach pypi.org).
+    #[test]
+    fn a_projects_egress_rules_are_enforced_by_openshell() {
+        use crate::config::{Config, HarnessConfig, ProviderConfig, SandboxConfig};
+        use crate::queue::DirQueue;
+        use chrono::Local;
+        let Some(bin) = std::env::var("TOTO_OPENSHELL_BIN").ok().filter(|b| std::path::Path::new(b).exists() && std::env::var("TOTO_OPENSHELL_NET").is_ok_and(|v| v == "1")) else {
+            eprintln!("skipping: set TOTO_OPENSHELL_BIN and TOTO_OPENSHELL_NET=1");
+            return;
+        };
+        let f = fixture("omni-openshell-net");
+        let probe = "import urllib.request as u\nfor m, url in [('GET', 'https://pypi.org/simple/requests/'), ('GET', 'https://pypi.org/pypi/requests/json'), ('GET', 'https://files.pythonhosted.org/')]:\n    try: print('NET', m, url, u.urlopen(u.Request(url, method=m), timeout=20).status)\n    except u.HTTPError as e: print('NET', m, url, e.code, e.read()[:40])\n    except Exception as e: print('NET', m, url, type(e).__name__)\n";
+        let (url, seen) = fake_scripted(vec![
+            ("ToolSearch", serde_json::json!({"query": "select:mcp__omnigent__sys_os_shell", "max_results": 1})),
+            ("mcp__omnigent__sys_os_shell", serde_json::json!({"command": format!("python3 -c \"$(printf '%s' '{}' | base64 -d)\"", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, probe))})),
+        ]);
+        let mut cfg = Config::starter(&f.dir);
+        cfg.sandbox = SandboxConfig::Openshell { bin, gateway: None, proxy_bind: None };
+        cfg.harness = HarnessConfig::Omnigent { provider: ProviderConfig::Anthropic, upstream: Some(url), token_file: None, api_key_file: None };
+        cfg.policy = super::policy();
+        cfg.policy.daily_token_cap = 10_000_000;
+        cfg.projects.insert("a".into(), hex::encode(f.key_a.verifying_key().to_bytes()));
+        let net = "os_env:\n  type: caller_process\n  cwd: \".\"\n  sandbox: {type: none, allow_network: true, egress_rules: [\"GET pypi.org/simple/**\"]}";
+        let files = agent_dir("claude-sdk", "claude-fake", net, &[]);
+        let approval = approval("toto-omnigent-test", &files);
+        assert!(approval.agent.needs_network && approval.agent.egress_rules == ["GET pypi.org/simple/**"], "{:?}", approval.agent);
+        cfg.environments.insert("a".into(), approval);
+        std::fs::create_dir_all(&cfg.state_dir).unwrap();
+        crate::secrets::save_token(&cfg.token_path(), "REAL-SECRET-TOKEN").unwrap();
+        let q = DirQueue::new(&cfg.queue_dir).unwrap();
+        let mut t = task("osn1", "a", 100000, &f.key_a);
+        t.prompt = "RUN-THE-TOOL".into();
+        t.inputs = q.post_bundle(&crate::archive::to_bytes(&[]).unwrap()).unwrap();
+        t.sandbox_profile.timeout_secs = 170;
+        t.output_schema.max_bytes = 10_000;
+        q.post(&t.sign(&f.key_a).unwrap()).unwrap();
+        let mut runner = cfg.build().unwrap();
+        let tick = runner.tick(Local::now()).unwrap();
+        assert_eq!(tick, crate::runner::Tick::Submitted("osn1".into()), "audit: {:?}", runner.audit.entries().unwrap());
+        let bodies = seen.lock().unwrap().clone();
+        let last = bodies.iter().map(|(_, b)| b.clone()).filter(|b| b.contains("tool_result")).max_by_key(|b| b.matches("tool_result").count()).unwrap();
+        let shown = &last[last.find("NET").unwrap_or(0)..];
+        eprintln!("FACT {}", &shown[..shown.len().min(400)]);
+        assert!(shown.contains("simple/requests/ 200"), "the listed request is allowed: {shown}");
+        assert!(shown.contains("requests/json 403") && shown.contains("policy_denied"), "another path on the same host is refused: {shown}");
+        assert!(shown.contains("files.pythonhosted.org/ URLError") || shown.contains("files.pythonhosted.org/ PermissionError"), "an unlisted host is refused: {shown}");
+    }
+
     /// The whole pipeline, as the daemon runs it: the project's agent directory (with a skill) and
     /// image are approved; a task with inputs runs; Omnigent inside the image runs a shell tool as
     /// an unprivileged user; the credential never enters the container; only the changed file comes back.
@@ -1398,7 +1549,7 @@ mod omnigent_in_container {
         let proxy = Arc::new(AuthProxy::start(&sock_dir(&f).join("p.sock"), &url, crate::proxy::Provider::Anthropic, Auth::Bearer { token: "x".into(), oauth: true }).unwrap());
         let mut h = OmnigentHarness::new(proxy, crate::proxy::Provider::Anthropic);
         h.agents.insert("a".into(), ApprovedAgent { tar: vec![], harness: "codex".into() });
-        let ws = Workspace { task_id: "t".into(), path: Default::default(), exec_prefix: vec!["docker".into(), "exec".into(), "-i".into(), "nothing".into()] };
+        let ws = Workspace::docker("t", vec!["docker".into(), "exec".into(), "-i".into(), "nothing".into()]);
         let e = h.run(&task("t", "a", 1, &f.key_a), &ws, &mut UsageMeter::new(100, 25)).unwrap_err().to_string();
         assert!(e.contains("codex") && e.contains("OpenAi"), "{e}");
         let e = h.run(&task("t", "b", 1, &f.key_a), &ws, &mut UsageMeter::new(100, 25)).unwrap_err().to_string();
@@ -3499,5 +3650,68 @@ mod prebuild {
         assert!(text.contains("CapEff:\t0000000000000000"), "the prebuild ran without capabilities: {text}");
         assert!(text.contains("post: No such file") && text.contains("/host: No such file"), "postCreateCommand did not run and the host mount was dropped: {text}");
         assert!(text.trim().ends_with("65534"), "the task still runs unprivileged in the snapshot: {text}");
+    }
+}
+
+mod openshell_unit {
+    use crate::openshell::OpenShellSandbox;
+    use crate::sandbox::{ExecStyle, Workspace};
+
+    #[test]
+    fn the_policy_allows_only_the_proxy_and_never_root() {
+        let y = OpenShellSandbox::policy_yaml(Some(41234), &[]).unwrap();
+        for want in ["compatibility: hard_requirement", "run_as_user: \"65534\"", "read_only: [\"/\"]", "read_write: [\"/work\", \"/tmp\"", "include_workdir: false", "host: host.openshell.internal", "port: 41234"] {
+            assert!(y.contains(want), "missing `{want}` in\n{y}");
+        }
+        assert!(!y.contains("read_write: [\"/\""), "nothing in the image is writable but /tmp and the work directory");
+        assert_eq!(y.matches("host:").count(), 1, "one destination");
+        assert!(OpenShellSandbox::policy_yaml(None, &[]).unwrap().contains("network_policies: {}"), "no proxy, no network at all");
+        let rules = ["GET,HEAD api.github.com/repos/org/**".to_string(), "POST api.github.com/graphql".to_string(), "* *.pythonhosted.org/**".to_string()];
+        let y = OpenShellSandbox::policy_yaml(Some(1), &rules).unwrap();
+        assert_eq!(y.matches("host: \"api.github.com\"").count(), 1, "one rule per host: {y}");
+        for want in ["method: \"GET\"\n              path: \"/repos/org/**\"", "method: \"HEAD\"", "method: \"POST\"\n              path: \"/graphql\"", "host: \"*.pythonhosted.org\"", "method: \"*\"", "enforcement: enforce", "port: 443"] {
+            assert!(y.contains(want), "missing `{want}` in\n{y}");
+        }
+        assert!(OpenShellSandbox::policy_yaml(None, &["GET *.org/x".to_string()]).is_err(), "a too-broad wildcard is refused");
+        assert_eq!(OpenShellSandbox::sandbox_name("T1_a.b"), "toto-t1ab");
+        let d: serde_json::Value = serde_json::from_str(&OpenShellSandbox::driver_config_json()).unwrap();
+        assert_eq!(d["docker"]["mounts"][0]["target"], "/work");
+        assert_eq!(d["docker"]["mounts"][0]["size_bytes"], 512 << 20);
+        assert_eq!(d["docker"]["mounts"][1]["target"], "/tmp");
+    }
+
+    #[test]
+    fn on_openshell_omnigents_own_network_sandbox_is_turned_off_and_nothing_else_changes() {
+        let mut files = std::collections::BTreeMap::new();
+        let cfg = "spec_version: 1\nname: a\nexecutor:\n  type: omnigent\n  config: {harness: claude-sdk}\n  model: m\nprompt: Do it.\nos_env:\n  type: caller_process\n  cwd: \".\"\n  sandbox: {type: linux_bwrap, allow_network: true, egress_rules: [\"GET pypi.org/simple/**\"]}\n";
+        files.insert("config.yaml".to_string(), cfg.as_bytes().to_vec());
+        files.insert("skills/x/SKILL.md".to_string(), b"skill".to_vec());
+        let tar = crate::agent::pack(&files).unwrap();
+        let out = crate::agent::unpack(&crate::agent::with_external_egress(&tar).unwrap()).unwrap();
+        assert_eq!(out["skills/x/SKILL.md"], b"skill", "the rest is byte for byte");
+        let v: serde_yaml_ng::Value = serde_yaml_ng::from_slice(&out["config.yaml"]).unwrap();
+        assert_eq!(v["os_env"]["sandbox"]["type"].as_str(), Some("none"));
+        assert_eq!(v["os_env"]["sandbox"]["allow_network"].as_bool(), Some(true));
+        assert!(v["os_env"]["sandbox"].get("egress_rules").is_none(), "OpenShell enforces them instead");
+        assert_eq!((v["prompt"].as_str(), v["os_env"]["cwd"].as_str()), (Some("Do it."), Some(".")));
+        let offline = crate::agent::pack(&std::collections::BTreeMap::from([("config.yaml".to_string(), b"spec_version: 1\nos_env:\n  sandbox: {type: linux_bwrap}\n".to_vec())])).unwrap();
+        let v: serde_yaml_ng::Value = serde_yaml_ng::from_slice(&crate::agent::unpack(&crate::agent::with_external_egress(&offline).unwrap()).unwrap()["config.yaml"]).unwrap();
+        assert!(v["os_env"]["sandbox"].get("allow_network").is_none(), "Omnigent refuses `allow_network: false` with type none: {v:?}");
+        let plain = crate::agent::pack(&std::collections::BTreeMap::from([("config.yaml".to_string(), b"spec_version: 1\nprompt: p\n".to_vec())])).unwrap();
+        assert_eq!(crate::agent::with_external_egress(&plain).unwrap(), plain, "no os_env.sandbox, no change");
+    }
+
+    #[test]
+    fn each_exec_style_gets_env_and_workdir_its_own_way() {
+        let envs = [("A".to_string(), "1".to_string())];
+        let d = Workspace::docker("t", ["docker", "exec", "-i", "c1"].map(String::from).to_vec()).with_env(&envs).unwrap();
+        assert_eq!(d.exec_prefix, ["docker", "exec", "-i", "-e", "A=1", "-w", "/workspace", "c1"]);
+        let mut o = Workspace::docker("t", ["openshell", "sandbox", "exec", "-n", "s1", "--no-login-shell", "--"].map(String::from).to_vec());
+        (o.style, o.workdir) = (ExecStyle::OpenShell, "/sandbox".into());
+        let o = o.with_env(&envs).unwrap();
+        assert_eq!(o.exec_prefix, ["openshell", "sandbox", "exec", "-n", "s1", "--no-login-shell", "--env", "A=1", "--workdir", "/sandbox", "--"]);
+        let mut bad = Workspace::docker("t", vec!["openshell".into()]);
+        bad.style = ExecStyle::OpenShell;
+        assert!(bad.with_env(&envs).is_err());
     }
 }

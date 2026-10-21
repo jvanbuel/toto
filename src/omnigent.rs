@@ -11,7 +11,7 @@ use crate::harness::Harness;
 use crate::manifest::TaskManifest;
 use crate::meter::UsageMeter;
 use crate::proxy::{AuthProxy, Provider};
-use crate::sandbox::{exec_io, Workspace, PROXY_ADDR};
+use crate::sandbox::{exec_io, Workspace};
 use crate::{Error, Result};
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -53,19 +53,16 @@ impl Harness for OmnigentHarness {
             Some(p) => return Err(Error::Harness(format!("project `{}` uses harness `{}`, which needs {p:?} credentials; this runner has {:?}", task.project_id, agent.harness, self.provider))),
             None => return Err(Error::Harness(format!("unknown harness `{}`", agent.harness))),
         }
-        let (name, head) = ws.exec_prefix.split_last().ok_or_else(|| Error::Harness("the omnigent harness needs a container sandbox".into()))?;
-        let base_url = format!("http://{PROXY_ADDR}");
+        if ws.exec_prefix.is_empty() {
+            return Err(Error::Harness("the omnigent harness needs a container sandbox".into()));
+        }
+        let (base_url, key) = (ws.proxy.url.clone(), ws.proxy.key.clone());
         let mut envs: Vec<(String, String)> = vec![("HOME".into(), "/tmp/home".into()), ("TERM".into(), "dumb".into()), ("DISABLE_AUTOUPDATER".into(), "1".into()), ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into())];
         match self.provider {
-            Provider::Anthropic => envs.extend([("ANTHROPIC_BASE_URL".into(), base_url), ("ANTHROPIC_AUTH_TOKEN".into(), "not-a-credential".into())]),
-            Provider::OpenAi => envs.extend([("OPENAI_BASE_URL".into(), format!("{base_url}/v1")), ("OPENAI_API_KEY".into(), "not-a-credential".into())]),
+            Provider::Anthropic => envs.extend([("ANTHROPIC_BASE_URL".into(), base_url), ("ANTHROPIC_AUTH_TOKEN".into(), key)]),
+            Provider::OpenAi => envs.extend([("OPENAI_BASE_URL".into(), format!("{base_url}/v1")), ("OPENAI_API_KEY".into(), key)]),
         }
-        let mut prefix: Vec<String> = head.to_vec();
-        for (k, v) in &envs {
-            prefix.extend(["-e".into(), format!("{k}={v}")]);
-        }
-        prefix.extend(["-w".into(), "/workspace".into(), name.clone()]);
-        let sh = Workspace { task_id: ws.task_id.clone(), path: ws.path.clone(), exec_prefix: prefix };
+        let sh = ws.with_env(&envs)?;
 
         // The approved agent directory and the prompt go in through stdin: nothing of the task
         // appears in a process list or hits argument-length limits.

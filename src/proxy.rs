@@ -81,6 +81,41 @@ pub struct AuthProxy {
     shared: Arc<Shared>,
     socket: PathBuf,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The optional TCP listener (`listen_tcp`): its address and accept loop.
+    tcp: std::sync::Mutex<Option<(std::net::SocketAddr, std::thread::JoinHandle<()>)>>,
+}
+
+/// Bridges any stream the proxy serves: a Unix socket (behind the relay) or TCP (`listen_tcp`).
+trait Conn: Send + 'static
+where
+    for<'a> &'a Self: Read + Write,
+{
+}
+impl Conn for UnixStream {}
+impl Conn for std::net::TcpStream {}
+
+/// One accept loop. `key`: when set, a request is served only if it carries this key as its
+/// bearer token or `x-api-key` (the TCP listener can be reached by any local process).
+fn accept_loop<S: Conn + Timeout>(s: Arc<Shared>, incoming: impl Iterator<Item = std::io::Result<S>>, key: Option<String>)
+where
+    for<'a> &'a S: Read + Write,
+{
+    for conn in incoming {
+        if s.stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let Ok(conn) = conn else { continue };
+        if s.active.load(Ordering::Relaxed) >= MAX_CONNECTIONS as u64 {
+            let _ = respond_error(&conn, 503, "too many connections");
+            continue;
+        }
+        s.active.fetch_add(1, Ordering::Relaxed);
+        let (s2, key) = (s.clone(), key.clone());
+        std::thread::spawn(move || {
+            let _ = handle(&s2, conn, key.as_deref());
+            s2.active.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
 }
 
 impl AuthProxy {
@@ -94,25 +129,31 @@ impl AuthProxy {
         std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o666))?;
         let shared = Arc::new(Shared { provider, upstream: upstream.trim_end_matches('/').to_string(), auth, quota: Default::default(), tokens: 0.into(), requests: 0.into(), active: 0.into(), stop: false.into() });
         let s = shared.clone();
-        let thread = std::thread::spawn(move || {
-            for conn in listener.incoming() {
-                if s.stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                let Ok(conn) = conn else { continue };
-                if s.active.load(Ordering::Relaxed) >= MAX_CONNECTIONS as u64 {
-                    let _ = respond_error(&conn, 503, "too many connections");
-                    continue;
-                }
-                s.active.fetch_add(1, Ordering::Relaxed);
-                let s2 = s.clone();
-                std::thread::spawn(move || {
-                    let _ = handle(&s2, conn);
-                    s2.active.fetch_sub(1, Ordering::Relaxed);
-                });
-            }
-        });
-        Ok(Self { shared, socket: socket.to_path_buf(), thread: Some(thread) })
+        let thread = std::thread::spawn(move || accept_loop(s, listener.incoming(), None));
+        Ok(Self { shared, socket: socket.to_path_buf(), thread: Some(thread), tcp: Default::default() })
+    }
+
+    /// Also serves on TCP at `addr` (port 0 picks one), for sandboxes that reach the host over a
+    /// network path instead of the exec-stream relay (OpenShell). Any local process can connect
+    /// there, so every request must carry `key`, the secret handed to the sandbox, as its bearer
+    /// token or `x-api-key`; it is never forwarded. Returns the bound address.
+    pub fn listen_tcp(&self, addr: std::net::SocketAddr, key: &str) -> Result<std::net::SocketAddr> {
+        if key.len() < 32 {
+            return Err(Error::Harness("the proxy's TCP key must be at least 32 characters".into()));
+        }
+        if self.tcp.lock().unwrap().is_some() {
+            return Err(Error::Harness("the proxy already listens on TCP".into()));
+        }
+        let listener = std::net::TcpListener::bind(addr)?;
+        let bound = listener.local_addr()?;
+        let (s, key) = (self.shared.clone(), key.to_string());
+        let thread = std::thread::spawn(move || accept_loop(s, listener.incoming(), Some(key)));
+        *self.tcp.lock().unwrap() = Some((bound, thread));
+        Ok(bound)
+    }
+
+    pub fn tcp_addr(&self) -> Option<std::net::SocketAddr> {
+        self.tcp.lock().unwrap().as_ref().map(|t| t.0)
     }
 
     /// Tokens counted from upstream responses so far: input + cache creation + output.
@@ -143,6 +184,10 @@ impl AuthProxy {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+        if let Some((addr, t)) = self.tcp.lock().unwrap().take() {
+            let _ = std::net::TcpStream::connect(addr);
+            let _ = t.join();
+        }
         let _ = std::fs::remove_file(&self.socket);
     }
 }
@@ -153,7 +198,11 @@ impl Drop for AuthProxy {
     }
 }
 
-fn respond_error(mut conn: &UnixStream, status: u16, msg: &str) -> std::io::Result<()> {
+fn respond_error<S>(conn: &S, status: u16, msg: &str) -> std::io::Result<()>
+where
+    for<'a> &'a S: Write,
+{
+    let mut conn = conn;
     let body = format!(r#"{{"type":"error","error":{{"type":"toto_proxy_error","message":"{msg}"}}}}"#);
     write!(conn, "HTTP/1.1 {status} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", reason(status), body.len())
 }
@@ -170,8 +219,11 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-fn handle(sh: &Shared, conn: UnixStream) -> std::io::Result<()> {
-    conn.set_read_timeout(Some(Duration::from_secs(60)))?;
+fn handle<S: Conn + Timeout>(sh: &Shared, conn: S, key: Option<&str>) -> std::io::Result<()>
+where
+    for<'a> &'a S: Read + Write,
+{
+    conn.read_timeout(Duration::from_secs(60))?;
     let mut reader = BufReader::new(&conn);
     // request line and headers
     let mut head = String::new();
@@ -196,6 +248,16 @@ fn handle(sh: &Shared, conn: UnixStream) -> std::io::Result<()> {
     if (method == "HEAD" || method == "GET") && path == "/api/hello" {
         return write!(&conn, "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
     }
+    if let Some(key) = key {
+        let given = headers.iter().find_map(|(k, v)| match k.as_str() {
+            "authorization" => v.strip_prefix("Bearer ").map(str::trim),
+            "x-api-key" => Some(v.as_str()),
+            _ => None,
+        });
+        if !given.is_some_and(|g| constant_eq(g.as_bytes(), key.as_bytes())) {
+            return respond_error(&conn, 403, "this proxy needs the key it gave the sandbox");
+        }
+    }
     if !sh.provider.allows(&method, path) {
         return respond_error(&conn, 403, "this proxy does not forward that endpoint");
     }
@@ -216,7 +278,10 @@ fn handle(sh: &Shared, conn: UnixStream) -> std::io::Result<()> {
     }
 }
 
-fn forward(sh: &Shared, method: &str, path: &str, query: &str, headers: &[(String, String)], body: Vec<u8>, conn: &UnixStream) -> Result<()> {
+fn forward<S>(sh: &Shared, method: &str, path: &str, query: &str, headers: &[(String, String)], body: Vec<u8>, conn: &S) -> Result<()>
+where
+    for<'a> &'a S: Read + Write,
+{
     let url = if query.is_empty() { format!("{}{path}", sh.upstream) } else { format!("{}{path}?{query}", sh.upstream) };
     let mut req = ureq::http::Request::builder().method(method).uri(&url);
     let mut beta: Vec<String> = Vec::new();
@@ -278,6 +343,25 @@ fn forward(sh: &Shared, method: &str, path: &str, query: &str, headers: &[(Strin
     }
     sh.tokens.fetch_add(scanner.total(), Ordering::Relaxed);
     Ok(())
+}
+
+/// Read timeouts for both stream kinds.
+trait Timeout {
+    fn read_timeout(&self, t: Duration) -> std::io::Result<()>;
+}
+impl Timeout for UnixStream {
+    fn read_timeout(&self, t: Duration) -> std::io::Result<()> {
+        self.set_read_timeout(Some(t))
+    }
+}
+impl Timeout for std::net::TcpStream {
+    fn read_timeout(&self, t: Duration) -> std::io::Result<()> {
+        self.set_read_timeout(Some(t))
+    }
+}
+
+fn constant_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Counts tokens in a Messages API response, streamed (SSE) or not.

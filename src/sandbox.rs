@@ -83,6 +83,71 @@ pub struct Workspace {
     /// Command prefix the harness uses to run a command *inside* the sandbox, e.g.
     /// `docker exec -i <container>`. Empty for `DirSandbox`.
     pub exec_prefix: Vec<String>,
+    /// How a command run through `exec_prefix` gets environment variables and a directory.
+    pub style: ExecStyle,
+    /// The task's working directory inside the sandbox (inputs in, changed files out).
+    pub workdir: String,
+    /// Where the agent reaches the credential proxy, and the key it presents there.
+    pub proxy: ProxyEndpoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecStyle {
+    /// `docker|podman exec -i [-e K=V]... [-w DIR] <container> ...`
+    Docker,
+    /// `openshell sandbox exec -n <name> [--env K=V]... [--workdir DIR] ... -- ...`
+    OpenShell,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyEndpoint {
+    pub url: String,
+    /// The relay path needs no key (the agent sends a dummy one, which the proxy replaces); a
+    /// network path does (`AuthProxy::listen_tcp`).
+    pub key: String,
+}
+
+impl Default for ProxyEndpoint {
+    fn default() -> Self {
+        Self { url: format!("http://{PROXY_ADDR}"), key: "not-a-credential".into() }
+    }
+}
+
+impl Workspace {
+    /// A host directory (`DirSandbox`).
+    pub fn host(task_id: &str, path: PathBuf) -> Self {
+        Self { task_id: task_id.into(), path, exec_prefix: vec![], style: ExecStyle::Docker, workdir: String::new(), proxy: ProxyEndpoint::default() }
+    }
+
+    /// A container driven by `<bin> exec -i <container>`.
+    pub fn docker(task_id: &str, exec_prefix: Vec<String>) -> Self {
+        Self { task_id: task_id.into(), path: PathBuf::new(), exec_prefix, style: ExecStyle::Docker, workdir: "/workspace".into(), proxy: ProxyEndpoint::default() }
+    }
+
+    /// The same workspace, with commands run under `envs` in the work directory.
+    pub fn with_env(&self, envs: &[(String, String)]) -> Result<Workspace> {
+        let prefix = match self.style {
+            ExecStyle::Docker => {
+                let (name, head) = self.exec_prefix.split_last().ok_or_else(|| Error::Sandbox("this needs a container sandbox".into()))?;
+                let mut p: Vec<String> = head.to_vec();
+                for (k, v) in envs {
+                    p.extend(["-e".into(), format!("{k}={v}")]);
+                }
+                p.extend(["-w".into(), self.workdir.clone(), name.clone()]);
+                p
+            }
+            ExecStyle::OpenShell => {
+                let (dashes, head) = self.exec_prefix.split_last().filter(|(d, _)| d.as_str() == "--").ok_or_else(|| Error::Sandbox("an openshell exec prefix ends with `--`".into()))?;
+                let mut p: Vec<String> = head.to_vec();
+                for (k, v) in envs {
+                    p.extend(["--env".into(), format!("{k}={v}")]);
+                }
+                p.extend(["--workdir".into(), self.workdir.clone(), dashes.clone()]);
+                p
+            }
+        };
+        Ok(Workspace { task_id: self.task_id.clone(), path: self.path.clone(), exec_prefix: prefix, style: self.style, workdir: self.workdir.clone(), proxy: self.proxy.clone() })
+    }
 }
 
 /// **Not isolating.** A plain temp directory for the demo and tests; it enforces none of the
@@ -95,7 +160,7 @@ impl Sandbox for DirSandbox {
     fn create(&self, task: &TaskManifest, _profile: &SandboxProfile) -> Result<Workspace> {
         let path = self.root.join(&task.id);
         std::fs::create_dir_all(&path)?;
-        Ok(Workspace { task_id: task.id.clone(), path, exec_prefix: vec![] })
+        Ok(Workspace::host(&task.id, path))
     }
 
     fn destroy(&self, ws: Workspace) -> Result<()> {
@@ -263,7 +328,7 @@ impl Sandbox for DockerSandbox {
         let _ = self.docker(&["rm".into(), "-f".into(), name.clone()]);
         self.docker(&args)?;
         let exec_prefix = vec![self.bin.clone(), "exec".into(), "-i".into(), name.clone()];
-        let ws = Workspace { task_id: task.id.clone(), path: PathBuf::new(), exec_prefix };
+        let ws = Workspace::docker(&task.id, exec_prefix);
         if let Some(sock) = &self.proxy_socket
             && let Err(e) = self.start_relay(&ws, sock)
         {
@@ -277,7 +342,7 @@ impl Sandbox for DockerSandbox {
         // Validate on the host first, so the tar the container extracts holds only regular files
         // and directories at safe relative paths.
         let records = crate::archive::from_bytes(bundle, crate::archive::Limits::new(max_bytes)).map_err(Error::Sandbox)?;
-        let out = exec_io(ws, &["tar", "-x", "-f", "-", "-C", "/workspace"], Some(bundle), Duration::from_secs(300), 64 * 1024)?;
+        let out = exec_io(ws, &["tar", "-x", "-f", "-", "-C", &ws.workdir], Some(bundle), Duration::from_secs(300), 64 * 1024)?;
         if !out.status.success() {
             return Err(Error::Sandbox(format!("unpacking inputs failed (the image must provide `tar`): {}", String::from_utf8_lossy(&out.stderr).trim())));
         }
@@ -286,50 +351,8 @@ impl Sandbox for DockerSandbox {
     }
 
     fn collect_outputs(&self, ws: &Workspace, max_bytes: u64) -> Result<Vec<u8>> {
-        use std::sync::{Arc, Mutex};
         let base = self.baselines.lock().unwrap().get(&ws.task_id).cloned().unwrap_or_default();
-        let (prog, rest) = ws.exec_prefix.split_first().ok_or_else(|| Error::Sandbox("not a container workspace".into()))?;
-        let mut child = Command::new(prog)
-            .args(rest)
-            .args(["tar", "-c", "-f", "-", "-C", "/workspace", "."])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let (stdout, mut stderr) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
-        let err = std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = std::io::Read::take(&mut stderr, 1 << 16).read_to_string(&mut s);
-            s
-        });
-        // Watchdog: a hung `tar` must not stall the runner.
-        let child = Arc::new(Mutex::new(child));
-        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (wc, wd) = (child.clone(), done.clone());
-        let watchdog = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(300);
-            while !wd.load(std::sync::atomic::Ordering::Relaxed) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            if !wd.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = wc.lock().unwrap().kill();
-            }
-        });
-        let limits = crate::archive::Limits::new(max_bytes);
-        let parsed = crate::archive::changes_from_tar(stdout, &base, limits);
-        done.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = watchdog.join();
-        let mut child = child.lock().unwrap();
-        if parsed.is_err() {
-            let _ = child.kill();
-        }
-        let status = child.wait()?;
-        let stderr = err.join().unwrap_or_default();
-        let changes = parsed.map_err(|e| Error::Sandbox(format!("collecting outputs failed: {e}")))?;
-        if !status.success() {
-            return Err(Error::Sandbox(format!("collecting outputs failed (the image must provide `tar`): {}", stderr.trim())));
-        }
-        crate::archive::to_bytes(&changes).map_err(Error::Sandbox)
+        collect_via_exec(ws, &base, max_bytes)
     }
 
     fn destroy(&self, ws: Workspace) -> Result<()> {
@@ -339,6 +362,54 @@ impl Sandbox for DockerSandbox {
         let _ = self.docker(&["stop".into(), "-t".into(), "0".into(), Self::container_name(&ws.task_id)]);
         Ok(())
     }
+}
+
+/// Streams a tar of the work directory out through the sandbox's exec path and keeps only what
+/// changed against `base`, within `max_bytes`. Shared by the container backends.
+pub(crate) fn collect_via_exec(ws: &Workspace, base: &std::collections::BTreeMap<String, String>, max_bytes: u64) -> Result<Vec<u8>> {
+    use std::sync::{Arc, Mutex};
+    let (prog, rest) = ws.exec_prefix.split_first().ok_or_else(|| Error::Sandbox("not a container workspace".into()))?;
+    let mut child = Command::new(prog)
+        .args(rest)
+        .args(["tar", "-c", "-f", "-", "-C", ws.workdir.as_str(), "."])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let (stdout, mut stderr) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+    let err = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = std::io::Read::take(&mut stderr, 1 << 16).read_to_string(&mut s);
+        s
+    });
+    // Watchdog: a hung `tar` must not stall the runner.
+    let child = Arc::new(Mutex::new(child));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (wc, wd) = (child.clone(), done.clone());
+    let watchdog = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        while !wd.load(std::sync::atomic::Ordering::Relaxed) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if !wd.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = wc.lock().unwrap().kill();
+        }
+    });
+    let limits = crate::archive::Limits::new(max_bytes);
+    let parsed = crate::archive::changes_from_tar(stdout, base, limits);
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = watchdog.join();
+    let mut child = child.lock().unwrap();
+    if parsed.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    let stderr = err.join().unwrap_or_default();
+    let changes = parsed.map_err(|e| Error::Sandbox(format!("collecting outputs failed: {e}")))?;
+    if !status.success() {
+        return Err(Error::Sandbox(format!("collecting outputs failed (the image must provide `tar`): {}", stderr.trim())));
+    }
+    crate::archive::to_bytes(&changes).map_err(Error::Sandbox)
 }
 
 /// Runs `argv` inside the sandbox (prefixed by `ws.exec_prefix`) and kills it at `timeout`.

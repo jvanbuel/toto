@@ -22,6 +22,7 @@ pub mod intake;
 pub mod meter;
 pub mod netfence;
 pub mod omnigent;
+pub mod openshell;
 pub mod policy;
 pub mod prebuild;
 pub mod pr_flow;

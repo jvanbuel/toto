@@ -36,6 +36,24 @@ pub enum SandboxConfig {
         #[serde(default)]
         network: Option<String>,
     },
+    /// NVIDIA OpenShell (experimental; docs/spikes/openshell.md): Landlock, seccomp and a policy-
+    /// mediated network path, through a locally running OpenShell gateway.
+    Openshell {
+        #[serde(default = "openshell_bin")]
+        bin: String,
+        /// Gateway name for `openshell --gateway`; default: the CLI's active gateway.
+        #[serde(default)]
+        gateway: Option<String>,
+        /// Host address toto's credential proxy listens on for sandboxes: where a sandbox's
+        /// `host.openshell.internal` lands. Default `127.0.0.1`: with the Docker driver the
+        /// supervisor shares the host's network and connects to loopback (measured in the spike).
+        #[serde(default)]
+        proxy_bind: Option<String>,
+    },
+}
+
+fn openshell_bin() -> String {
+    "openshell".into()
 }
 
 fn docker_bin() -> String {
@@ -289,14 +307,14 @@ impl Config {
     pub fn docker_bin(&self) -> Option<&str> {
         match &self.sandbox {
             SandboxConfig::Docker { bin, .. } => Some(bin),
-            SandboxConfig::Dir => None,
+            SandboxConfig::Dir | SandboxConfig::Openshell { .. } => None,
         }
     }
 
     pub fn sandbox_network(&self) -> Option<&str> {
         match &self.sandbox {
             SandboxConfig::Docker { network, .. } => network.as_deref(),
-            SandboxConfig::Dir => None,
+            SandboxConfig::Dir | SandboxConfig::Openshell { .. } => None,
         }
     }
 
@@ -312,11 +330,19 @@ impl Config {
     }
 
     pub fn build_sandbox(&self) -> Box<dyn Sandbox> {
-        self.build_sandbox_with(None)
+        self.build_sandbox_with(None, None)
     }
 
-    fn build_sandbox_with(&self, proxy_socket: Option<PathBuf>) -> Box<dyn Sandbox> {
+    fn build_sandbox_with(&self, proxy_socket: Option<PathBuf>, proxy_tcp: Option<crate::sandbox::ProxyEndpoint>) -> Box<dyn Sandbox> {
         match &self.sandbox {
+            SandboxConfig::Openshell { bin, gateway, .. } => {
+                let mut s = crate::openshell::OpenShellSandbox::new(bin, self.state_dir.join("openshell"));
+                s.gateway = gateway.clone();
+                s.environments = self.environments.iter().map(|(k, a)| (k.clone(), Environment { image: a.pinned(), network: a.agent.needs_network })).collect();
+                s.egress = self.environments.iter().map(|(k, a)| (k.clone(), a.agent.egress_rules.clone())).collect();
+                s.proxy = proxy_tcp;
+                Box::new(s)
+            }
             SandboxConfig::Dir => Box::new(DirSandbox { root: self.state_dir.join("work") }),
             SandboxConfig::Docker { bin, runtime, nested_userns, network } => {
                 let mut s = DockerSandbox::new();
@@ -376,18 +402,30 @@ impl Config {
             trusted.insert(id, VerifyingKey::from_bytes(&bytes).map_err(|_| Error::Verify(format!("bad key for project `{id}`")))?);
         }
         let mut proxy_socket = None;
+        let mut proxy_tcp = None;
         let harness: Box<dyn Harness> = match &self.harness {
             HarnessConfig::Echo { tokens_per_run } => Box::new(EchoHarness { tokens_per_run: *tokens_per_run }),
             HarnessConfig::Omnigent { provider, upstream, token_file, api_key_file } => {
-                if !matches!(self.sandbox, SandboxConfig::Docker { .. }) {
-                    return Err(Error::Policy("the omnigent harness needs a Docker/Podman sandbox".into()));
+                if !matches!(self.sandbox, SandboxConfig::Docker { .. } | SandboxConfig::Openshell { .. }) {
+                    return Err(Error::Policy("the omnigent harness needs a Docker/Podman or OpenShell sandbox".into()));
                 }
                 let token_file = token_file.clone().unwrap_or_else(|| self.token_path());
                 let proxy = self.start_proxy(*provider, upstream.as_deref().unwrap_or(provider.default_upstream()), &token_file, api_key_file.as_deref())?;
                 proxy_socket = Some(proxy.socket().to_path_buf());
+                if let SandboxConfig::Openshell { proxy_bind, .. } = &self.sandbox {
+                    let host = proxy_bind.clone().unwrap_or_else(|| "127.0.0.1".into());
+                    let addr: std::net::SocketAddr = format!("{host}:0").parse().map_err(|_| Error::Policy(format!("proxy_bind `{host}` is not an IP address")))?;
+                    let key = hex::encode(crate::manifest::generate_key().to_bytes());
+                    let bound = proxy.listen_tcp(addr, &key)?;
+                    proxy_tcp = Some(crate::sandbox::ProxyEndpoint { url: format!("http://{}:{}", crate::openshell::HOST_ALIAS, bound.port()), key });
+                }
                 let mut h = OmnigentHarness::new(proxy, provider.provider());
+                let external_egress = matches!(self.sandbox, SandboxConfig::Openshell { .. });
                 for (id, a) in &self.environments {
-                    h.agents.insert(id.clone(), ApprovedAgent { tar: a.agent_tar_bytes()?, harness: a.agent.harness.clone() });
+                    // OpenShell enforces the approved egress rules itself; Omnigent's nested
+                    // sandbox cannot start there (no user namespaces), so it is turned off.
+                    let tar = if external_egress { crate::agent::with_external_egress(&a.agent_tar_bytes()?)? } else { a.agent_tar_bytes()? };
+                    h.agents.insert(id.clone(), ApprovedAgent { tar, harness: a.agent.harness.clone() });
                 }
                 Box::new(h)
             }
@@ -399,7 +437,7 @@ impl Config {
             self.load_or_create_key()?,
             queue,
             harness,
-            self.build_sandbox_with(proxy_socket),
+            self.build_sandbox_with(proxy_socket, proxy_tcp),
             Box::new(NoReview),
             AuditLog::new(self.state_dir.join("audit.jsonl")),
         ))

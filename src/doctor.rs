@@ -75,6 +75,20 @@ pub fn run_all(cfg: &Config) -> Vec<Check> {
 
     match &cfg.sandbox {
         SandboxConfig::Dir => c.push(Check::new(Level::Warn, "sandbox", "`dir` gives no isolation (development only)")),
+        SandboxConfig::Openshell { bin, .. } => {
+            c.push(Check::new(Level::Warn, "sandbox", "OpenShell is experimental in toto (docs/spikes/openshell.md)"));
+            match cfg.build_sandbox().probe() {
+                Ok(()) => c.push(Check::new(Level::Ok, "sandbox", format!("{bin}: gateway reachable"))),
+                Err(e) => c.push(Check::new(Level::Fail, "sandbox", e.to_string())),
+            }
+            for (id, a) in &cfg.environments {
+                match (a.agent.needs_network, a.agent.egress_rules.is_empty()) {
+                    (true, true) => c.push(Check::new(Level::Fail, "environment", format!("{id}: needs a network but lists no egress rules; OpenShell only grants listed destinations"))),
+                    (true, false) => c.push(Check::new(Level::Ok, "environment", format!("{id}: OpenShell enforces its {} egress rules (Omnigent's own network sandbox is turned off)", a.agent.egress_rules.len()))),
+                    _ => {}
+                }
+            }
+        }
         SandboxConfig::Docker { bin, runtime, nested_userns, network } => {
             // `probe` covers the daemon, every approved image and the network fence.
             match cfg.build_sandbox().probe() {
