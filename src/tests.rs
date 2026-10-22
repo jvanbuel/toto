@@ -3083,7 +3083,13 @@ pub(crate) mod github_queue {
         let a = Approval::new("ghcr.io/acme/env:1.0", fake_info(), &f.agent_files, f.commit.clone(), false).unwrap();
         assert!(a.agent.needs_network && a.agent.needs_nested_sandbox());
 
+        // On OpenShell, toto's sandbox, the agent's egress rules are all a networked agent needs.
+        let mut on_openshell = contributor("proj-add-openshell");
+        let notes = projects::add(&mut on_openshell, "org/proj", &f.devcontainer, a.clone(), &AddOptions { share: 3, token_file: None }).unwrap();
+        assert!(notes.iter().all(|n| !n.contains("net-setup") && !n.contains("nested_userns")) && notes.iter().any(|n| n.contains("no GitHub token")), "{notes:?}");
+
         let mut cfg = contributor("proj-add");
+        cfg.sandbox = crate::config::SandboxConfig::Docker { bin: "docker".into(), runtime: None, nested_userns: false, network: None };
         let notes = projects::add(&mut cfg, "org/proj", &f.devcontainer, a.clone(), &AddOptions { share: 3, token_file: None }).unwrap();
         assert_eq!(cfg.projects["acme"], f.devcontainer.toto.public_key);
         assert_eq!((cfg.policy.project_shares["acme"], cfg.sources["acme"].as_str()), (3, "org/proj"));

@@ -108,6 +108,12 @@
 		</Card>
 	</div>
 
+	<p class="mt-3 text-sm text-muted-foreground">
+		Sandbox: <span class={data.sandbox.ok ? '' : 'font-medium text-foreground'}
+			>{data.sandbox.summary}</span
+		>{#if data.sandbox.detail}. {data.sandbox.detail}{/if}
+	</p>
+
 	{#if data.status?.user_paused}
 		<Card class="mt-4">
 			<CardSection>

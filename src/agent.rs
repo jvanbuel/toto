@@ -68,11 +68,14 @@ impl AgentSummary {
         }
         out.push(format!(
             "network     {}",
-            if !self.needs_network { "none (tasks run offline)".to_string() } else if self.egress_rules.is_empty() { "allowed, no egress rules (any destination the fenced network reaches)".into() } else { format!("rules: {}", self.egress_rules.join(", ")) }
+            if !self.needs_network {
+                "none (tasks run offline)".to_string()
+            } else if self.egress_rules.is_empty() {
+                "wanted, but no egress rules: OpenShell only grants listed destinations, so tasks are refused".into()
+            } else {
+                format!("only these requests, each checked by the sandbox: {}", self.egress_rules.join(", "))
+            }
         ));
-        if let Some(t) = &self.sandbox_type {
-            out.push(format!("sandbox     Omnigent `{t}` inside the container{}", if self.needs_nested_sandbox() { " (needs `nested_userns` in your sandbox config)" } else { "" }));
-        }
         out.extend(self.warnings.iter().map(|w| format!("note        {w}")));
         out
     }
@@ -174,7 +177,7 @@ pub fn summarize(files: &BTreeMap<String, Vec<u8>>) -> Result<AgentSummary> {
     }
     let needs_network = allow_network || url_servers;
     if url_servers && !allow_network {
-        warnings.push("an MCP server is reached by URL: tasks get the fenced network for it".into());
+        warnings.push("an MCP server is reached by URL: tasks need a network for it, and its host must be in the egress rules".into());
     }
     Ok(AgentSummary { harness, model, prompt_preview, mcp, skills, sandbox_type, egress_rules, needs_network, warnings })
 }

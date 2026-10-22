@@ -9,6 +9,8 @@
 	<Badge variant="outline">{harnessLabel(a.harness)}</Badge>
 	{#if a.model}<Badge variant="secondary">{a.model}</Badge>{/if}
 	{#if a.needs_network}<Badge variant="outline">needs a network</Badge>{/if}
+	{#if a.egress_enforced_by}<Badge variant="outline">rules enforced by {a.egress_enforced_by}</Badge
+		>{/if}
 	{#if a.nested_sandbox}<Badge variant="outline">nested sandbox</Badge>{/if}
 	{#if a.prebuilt}<Badge variant="outline">prebuilt here</Badge>{/if}
 </div>
@@ -35,7 +37,14 @@
 	{/if}
 	{#if a.egress_rules.length}
 		<dt class="text-muted-foreground">egress rules</dt>
-		<dd class="font-mono text-xs whitespace-pre-line">{a.egress_rules.join('\n')}</dd>
+		<dd>
+			<div class="font-mono text-xs whitespace-pre-line">{a.egress_rules.join('\n')}</div>
+			<div class="text-xs text-muted-foreground">
+				the only requests tasks can make{a.egress_enforced_by === 'OpenShell'
+					? ', each checked by the sandbox (method, host and path)'
+					: ''}
+			</div>
+		</dd>
 	{/if}
 </dl>
 <details class="mt-3 text-sm">

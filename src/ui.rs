@@ -95,6 +95,48 @@ pub struct Overview {
     pub projects: usize,
     pub audit: Vec<crate::audit::AuditEntry>,
     pub config_path: String,
+    pub sandbox: SandboxView,
+}
+
+/// What runs the tasks, and whether it is ready.
+#[derive(Serialize)]
+pub struct SandboxView {
+    /// `openshell`, `docker` or `dir`.
+    pub kind: String,
+    /// One line for the page, e.g. `OpenShell 0.1.5, toto's gateway running`.
+    pub summary: String,
+    /// Ready to run tasks (for OpenShell: the binaries are there; the gateway runs with the daemon).
+    pub ok: bool,
+    /// What to do when it is not, or why it matters.
+    pub detail: Option<String>,
+}
+
+fn sandbox_view(cfg: &Config) -> SandboxView {
+    use crate::config::SandboxConfig;
+    match &cfg.sandbox {
+        SandboxConfig::Openshell { bin_dir, gateway, port, .. } => {
+            let lock = crate::openshell_pin::Lock::embedded();
+            let found = crate::openshell_pin::find(&lock, bin_dir.as_deref(), &cfg.state_dir);
+            let gw = match gateway {
+                Some(g) => format!("your gateway `{g}`"),
+                None if crate::openshell_gateway::health(port + 1) => "toto's gateway running".into(),
+                None => "toto's gateway starts with the runner".into(),
+            };
+            SandboxView {
+                kind: "openshell".into(),
+                summary: format!("OpenShell {}, {gw}", lock.version),
+                ok: found.is_ok(),
+                detail: found.err().map(|e| e.to_string().trim_start_matches("sandbox error: ").to_string()),
+            }
+        }
+        SandboxConfig::Docker { bin, .. } => SandboxView {
+            kind: "docker".into(),
+            summary: format!("{bin} (deprecated)"),
+            ok: true,
+            detail: Some("The `docker` sandbox goes in the next release; switch to `\"sandbox\": {\"kind\": \"openshell\"}`.".into()),
+        },
+        SandboxConfig::Dir => SandboxView { kind: "dir".into(), summary: "a plain directory".into(), ok: false, detail: Some("No isolation: development only.".into()) },
+    }
 }
 
 async fn overview(State(s): State<Arc<UiState>>) -> ApiResult<Overview> {
@@ -113,6 +155,7 @@ async fn overview(State(s): State<Arc<UiState>>) -> ApiResult<Overview> {
         projects: cfg.projects.len(),
         audit: audit_tail,
         config_path: s.config_path.display().to_string(),
+        sandbox: sandbox_view(&cfg),
     }))
 }
 
@@ -136,14 +179,19 @@ pub struct ApprovalView {
     pub harness: String,
     pub model: Option<String>,
     pub needs_network: bool,
+    /// The agent's own bubblewrap sandbox runs inside the container (the deprecated `docker`
+    /// sandbox only; on OpenShell it is turned off and OpenShell enforces the rules).
     pub nested_sandbox: bool,
+    /// Who enforces the egress rules, when there are any: `OpenShell` or `Omnigent`.
+    pub egress_enforced_by: Option<String>,
     pub skills: Vec<String>,
     pub mcp: Vec<(String, String)>,
     pub egress_rules: Vec<String>,
     pub describe: Vec<String>,
 }
 
-fn approval_view(a: &projects::Approval) -> ApprovalView {
+fn approval_view(cfg: &Config, a: &projects::Approval) -> ApprovalView {
+    let docker = matches!(cfg.sandbox, crate::config::SandboxConfig::Docker { .. });
     ApprovalView {
         image: a.image.clone(),
         pinned: a.pinned(),
@@ -154,7 +202,8 @@ fn approval_view(a: &projects::Approval) -> ApprovalView {
         harness: a.agent.harness.clone(),
         model: a.agent.model.clone(),
         needs_network: a.agent.needs_network,
-        nested_sandbox: a.agent.needs_nested_sandbox(),
+        nested_sandbox: docker && a.agent.needs_nested_sandbox(),
+        egress_enforced_by: (!a.agent.egress_rules.is_empty()).then(|| if docker { "Omnigent" } else { "OpenShell" }.to_string()),
         skills: a.agent.skills.clone(),
         mcp: a.agent.mcp.clone(),
         egress_rules: a.agent.egress_rules.clone(),
@@ -168,7 +217,7 @@ fn project_view(cfg: &Config, id: &str, key: &str) -> ProjectView {
         key: key.to_string(),
         share: cfg.policy.project_shares.get(id).copied().unwrap_or(0),
         source: cfg.sources.get(id).cloned(),
-        approval: cfg.environments.get(id).map(approval_view),
+        approval: cfg.environments.get(id).map(|a| approval_view(cfg, a)),
     }
 }
 
@@ -228,6 +277,7 @@ pub struct PreviewView {
 
 async fn preview_add(State(s): State<Arc<UiState>>, Json(req): Json<PreviewRequest>) -> ApiResult<PreviewView> {
     let cfg = s.config()?;
+    let for_view = cfg.clone();
     let (api, arg, share) = (s.api.clone(), req.arg.clone(), req.share.max(1));
     let (p, progress) = tokio::task::spawn_blocking(move || {
         let mut progress = vec![];
@@ -248,7 +298,7 @@ async fn preview_add(State(s): State<Arc<UiState>>, Json(req): Json<PreviewReque
         kinds: t.kinds.clone(),
         listed: p.listed.is_some(),
         devcontainer_notes: p.fetched.devcontainer.notes.clone(),
-        approval: approval_view(&p.approval),
+        approval: approval_view(&for_view, &p.approval),
         notes: p.notes.clone(),
         progress,
     };

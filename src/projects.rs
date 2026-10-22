@@ -137,10 +137,14 @@ pub fn add(cfg: &mut Config, repo: &str, dc: &Devcontainer, approval: Approval, 
     if !cfg.queues.iter().any(|q| matches!(q, QueueEndpoint::Github { repo: r, .. } if r == repo)) {
         cfg.queues.push(QueueEndpoint::Github { repo: repo.into(), token_file: o.token_file.clone(), label: crate::github_queue::DEFAULT_LABEL.into(), api_url: crate::github_queue::DEFAULT_API.into() });
     }
-    if approval.agent.needs_network && cfg.sandbox_network().is_none() {
+    let docker = matches!(cfg.sandbox, crate::config::SandboxConfig::Docker { .. });
+    if approval.agent.needs_network && !docker && approval.agent.egress_rules.is_empty() {
+        notes.push("this project's agent needs a network but lists no egress rules; OpenShell only grants listed destinations, so its tasks will be refused".into());
+    }
+    if approval.agent.needs_network && docker && cfg.sandbox_network().is_none() {
         notes.push("this project's tasks need a network: run `toto net-setup --apply` and set `network` in the sandbox config, or its tasks will be refused".into());
     }
-    if approval.agent.needs_nested_sandbox() && !cfg.sandbox_nested_userns() {
+    if approval.agent.needs_nested_sandbox() && docker && !cfg.sandbox_nested_userns() {
         notes.push("this project's agent uses Omnigent's own sandbox inside the container: set `nested_userns: true` in the sandbox config, or its tools will fail".into());
     }
     if let Some(p) = approval.agent.provider()

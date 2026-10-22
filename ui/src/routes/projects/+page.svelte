@@ -90,7 +90,7 @@
 			>
 		</form>
 		<p class="mt-2 text-xs text-muted-foreground">
-			Reading pulls the image (or prebuilds it), which can take a while. Nothing changes until you
+			Reading pulls the project's published image, which can take a while. Nothing changes until you
 			approve.
 		</p>
 		{#if error}

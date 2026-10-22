@@ -79,6 +79,14 @@ export type Overview = {
 	projects: number;
 	audit: AuditEntry[];
 	config_path: string;
+	sandbox: SandboxInfo;
+};
+
+export type SandboxInfo = {
+	kind: string;
+	summary: string;
+	ok: boolean;
+	detail: string | null;
 };
 
 export type Approval = {
@@ -92,6 +100,7 @@ export type Approval = {
 	model: string | null;
 	needs_network: boolean;
 	nested_sandbox: boolean;
+	egress_enforced_by: string | null;
 	skills: string[];
 	mcp: [string, string][];
 	egress_rules: string[];
