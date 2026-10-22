@@ -250,11 +250,11 @@ pub fn approval_for(cfg: &Config, repo: &str, f: &Fetched, progress: &mut dyn Fn
         }
         None => {
             let network = cfg.sandbox_network().ok_or_else(|| match cfg.sandbox {
-                crate::config::SandboxConfig::Openshell { .. } => Error::Policy("this project publishes no image, so it has to be prebuilt here; prebuilds do not run on OpenShell yet (ADR 17), so ask the project to publish its image".into()),
+                crate::config::SandboxConfig::Openshell { .. } => Error::Policy("this project publishes no image. Projects prebuild their dev container in their own CI and publish it (`toto project image --push`, docs/project-owner-guide.md); contributors no longer build it (ADR 17). Ask the project to publish its image".into()),
                 _ => Error::Policy("this project publishes no image, so it has to be prebuilt here, and a prebuild needs the fenced network: run `toto net-setup --apply` and set `network` in the sandbox config".into()),
             })?;
             let pb = crate::prebuild::Prebuild { bin: bin.into(), cli: crate::prebuild::DEFAULT_CLI.into(), network: network.into(), work_dir: cfg.state_dir.join("prebuild") };
-            progress(&format!("prebuilding {repo} (build, onCreateCommand, updateContentCommand); this can take a while..."));
+            progress(&format!("prebuilding {repo} (build, onCreateCommand, updateContentCommand); this can take a while. Deprecated: local prebuilds go with the `docker` sandbox, so ask the project to publish its image with `toto project image` (ADR 17)..."));
             let (tag, info) = pb.build(&format!("https://github.com/{repo}.git"), f.commit.as_deref(), &f.devcontainer.toto.id, &f.devcontainer_text, crate::devcontainer::PATH)?;
             (tag, info, true)
         }

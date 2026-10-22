@@ -51,6 +51,12 @@ That setup is the part contributors would get wrong.
 - **toto's credential proxy stays in the path** (ADR 12, ADR 14). It listens on a loopback TCP port, and only requests carrying a per-run 256-bit key get through. The sandbox policy allows that one endpoint, plus the project's approved egress rules, which OpenShell enforces per request. No provider credential is ever given to OpenShell.
 - **Omnigent's own network sandbox is turned off.** bubblewrap cannot start in an OpenShell workload. The approved egress rules are enforced by OpenShell from outside instead.
 - **One release of overlap.** `"sandbox": {"kind": "docker"}` keeps working for one release, with a deprecation warning from `toto doctor`, then it is removed together with `netfence`, the nested-userns seccomp profile and the Unix-socket relay. `toto init` writes `openshell`.
+- **Projects publish their environment; contributors never build it.** Prebuilding a dev container runs the project's build and `onCreateCommand` with open network access, for `apt`, `pip` and `npm`. On a contributor's machine only the iptables fence confined that, and the fence goes with the Docker sandbox. So the prebuild moves to the project's own CI:
+  - `toto project image --push` runs the dev container spec's prebuild phase with the reference CLI, the same code a contributor's machine ran: `build`/`features`, `onCreateCommand`, `updateContentCommand`, host keys dropped. It snapshots the result with the project image's own entrypoint and pushes it to `customizations.toto.image`.
+  - Contributors pull it and approve it by digest, as for any published image.
+  - The example workflow is `docs/examples/project/.github/workflows/toto-image.yml`.
+  - The dev container file stays the project's contract: image, `customizations.toto`, prebuild recipe.
+  - Local prebuilds stay on the deprecated `docker` sandbox for its last release and are removed with it, along with the dev container CLI dependency on contributor machines.
 - **An escape hatch:** `"gateway": "<name>"` uses a gateway the contributor runs. toto then checks neither its version nor its images, and `toto doctor` says so.
 
 ## Consequences
@@ -59,7 +65,7 @@ That setup is the part contributors would get wrong.
 - **More trusted code from NVIDIA.** The supervisor runs on the host network, terminates TLS for rule enforcement and parses the agent's HTTP. It runs unprivileged and read-only, and only ever sees toto's per-run key, never the provider credential.
 - **Upgrades are toto's work.** OpenShell is young: its gateway config is at schema version 2 and keys have been renamed. Every bump goes through the lock, the live tests and a release.
 - **Docker is still required** with the Docker driver, which is the default. The MicroVM driver (Hypervisor.framework or KVM) is installed with `--vm`. It is not yet wired up, because its disk caps need their own mechanism.
-- **Prebuilds** of projects that publish no image still need the fenced Docker network, so they keep working only on the deprecated `docker` sandbox until they move into an OpenShell sandbox too.
+- **Prebuilds move to the project's CI** (see the decision below). A project that builds its dev container and publishes no image can no longer be added on OpenShell.
 
 ## Not yet verified
 

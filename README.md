@@ -14,18 +14,18 @@ toto reuses what exists and adds as little as it can (ADR 13, ADR 17):
 
 | Piece | Comes from | toto's part |
 |---|---|---|
-| Environment | the project's `.devcontainer/devcontainer.json` (the [dev container spec](https://containers.dev)) | reads `customizations.toto`; pulls the published image, or prebuilds the file with the reference CLI |
+| Environment | the project's `.devcontainer/devcontainer.json` (the [dev container spec](https://containers.dev)) | reads `customizations.toto`; pulls the image the project prebuilt and published from that file (`toto project image` in its CI) |
 | Agent, tools, skills, prompt | the project's [Omnigent](https://github.com/omnigent-ai/omnigent) agent directory (`.toto/agent`) | shows it to the contributor, hashes it, runs it as is |
 | Egress rules | the agent's Omnigent config (`os_env.sandbox.egress_rules`) | turns them into OpenShell policy rules, enforced per request (method and path) |
 | Isolation | [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell): Landlock, seccomp, a policy-mediated network | ships the pinned release and runs a private gateway; nothing to set up |
 | Credential | your subscription token or API key | a host-side proxy that adds it to model calls; the container never holds it |
 | Queue | GitHub issues in the project's repository | signed tasks in, signed results out, results opened as pull requests |
 
-A contributor approves exactly what will run: the image by digest (or by id when prebuilt locally) and the agent directory by hash, at a commit. A project cannot change either without the contributor approving the update.
+A contributor approves exactly what will run: the image by digest and the agent directory by hash, at a commit. A project cannot change either without the contributor approving the update.
 
 ## Status
 
-A working runner, tested end to end with fake model APIs: Omnigent with the Claude and Codex harnesses inside an OpenShell sandbox, the credential proxy, project egress rules enforced by OpenShell, prebuilds with the dev container CLI, GitHub issues as the queue, results as pull requests. Not yet run with a real credential. See [docs/design.md](docs/design.md) and the ADRs.
+A working runner, tested end to end with fake model APIs: Omnigent with the Claude and Codex harnesses inside an OpenShell sandbox, the credential proxy, project egress rules enforced by OpenShell, dev container prebuilds published from the project's CI, GitHub issues as the queue, results as pull requests. Not yet run with a real credential. See [docs/design.md](docs/design.md) and the ADRs.
 
 ```
 cargo test --workspace
@@ -71,7 +71,7 @@ The proxy sees every provider response, so it reads the rate-limit headers the p
 
 ## Platforms
 
-Linux (x86_64, arm64) and macOS (Apple silicon) with Docker: OpenShell's Docker driver runs the sandboxes. Egress rules are enforced the same way on both, so projects whose agents need a network run on macOS too. The macOS path has not been run yet (ADR 17). Projects that publish no image are prebuilt on your machine, which still needs the deprecated `docker` sandbox and its Linux network fence for now.
+Linux (x86_64, arm64) and macOS (Apple silicon) with Docker: OpenShell's Docker driver runs the sandboxes. Egress rules are enforced the same way on both, so projects whose agents need a network run on macOS too. The macOS path has not been run yet (ADR 17). Projects publish their environment as an image (prebuilt in their CI), so your machine never builds a project's code.
 
 ## The sandbox
 

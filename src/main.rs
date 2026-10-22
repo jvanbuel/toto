@@ -227,6 +227,26 @@ enum ProjectCmd {
         #[arg(long, default_value = toto::github_queue::DEFAULT_API)]
         api: String,
     },
+    /// Prebuild the project's dev container (build, onCreateCommand, updateContentCommand, under
+    /// toto's flags) and, with --push, publish it where customizations.toto.image names it. Run it
+    /// from the project's CI; contributors pull the result and approve it by digest.
+    Image {
+        /// A checkout of the project repository.
+        #[arg(long, default_value = ".")]
+        repo_dir: PathBuf,
+        /// The dev container file, relative to the checkout.
+        #[arg(long, default_value = toto::devcontainer::PATH)]
+        config: String,
+        /// Push the image (log in to the registry first).
+        #[arg(long)]
+        push: bool,
+        /// `docker` or `podman`.
+        #[arg(long, default_value = "docker")]
+        bin: String,
+        /// Network the build and prebuild commands run on.
+        #[arg(long, default_value = "bridge")]
+        network: String,
+    },
     /// Make a secret plus-address for a pre-approved mail sender: prints the address to give them
     /// and the `secret_sha256` for their entry in `.toto/intake.toml`.
     SecretAddress {
@@ -505,6 +525,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("                            secret_sha256 = \"{}\"", toto::archive::sha256_hex(tag.as_bytes()));
             println!("The address is the secret: anyone who learns it can ask within that sender's limits.");
         }
+        Cmd::Project { cmd: ProjectCmd::Image { repo_dir, config, push, bin, network } } => {
+            let pb = toto::prebuild::Prebuild { bin, cli: toto::prebuild::DEFAULT_CLI.into(), network, work_dir: repo_dir.clone() };
+            let pinned = toto::prebuild::publish(&pb, &repo_dir, &config, push)?;
+            if push {
+                println!("published {pinned}");
+                if let Ok(summary) = std::env::var("GITHUB_STEP_SUMMARY") {
+                    let line = format!("toto image published: `{pinned}`. Contributors approve it with `toto projects update` (or `add`).\n");
+                    let _ = fs::OpenOptions::new().append(true).create(true).open(summary).and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+                }
+            } else {
+                println!("built {pinned} (not pushed; add --push)");
+            }
+        }
         Cmd::Project { cmd: ProjectCmd::Sync { repo_dir, config, key_file, token_file, api } } => {
             let path = config.unwrap_or_else(|| repo_dir.join(".toto/intake.toml"));
             let cfg = toto::intake::sync::IntakeConfig::parse(&fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?)?;
@@ -649,7 +682,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!("  {l}");
                             }
                         }
-                        None => println!("\nno published image: `toto projects add` prebuilds it here from the devcontainer config above"),
+                        None => println!("\nno published image: only the deprecated `docker` sandbox can prebuild it here; ask the project to publish it (`toto project image`)"),
                     }
                 }
                 ProjectsCmd::Update { id, token_file, api, yes } => {

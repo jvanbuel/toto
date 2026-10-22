@@ -14,20 +14,27 @@ Nothing here is toto-specific except one block in your `devcontainer.json` and o
 
 ## 1. The environment: your dev container
 
-toto runs tasks in the dev container your developers use. Keep one `.devcontainer/devcontainer.json`; add a `customizations.toto` block (section 3). Two ways to get an image onto contributors' machines:
+toto runs tasks in the dev container your developers use. Keep one `.devcontainer/devcontainer.json`; add a `customizations.toto` block (section 3). **You publish the image; contributors pull it** and approve it by **digest**. They never build your code (ADR 17).
 
-**Publish it (recommended).** Build with the reference CLI in CI (`docs/examples/project/.github/workflows/toto-image.yml`: `devcontainer build --push`) and name the result in `customizations.toto.image`, fully qualified with a registry and a tag or digest (`ghcr.io/acme/toto-env:1.0`). Contributors pull it and approve it by **digest**; they never build your code. A top-level `image` works too when you have no `build`.
+**Prebuild and publish it in your CI.** Copy `docs/examples/project/.github/workflows/toto-image.yml`. It runs `toto project image --push`, which prebuilds your dev container with the reference CLI the way GitHub Codespaces makes a prebuild, then pushes it where `customizations.toto.image` names it (fully qualified, with a registry and a tag: `ghcr.io/acme/toto-env:1.0`). The prebuild phase is:
+- `build` and `features`;
+- then `onCreateCommand` and `updateContentCommand`, run in the container;
+- the result snapshotted, starting with your image's own entrypoint and command.
 
-**Or let contributors prebuild it.** With `build` or `features` and no published image, `toto projects add` runs the dev container CLI on the contributor's machine the way GitHub Codespaces makes a prebuild: `build`, then `onCreateCommand` and `updateContentCommand`, snapshotted into an image approved by id. The prebuild runs with all capabilities dropped, `no-new-privileges` and the contributor's fenced network (so `npm ci` and `pip install` work; private addresses and the contributor's host do not). `postCreateCommand`, `postStartCommand` and `postAttachCommand` never run: put installs in `onCreateCommand`, not there. Keys that act on the host (`mounts`, `runArgs`, `privileged`, `capAdd`, `securityOpt`, `initializeCommand`, `forwardPorts`, ...) are dropped for the prebuild and never applied to tasks; the contributor sees a note for each. Everything else in the file (editor settings, your `vscode` customizations) is ignored.
+Put installs in `onCreateCommand`. `postCreateCommand`, `postStartCommand` and `postAttachCommand` never run. Keys that act on the host (`mounts`, `runArgs`, `privileged`, `capAdd`, `securityOpt`, `initializeCommand`, `forwardPorts`, ...) are dropped, and contributors see a note for each. Everything else in the file (editor settings, your `vscode` customizations) is ignored. Make the package public so it pulls without credentials. Try it locally first: `toto project image` without `--push` builds the same snapshot.
 
-Whichever way, what you can rely on at task time:
+**Or name an image you already publish.** A top-level `image` works when the file has no `build`, and so does `customizations.toto.image` for an image you build some other way. Contributors get exactly what that image contains: nothing in the file runs for them.
 
-- tasks run as an unprivileged user (uid 65534) in a read-only container with all capabilities dropped, a writable `/workspace` and `/tmp`, and CPU, memory and time limits from the manifest;
-- there is **no network** unless your agent config asks for one (section 2) **and** the contributor has set up the fenced network;
-- the contributor's credential is never in the container: model calls go through a proxy on the host that adds it;
-- inputs arrive in `/workspace`; only files the task changed there come back, as artifacts, within your `max_artifact_bytes`.
+**Deprecated: contributor prebuilds.** A file that builds but names no published image used to be prebuilt on each contributor's machine. That needs open network access for installs, which only the deprecated `docker` sandbox can fence. It still works there for one release; on OpenShell, toto asks the contributor to ask you to publish.
 
-The image must contain `omnigent` (and so `python3`, which also runs toto's credential relay) and the harness it drives (`claude-agent-sdk`, which bundles the Claude Code binary, or Codex), plus `tar`. If your agent uses Omnigent's own sandbox (egress rules), also `bubblewrap` and the `/run/lakebox` marker directory; see the example Dockerfile. Run it as root in the Dockerfile if you like; toto starts it as uid 65534 regardless, so make sure your tools work for an unprivileged user with a writable `/tmp` and `/workspace` and nothing else (`HOME` is `/tmp/home`).
+What you can rely on at task time (toto runs your image in an [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell) sandbox):
+
+- tasks run as an unprivileged user (uid 65534), with Landlock and seccomp, the whole image read-only, a writable `/work` (512 MB) and `/tmp` (256 MB), and CPU, memory and time limits from the manifest;
+- there is **no network** except the exact methods, hosts and paths your agent config lists as egress rules (section 2), enforced per request;
+- the contributor's credential is never in the sandbox: model calls go to a proxy on the contributor's host, which adds it;
+- inputs arrive in `/work`, the working directory; only files the task changed there come back, as artifacts, within your `max_artifact_bytes`.
+
+The image must contain `omnigent` (and so `python3`) and the harness it drives (`claude-agent-sdk`, which bundles the Claude Code binary, or Codex), plus `sh` and `tar`. Run it as root in the Dockerfile if you like; toto starts it as uid 65534 regardless, so make sure your tools work for an unprivileged user with a writable `/tmp` and `/work` and nothing else (`HOME` is `/tmp/home`).
 
 **Contributors approve what you publish, by content.** `toto projects add` shows the image's digest (or id), user, environment, size and build steps, read from the image itself, newest layer first, and the agent directory (section 2). The approval is bound to that content at a commit. When you publish a new image or change the agent, contributors keep running what they approved until they run `toto projects update <id>`, which shows what changed and asks again. So: write build steps that read well (a `RUN curl ... | sh` is what a reviewing contributor will judge), version your tags, and say what changed in your release notes.
 
@@ -38,9 +45,9 @@ The image must contain `omnigent` (and so `python3`, which also runs toto's cred
 - `executor.config.harness`: `claude-sdk` (contributors with an Anthropic subscription or API key) or `codex` (OpenAI API key). This decides which contributors can run your tasks.
 - `executor.model`: set one; the credential proxy does not forward model discovery.
 - `prompt`: your instructions. The task's own prompt comes from the manifest.
-- `tools`: MCP servers. A `command` runs inside your image. A `url` server needs a network, which the contributor must have fenced; prefer commands.
+- `tools`: MCP servers. A `command` runs inside your image. A `url` server needs a network, so it must be covered by your egress rules; prefer commands.
 - `skills/<name>/SKILL.md`: Agent Skills, loaded by Omnigent.
-- `os_env`: absent, or `type: caller_process` (anything else, such as `ssh`, is refused). Its `sandbox` is where **egress rules** live: `type: linux_bwrap` with `allow_network: true` and `egress_rules` in Omnigent's syntax (`GET docs.acme.example/**`, `GET,POST api.example.com/v1/*`). Default deny. This nested sandbox runs inside toto's container; it needs `bubblewrap` in your image and `nested_userns` on the contributor's side, which `toto projects add` tells them. Ask for as little as the task needs, and prefer `GET` on specific paths.
+- `os_env`: absent, or `type: caller_process` (anything else, such as `ssh`, is refused). Its `sandbox` is where **egress rules** live: `allow_network: true` and `egress_rules` in Omnigent's syntax (`GET docs.acme.example/**`, `GET,POST api.example.com/v1/*`). Default deny. toto turns each rule into an OpenShell policy rule, enforced per request on HTTPS from outside your image, so you need no `bubblewrap` (a `linux_bwrap` sandbox type still parses; toto runs it as `none` with OpenShell enforcing the rules). An agent that needs a network must list its destinations. Ask for as little as the task needs, and prefer `GET` on specific paths.
 
 Limits: 500 files, 1 MiB; paths must be plain relative paths. A config toto cannot run (unknown harness, remote `os_env`, malformed egress rule) is refused when a contributor adds the project, with the reason.
 
@@ -60,7 +67,7 @@ In `.devcontainer/devcontainer.json`:
     "description": "Keeps the Acme documentation current.",
     "public_key": "<hex key from toto project-key>",
     "kinds": ["docs-fix"],                   // task kinds you post
-    "image": "ghcr.io/acme/toto-env:1.0",    // published image; omit to have contributors prebuild
+    "image": "ghcr.io/acme/toto-env:1.0",    // where `toto project image --push` publishes; contributors pull it
     "agent": ".toto/agent"                   // default
   }
 }
@@ -94,7 +101,7 @@ File changes touching `.github/`, `.gitlab-ci.yml`, `.git/`, `CODEOWNERS` and si
 ## Checklist before your first task
 
 - [ ] `.devcontainer/devcontainer.json` has `customizations.toto`, with the key from `project.key`, and the fingerprint is published elsewhere.
-- [ ] The image is published and pullable without credentials, or your `onCreateCommand` installs everything a task needs.
+- [ ] The image is published (`toto project image --push` from CI) and pullable without credentials, and your `onCreateCommand` installs everything a task needs.
 - [ ] `.toto/agent/config.yaml` names a harness and a model, and asks for the least network and tools it can.
 - [ ] No secrets in the image, the agent directory or the bundles (assume anything a task can read, a contributor can read).
 - [ ] You tried it yourself: `toto projects add` against your own repository, then `toto doctor`, then one task with `toto run --once`.

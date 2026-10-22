@@ -1,6 +1,6 @@
 # 13. Reuse: the project's dev container, an Omnigent agent directory, a hardened container runtime
 
-- Status: Accepted (implemented and tested with fake model APIs; not yet run with a real credential). Its sandbox (hardened Docker run, `netfence`, nested bubblewrap) is superseded by ADR 17.
+- Status: Accepted (implemented and tested with fake model APIs; not yet run with a real credential). Its sandbox (hardened Docker run, `netfence`, nested bubblewrap) and the prebuild on contributor machines are superseded by ADR 17: projects prebuild in their own CI (`toto project image`).
 - Date: 2026-10-06
 - Supersedes: ADR 5, 9, 10, 11 (its terms section still applies), 12 (its credential proxy is kept)
 

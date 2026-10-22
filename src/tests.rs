@@ -3438,11 +3438,11 @@ mod devcontainer {
         assert_eq!((top.image.as_deref(), top.builds), (Some("ghcr.io/a/b:1"), false));
         let both = parse(&with(", \"build\": {\"dockerfile\": \"Dockerfile\"}, \"customizations\": {\"toto\": {\"id\": \"acme\", \"name\": \"A\", \"public_key\": \"abababababababababababababababababababababababababababababababab\", \"kinds\": [\"fix\"], \"image\": \"ghcr.io/a/b:2\"}}")).unwrap();
         assert_eq!((both.image.as_deref(), both.builds), (Some("ghcr.io/a/b:2"), true), "the published image wins over the developers' build");
-        assert!(both.notes.iter().any(|n| n.contains("published one")), "{:?}", both.notes);
+        assert!(both.notes.iter().any(|n| n.contains("published image") && n.contains("toto project image")), "{:?}", both.notes);
         let build_only = parse(&with(", \"build\": {\"dockerfile\": \"Dockerfile\"}, \"features\": {\"ghcr.io/devcontainers/features/node:1\": {}}, \"onCreateCommand\": \"npm ci\", \"postCreateCommand\": \"npm test\", \"runArgs\": [\"--privileged\"], \"mounts\": [\"source=/,target=/h,type=bind\"], \"remoteUser\": \"root\"")).unwrap();
         assert_eq!((build_only.image, build_only.builds), (None, true));
         let notes = build_only.notes.join("\n");
-        for want in ["prebuilds it", "`onCreateCommand` runs at prebuild", "`postCreateCommand` never runs", "not applied", "runArgs", "mounts", "unprivileged user"] {
+        for want in ["prebuilt on your machine", "deprecated", "`onCreateCommand` ran when the image was prebuilt", "`postCreateCommand` never runs", "not applied", "runArgs", "mounts", "unprivileged user"] {
             assert!(notes.contains(want), "missing `{want}` in:\n{notes}");
         }
         for (what, text) in [
@@ -3667,6 +3667,78 @@ mod prebuild {
         assert!(text.contains("CapEff:\t0000000000000000"), "the prebuild ran without capabilities: {text}");
         assert!(text.contains("post: No such file") && text.contains("/host: No such file"), "postCreateCommand did not run and the host mount was dropped: {text}");
         assert!(text.trim().ends_with("65534"), "the task still runs unprivileged in the snapshot: {text}");
+    }
+}
+
+mod project_image {
+    use crate::prebuild::*;
+
+    const KEY: &str = "abababababababababababababababababababababababababababababababab";
+
+    fn project(dir: &std::path::Path, dc: &str) {
+        std::fs::create_dir_all(dir.join(".devcontainer")).unwrap();
+        std::fs::write(dir.join(".devcontainer/Dockerfile"), "FROM alpine\nRUN adduser -D dev\n").unwrap();
+        std::fs::write(dir.join(".devcontainer/devcontainer.json"), dc).unwrap();
+    }
+
+    fn dc(extra: &str, toto_image: &str) -> String {
+        format!(r#"{{"build": {{"dockerfile": "Dockerfile"}}{extra}, "customizations": {{"toto": {{"id": "acme", "name": "Acme", "public_key": "{KEY}", "kinds": ["fix"]{toto_image}}}}}}}"#)
+    }
+
+    #[test]
+    fn publishing_needs_a_tag_of_its_own_to_push_to() {
+        let pb = Prebuild { bin: "docker".into(), cli: "/nonexistent/devcontainer".into(), network: "bridge".into(), work_dir: std::env::temp_dir() };
+        let dir = std::env::temp_dir().join(format!("toto-pi-{}", std::process::id()));
+        let cases = [
+            ("no target", dc("", ""), "customizations.toto.image"),
+            ("a digest", dc("", &format!(r#", "image": "ghcr.io/acme/env@sha256:{}""#, "a".repeat(64))), "not a digest"),
+            ("the base", dc(r#", "image": "ghcr.io/acme/env:1""#, r#", "image": "ghcr.io/acme/env:1""#).replace(r#""build": {"dockerfile": "Dockerfile"}, "#, ""), "also the base"),
+            ("no CLI", dc("", r#", "image": "ghcr.io/acme/env:1""#), "not installed"),
+        ];
+        for (what, text, want) in cases {
+            project(&dir, &text);
+            let e = publish(&pb, &dir, crate::devcontainer::PATH, true).unwrap_err().to_string();
+            assert!(e.contains(want), "{what}: {e}");
+        }
+        assert!(!dir.join(".devcontainer/toto-prebuild.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Live: the project's CI prebuilds its dev container (onCreateCommand included, host keys
+    /// dropped) and pushes it; a contributor pulls exactly that by digest.
+    #[test]
+    fn live_project_image_is_prebuilt_and_published_by_digest() {
+        use std::process::Command;
+        let cli = std::env::var("DEVCONTAINER_CLI").unwrap_or_else(|_| DEFAULT_CLI.into());
+        if cli_version(&cli).is_none() || !super::proxy_container::docker_has("alpine") || !super::proxy_container::docker_has("registry:2") {
+            eprintln!("skipping: needs docker, alpine, registry:2 and the dev container CLI (DEVCONTAINER_CLI)");
+            return;
+        }
+        let f = super::fixture("project-image");
+        let name = format!("toto-test-registry-{}", std::process::id());
+        let out = Command::new("docker").args(["run", "-d", "--rm", "--name", &name, "-p", "127.0.0.1::5000", "registry:2"]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let port = String::from_utf8(Command::new("docker").args(["port", &name, "5000"]).output().unwrap().stdout).unwrap().trim().rsplit(':').next().unwrap().to_string();
+        let target = format!("localhost:{port}/acme/toto-env:1.0");
+        let repo = f.dir.join("repo");
+        project(
+            &repo,
+            &dc(r#", "onCreateCommand": "echo from-ci > /home/dev/marker", "postCreateCommand": "echo post > /home/dev/post", "runArgs": ["--privileged"], "remoteUser": "dev""#, &format!(r#", "image": "{target}""#)),
+        );
+        let pb = Prebuild { bin: "docker".into(), cli, network: "bridge".into(), work_dir: repo.clone() };
+        let res = publish(&pb, &repo, crate::devcontainer::PATH, true);
+        let pinned = res.as_ref().map(String::clone);
+        // Forget the local copy, as a contributor's machine never had it, then pull by digest.
+        let _ = Command::new("docker").args(["rmi", "-f", &target]).output();
+        let run = pinned.as_ref().ok().map(|p| Command::new("docker").args(["run", "--rm", p, "sh", "-c", "cat /home/dev/marker; ls /home/dev/post 2>&1"]).output().unwrap());
+        let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+        let pinned = pinned.unwrap();
+        assert!(pinned.starts_with(&format!("localhost:{port}/acme/toto-env@sha256:")), "{pinned}");
+        let run = run.unwrap();
+        let text = format!("{}{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+        assert!(text.contains("from-ci"), "the onCreateCommand's result is in the published image: {text}");
+        assert!(text.contains("post: No such file"), "postCreateCommand never runs: {text}");
+        assert!(!repo.join(".devcontainer/toto-prebuild.json").exists(), "the override config is cleaned up");
     }
 }
 

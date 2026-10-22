@@ -1,15 +1,24 @@
-# Builds the dev container image with the spec's reference CLI and publishes it where
-# `.devcontainer/devcontainer.json` names it (customizations.toto.image). Contributors then pull
-# that image instead of prebuilding on their own machines.
+# .github/workflows/toto-image.yml: prebuilds the dev container and publishes it where
+# `.devcontainer/devcontainer.json` names it (customizations.toto.image). Contributors pull that
+# image and approve it by digest; they never build your code (ADR 17).
+#
+# `toto project image` runs the dev container spec's own prebuild phase with the reference CLI:
+# `build`/`features`, then `onCreateCommand` and `updateContentCommand`, snapshotted.
+# `postCreateCommand` and later never run, and keys that act on the host (`runArgs`, `mounts`,
+# `privileged`, ...) are dropped, exactly as for tasks. The image needs no credentials to pull, so
+# make the package public after its first push.
 name: toto image
+
 on:
   push:
     branches: [main]
     paths: [.devcontainer/**]
   workflow_dispatch:
+
 permissions:
   contents: read
-  packages: write
+  packages: write   # push to ghcr.io
+
 jobs:
   image:
     runs-on: ubuntu-latest
@@ -20,5 +29,15 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - run: npm install -g @devcontainers/cli
-      - run: devcontainer build --workspace-folder . --image-name ghcr.io/${{ github.repository_owner }}/toto-env:1.0 --push
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install toto
+        run: cargo install --locked --git https://github.com/jvanbuel/toto toto-runner
+      # Prints `published <image>@sha256:...` and adds it to the run summary: the digest
+      # contributors will see when they add or update the project.
+      - name: Prebuild and publish
+        run: toto project image --push

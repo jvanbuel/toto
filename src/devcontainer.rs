@@ -6,10 +6,12 @@
 //! image (`customizations.toto.image`, or the top-level `image`), and `customizations.toto` (id,
 //! key, kinds, agent directory). Keys that act on the host (`runArgs`, `mounts`, `privileged`,
 //! ...) are simply not applied, because toto only ever starts the image under its own flags. When
-//! the file builds its image (`build`, `dockerFile`, `features`) and names no published one, the
-//! contributor's machine can prebuild it (`prebuild`): the spec's own prebuild phase, build +
-//! `onCreateCommand` + `updateContentCommand`, snapshotted. `postCreateCommand` and later never
-//! run: tasks start offline from the snapshot, as Codespaces prebuilds define it.
+//! the file builds its image (`build`, `dockerFile`, `features`), the project's CI prebuilds it
+//! with `toto project image` (`prebuild`): the spec's own prebuild phase, build +
+//! `onCreateCommand` + `updateContentCommand`, snapshotted and published as
+//! `customizations.toto.image`. `postCreateCommand` and later never run: tasks start offline from
+//! the snapshot, as Codespaces prebuilds define it. A file that builds but names no published
+//! image can only be prebuilt on the contributor's machine, which is deprecated (ADR 17).
 
 use crate::{Error, Result};
 use serde::Deserialize;
@@ -143,17 +145,17 @@ pub fn parse(text: &str) -> Result<Devcontainer> {
         (None, None) => None,
     };
     if image.is_none() && !builds {
-        return Err(bad("names no image and builds none: set `image`, or `build`/`features` (then a contributor prebuilds it), or customizations.toto.image".into()));
+        return Err(bad("names no image and builds none: set `image`, or `build`/`features` and publish the result with `toto project image` as customizations.toto.image".into()));
     }
     let mut notes = vec![];
     if image.is_some() && builds {
-        notes.push(format!("the file builds its own image for developers; tasks run the published one ({})", image.as_deref().unwrap_or("")));
+        notes.push(format!("tasks run the published image ({}), which the project prebuilds in its CI (`toto project image`)", image.as_deref().unwrap_or("")));
     } else if builds {
-        notes.push("no published image: your machine prebuilds it (build, onCreateCommand, updateContentCommand), then tasks run the snapshot offline".into());
+        notes.push("no published image: it has to be prebuilt on your machine (build, onCreateCommand, updateContentCommand), which only the deprecated `docker` sandbox does; ask the project to publish it with `toto project image`".into());
     }
     for k in ["onCreateCommand", "updateContentCommand"] {
         if obj.contains_key(k) {
-            notes.push(format!("`{k}` runs at prebuild{}", if image.is_some() { " only if your machine builds; the published image is used as is" } else { "" }));
+            notes.push(format!("`{k}` ran when the image was prebuilt{}", if image.is_some() { " (in the project's CI, if it used `toto project image`)" } else { "" }));
         }
     }
     for k in ["postCreateCommand", "postStartCommand", "postAttachCommand"] {

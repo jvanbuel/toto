@@ -3,8 +3,9 @@
 // `customizations.toto`. Everything else is for your developers; keys that act on the host
 // (runArgs, mounts, privileged, ...) are never applied to tasks.
 //
-// With no published image, a contributor's machine prebuilds this file the way Codespaces does:
-// build + onCreateCommand + updateContentCommand, snapshotted. postCreateCommand and later never run.
+// Your CI prebuilds this file the way Codespaces does and publishes it as customizations.toto.image
+// (.github/workflows/toto-image.yml runs `toto project image --push`): build + onCreateCommand +
+// updateContentCommand, snapshotted. postCreateCommand and later never run.
 {
   "name": "acme-docs",
   "build": { "dockerfile": "Dockerfile" },

@@ -22,8 +22,9 @@ tools:
     command: python
     args: ["-m", "acme_docs_mcp"]
 
-# Omnigent's own sandbox around the agent's tools, inside the container. Only with it do
-# egress_rules apply. Needs bubblewrap in the image and `nested_userns` on the contributor's side.
+# The agent's network: nothing but these egress rules. On toto, OpenShell enforces them per request
+# from outside the image (toto runs this sandbox as `type: none`); when your developers run the
+# agent locally, Omnigent enforces them with bubblewrap.
 os_env:
   type: caller_process
   cwd: "."

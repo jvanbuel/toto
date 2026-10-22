@@ -42,7 +42,7 @@ toto login                     # Anthropic: runs `claude setup-token`; paste the
 
 ## 3. A project to run
 
-Use a real project (`toto projects add owner/name --token-file gh.token`, see `docs/projects.md`) or make a scratch one from the example: copy `docs/examples/project/` into a repository of your own, put the public key from `toto project-key ./pilot.key` into `customizations.toto.public_key`, build and push the image named in `customizations.toto.image` (dropping `image` makes toto prebuild it, which for now needs the deprecated `docker` sandbox and its network fence, below), and add it:
+Use a real project (`toto projects add owner/name --token-file gh.token`, see `docs/projects.md`) or make a scratch one from the example: copy `docs/examples/project/` into a repository of your own, put the public key from `toto project-key ./pilot.key` into `customizations.toto.public_key`, publish the image named in `customizations.toto.image` (with the example's `.github/workflows/toto-image.yml`, or locally: `docker login ghcr.io`, then `toto project image --push` in the checkout), and add it:
 
 ```
 toto projects add you/scratch --token-file gh.token
@@ -84,4 +84,4 @@ Send back: the full output of `toto run --once`, `toto doctor` and `toto openshe
 
 ## Appendix: the deprecated `docker` sandbox
 
-`{"kind": "docker"}` is toto's earlier sandbox, kept for one release (ADR 17). Options: `"bin": "podman"` for Podman, `"runtime": "runsc"` for gVisor, `"nested_userns": true` for agents that use Omnigent's own bubblewrap sandbox, and `"network": "toto-egress"` for agents that need a network. That network is created as root with `toto net-setup --apply`, Linux only (iptables on the Docker host), and removed with `toto net-setup --remove --apply`. Prebuilds of projects without a published image use the same fence.
+`{"kind": "docker"}` is toto's earlier sandbox, kept for one release (ADR 17). Options: `"bin": "podman"` for Podman, `"runtime": "runsc"` for gVisor, `"nested_userns": true` for agents that use Omnigent's own bubblewrap sandbox, and `"network": "toto-egress"` for agents that need a network. That network is created as root with `toto net-setup --apply`, Linux only (iptables on the Docker host), and removed with `toto net-setup --remove --apply`. Local prebuilds of projects without a published image (deprecated too) use the same fence.
