@@ -115,7 +115,11 @@ export type Project = {
 	approval: Approval | null;
 };
 
-export type ProjectDetail = Project & { config_yaml: string | null; files: string[] };
+export type ProjectDetail = Project & {
+	config_yaml: string | null;
+	instructions: [string, string] | null;
+	files: string[];
+};
 
 export type Preview = {
 	pending: string;

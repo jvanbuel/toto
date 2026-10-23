@@ -99,6 +99,20 @@
 				</CardSection>
 			</Card>
 		{/if}
+		{#if p.instructions}
+			<Card class="mt-4">
+				<CardSection>
+					<h2 class="font-semibold">
+						Instructions <span class="font-normal text-muted-foreground"
+							>from {p.instructions[0]}, as approved</span
+						>
+					</h2>
+					<pre
+						class="mt-3 max-h-96 overflow-auto rounded-md bg-muted p-3 text-xs whitespace-pre-wrap">{p
+							.instructions[1]}</pre>
+				</CardSection>
+			</Card>
+		{/if}
 	{:else}
 		<p class="mt-4 text-sm text-muted-foreground">
 			No approved environment: this project was added by editing the config.

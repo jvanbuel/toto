@@ -231,6 +231,8 @@ pub struct ProjectDetail {
     #[serde(flatten)]
     pub project: ProjectView,
     pub config_yaml: Option<String>,
+    /// The instructions file as approved, when the prompt comes from one: its name and text.
+    pub instructions: Option<(String, String)>,
     pub files: Vec<String>,
 }
 
@@ -244,6 +246,10 @@ async fn project(State(s): State<Arc<UiState>>, AxPath(id): AxPath<String>) -> A
     Ok(Json(ProjectDetail {
         project: project_view(&cfg, &id, key),
         config_yaml: files.get("config.yaml").map(|b| String::from_utf8_lossy(b).to_string()),
+        instructions: cfg.environments.get(&id).and_then(|a| a.agent.instructions_from.clone()).filter(|f| f != "inline").and_then(|f| {
+            let text = String::from_utf8_lossy(crate::agent::instructions_file(&files, &f)?).to_string();
+            Some((f, text))
+        }),
         files: files.keys().cloned().collect(),
     }))
 }

@@ -3076,6 +3076,33 @@ pub(crate) mod github_queue {
     }
 
     #[test]
+    fn instructions_from_the_repositorys_own_agents_md_are_carried_and_approved() {
+        let p = project();
+        let cfg = agent_config("instructions: ../../AGENTS.md").replace("prompt: Fix docs.\n", "");
+        publish(&p, &devcontainer_json(&p.key, ""), &[("config.yaml", &cfg)]);
+        p.fake.state.lock().unwrap().files.push(("AGENTS.md".into(), b"# Acme\nAlways run the doc linter.\n".to_vec()));
+        let f = projects::fetch(&p.fake.queue(None)).unwrap();
+        assert_eq!(f.agent_files[".toto-repo/up/up/AGENTS.md"], b"# Acme\nAlways run the doc linter.\n", "the one file is carried in");
+        let a = Approval::new("ghcr.io/acme/env:1.0", fake_info(), &f.agent_files, f.commit.clone(), false).unwrap();
+        assert_eq!((a.agent.instructions_from.as_deref(), a.agent.prompt_preview.as_str()), (Some("../../AGENTS.md"), "Always run the doc linter."));
+        assert!(a.describe().iter().any(|l| l.contains("prompt      from ../../AGENTS.md: Always run the doc linter.")), "{:?}", a.describe());
+
+        // A change to the repository's AGENTS.md changes what was approved.
+        p.fake.state.lock().unwrap().files.retain(|f| f.0 != "AGENTS.md");
+        p.fake.state.lock().unwrap().files.push(("AGENTS.md".into(), b"Also push to main.\n".to_vec()));
+        let changed = Approval::new("ghcr.io/acme/env:1.0", fake_info(), &projects::fetch(&p.fake.queue(None)).unwrap().agent_files, None, false).unwrap();
+        assert_ne!(changed.agent_hash, a.agent_hash);
+
+        // Missing, or out of the repository: refused, never run as the literal text.
+        p.fake.state.lock().unwrap().files.retain(|f| f.0 != "AGENTS.md");
+        let e = projects::fetch(&p.fake.queue(None)).err().unwrap().to_string();
+        assert!(e.contains("not in the repository"), "{e}");
+        publish(&p, &devcontainer_json(&p.key, ""), &[("config.yaml", &agent_config("instructions: ../../../etc/passwd").replace("prompt: Fix docs.\n", ""))]);
+        let e = projects::fetch(&p.fake.queue(None)).err().unwrap().to_string();
+        assert!(e.contains("outside the repository"), "{e}");
+    }
+
+    #[test]
     fn adding_a_project_approves_exactly_what_was_shown() {
         let p = project();
         publish(&p, &devcontainer_json(&p.key, ""), &[("config.yaml", &agent_config("os_env:\n  type: caller_process\n  cwd: \".\"\n  sandbox: {type: linux_bwrap, allow_network: true, egress_rules: [\"GET api.acme.example/**\"]}"))]);
@@ -3745,6 +3772,86 @@ mod project_image {
         assert!(text.contains("from-ci"), "the onCreateCommand's result is in the published image: {text}");
         assert!(text.contains("post: No such file"), "postCreateCommand never runs: {text}");
         assert!(!repo.join(".devcontainer/toto-prebuild.json").exists(), "the override config is cleaned up");
+    }
+}
+
+mod agent_instructions {
+    use crate::agent::*;
+    use std::collections::BTreeMap;
+
+    fn files(config_extra: &str, more: &[(&str, &str)]) -> BTreeMap<String, Vec<u8>> {
+        let mut f = BTreeMap::new();
+        f.insert("config.yaml".to_string(), format!("spec_version: 1\nexecutor:\n  type: omnigent\n  config: {{harness: claude-sdk}}\n  model: m\n{config_extra}").into_bytes());
+        for (p, t) in more {
+            f.insert(p.to_string(), t.as_bytes().to_vec());
+        }
+        f
+    }
+
+    #[test]
+    fn instructions_resolve_as_omnigent_resolves_them() {
+        let from = |c: &str, more: &[(&str, &str)]| summarize(&files(c, more)).map(|s| (s.instructions_from, s.prompt_preview));
+        assert_eq!(from("prompt: Fix the docs.\n", &[]).unwrap(), (Some("inline".into()), "Fix the docs.".into()));
+        assert_eq!(from("prompt: |\n  # Role\n  You fix docs.\n", &[]).unwrap(), (Some("inline".into()), "You fix docs.".into()), "a heading is skipped in the preview");
+        assert_eq!(from("instructions: prompts/system.md\nprompt: ignored\n", &[("prompts/system.md", "From the file.")]).unwrap(), (Some("prompts/system.md".into()), "From the file.".into()), "instructions wins over prompt");
+        assert_eq!(from("prompt: AGENTS.md\n", &[("AGENTS.md", "Legacy alias, still a file.")]).unwrap().0, Some("AGENTS.md".into()));
+        assert_eq!(from("", &[("CLAUDE.md", "claude"), ("AGENTS.md", "agents")]).unwrap(), (Some("AGENTS.md".into()), "agents".into()), "first of AGENTS.md, CLAUDE.md, .cursorrules");
+        assert_eq!(from("", &[("CLAUDE.md", "claude")]).unwrap().0, Some("CLAUDE.md".into()));
+        assert_eq!(from("", &[]).unwrap(), (None, String::new()));
+        assert_eq!(from("instructions: Be brief and kind.\n", &[]).unwrap().0, Some("inline".into()), "a sentence is text");
+        for missing in ["instructions: AGENTS.md\n", "instructions: prompts/system.md\n", "instructions: ../../AGENTS.md\n"] {
+            let e = from(missing, &[]).unwrap_err().to_string();
+            assert!(e.contains("not in the agent directory") && e.contains("as the prompt"), "{missing}: {e}");
+        }
+        assert_eq!(from("instructions: ../../AGENTS.md\n", &[(".toto-repo/up/up/AGENTS.md", "From the repo root.")]).unwrap(), (Some("../../AGENTS.md".into()), "From the repo root.".into()));
+        let e = from("prompt: hi\n", &[(".toto-repo/up/x.md", "smuggled")]).unwrap_err().to_string();
+        assert!(e.contains("reserved"), "{e}");
+    }
+
+    #[test]
+    fn only_a_plain_upward_reference_is_carried() {
+        assert_eq!(outside_path("../../AGENTS.md").as_deref(), Some(".toto-repo/up/up/AGENTS.md"));
+        assert_eq!(outside_path("../docs/agent.md").as_deref(), Some(".toto-repo/up/docs/agent.md"));
+        for not in ["AGENTS.md", "prompts/x.md", "/etc/passwd", "../a/../b.md", "../", "../.", "../a/./b"] {
+            assert_eq!(outside_path(not), None, "{not}");
+        }
+    }
+
+    #[test]
+    fn at_task_time_the_reference_points_at_the_carried_copy_and_nothing_else_changes() {
+        let f = files("instructions: ../../AGENTS.md\nos_env:\n  type: caller_process\n  sandbox: {type: linux_bwrap, allow_network: true, egress_rules: [\"GET a.org/**\"]}\n", &[(".toto-repo/up/up/AGENTS.md", "x"), ("skills/s/SKILL.md", "s")]);
+        let tar = pack(&f).unwrap();
+        for openshell in [false, true] {
+            let out = unpack(&for_run(&tar, openshell).unwrap()).unwrap();
+            let v: serde_yaml_ng::Value = serde_yaml_ng::from_slice(&out["config.yaml"]).unwrap();
+            assert_eq!(v["instructions"].as_str(), Some(".toto-repo/up/up/AGENTS.md"));
+            assert_eq!(v["os_env"]["sandbox"]["type"].as_str(), Some(if openshell { "none" } else { "linux_bwrap" }));
+            assert_eq!((&out[".toto-repo/up/up/AGENTS.md"], &out["skills/s/SKILL.md"]), (&f[".toto-repo/up/up/AGENTS.md"], &f["skills/s/SKILL.md"]));
+        }
+        let plain = pack(&files("prompt: Fix docs.\n", &[])).unwrap();
+        assert_eq!(for_run(&plain, false).unwrap(), plain, "nothing to adjust, byte for byte");
+    }
+
+    /// Live: Omnigent's own parser, in the agent image, reads the carried file as the instructions.
+    #[test]
+    fn omnigent_reads_the_carried_instructions() {
+        if !super::proxy_container::docker_has("toto-omnigent-test") {
+            eprintln!("skipping: needs the toto-omnigent-test image");
+            return;
+        }
+        let f = files("name: t\ninstructions: ../../AGENTS.md\n", &[(".toto-repo/up/up/AGENTS.md", "CARRIED-INSTRUCTIONS")]);
+        let out = unpack(&for_run(&pack(&f).unwrap(), true).unwrap()).unwrap();
+        let dir = super::fixture("omnigent-instructions").dir.join("agent");
+        for (p, d) in &out {
+            std::fs::create_dir_all(dir.join(p).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(p), d).unwrap();
+        }
+        let o = std::process::Command::new("docker")
+            .args(["run", "--rm", "--network", "none", "-v", &format!("{}:/a:ro", dir.display()), "--entrypoint", "python3", "toto-omnigent-test", "-c", "from pathlib import Path; from omnigent.spec.parser import parse; print(parse(Path('/a')).instructions)"])
+            .output()
+            .unwrap();
+        let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert!(text.contains("CARRIED-INSTRUCTIONS"), "{text}");
     }
 }
 

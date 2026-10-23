@@ -44,7 +44,11 @@ The image must contain `omnigent` (and so `python3`) and the harness it drives (
 
 - `executor.config.harness`: `claude-sdk` (contributors with an Anthropic subscription or API key) or `codex` (OpenAI API key). This decides which contributors can run your tasks.
 - `executor.model`: set one; the credential proxy does not forward model discovery.
-- `prompt`: your instructions. The task's own prompt comes from the manifest.
+- `instructions` (or `prompt`): your instructions, inline or as a file. The task's own prompt comes from the manifest. toto reads them the way Omnigent does and shows contributors the text:
+  - a one-line value naming a file in the agent directory is read from that file (`instructions: prompts/system.md`);
+  - with neither key set, the first of `AGENTS.md`, `CLAUDE.md` or `.cursorrules` in the agent directory is used;
+  - **to reuse your repository's own AGENTS.md**, write `instructions: ../../AGENTS.md`. toto carries that one file in with the agent, at the same commit, and contributors approve it with the agent; a change to it asks them again;
+  - a reference to a file that does not exist is refused (Omnigent would otherwise run the reference itself as the prompt).
 - `tools`: MCP servers. A `command` runs inside your image. A `url` server needs a network, so it must be covered by your egress rules; prefer commands.
 - `skills/<name>/SKILL.md`: Agent Skills, loaded by Omnigent.
 - `os_env`: absent, or `type: caller_process` (anything else, such as `ssh`, is refused). Its `sandbox` is where **egress rules** live: `allow_network: true` and `egress_rules` in Omnigent's syntax (`GET docs.acme.example/**`, `GET,POST api.example.com/v1/*`). Default deny. toto turns each rule into an OpenShell policy rule, enforced per request on HTTPS from outside your image, so you need no `bubblewrap` (a `linux_bwrap` sandbox type still parses; toto runs it as `none` with OpenShell enforcing the rules). An agent that needs a network must list its destinations. Ask for as little as the task needs, and prefer `GET` on specific paths.

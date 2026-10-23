@@ -106,11 +106,36 @@ pub fn fetch(repo: &dyn RepoFiles) -> Result<Fetched> {
     let text = String::from_utf8(text).map_err(|_| Error::Policy("devcontainer.json is not UTF-8".into()))?;
     let dc = devcontainer::parse(&text)?;
     let agent_dir = dc.toto.agent.clone().unwrap_or_else(|| agent::DEFAULT_AGENT_DIR.into());
-    let agent_files = repo.tree(&agent_dir, c)?;
+    let mut agent_files = repo.tree(&agent_dir, c)?;
     if agent_files.is_empty() {
         return Err(Error::Policy(format!("the repository has no agent directory at {agent_dir} (an Omnigent agent: config.yaml and skills/)")));
     }
+    carry_outside_instructions(repo, c, &agent_dir, &mut agent_files)?;
     Ok(Fetched { devcontainer: dc, devcontainer_text: text, agent_files, agent_dir, commit })
+}
+
+/// When the agent's `instructions` name a file outside its directory (typically the repository's
+/// own `AGENTS.md`), reads that one file at the same commit and carries it in the agent directory
+/// (`agent::outside_path`), so it is shown, approved and hashed with the agent.
+fn carry_outside_instructions(repo: &dyn RepoFiles, commit: Option<&str>, agent_dir: &str, files: &mut BTreeMap<String, Vec<u8>>) -> Result<()> {
+    let Some(config) = files.get("config.yaml").or_else(|| files.get("config.yml")) else { return Ok(()) };
+    let Ok(v) = serde_yaml_ng::from_slice::<serde_json::Value>(config) else { return Ok(()) }; // `summarize` reports it
+    let Some(reference) = agent::instruction_ref(&v) else { return Ok(()) };
+    let Some(carried) = agent::outside_path(&reference) else { return Ok(()) };
+    // `agent_dir/../../AGENTS.md`, resolved in the repository; it must not leave the repository.
+    let mut path: Vec<&str> = agent_dir.trim_matches('/').split('/').filter(|s| !s.is_empty() && *s != ".").collect();
+    for seg in reference.split('/') {
+        match seg {
+            ".." => {
+                path.pop().ok_or_else(|| Error::Policy(format!("instructions `{reference}` points outside the repository")))?;
+            }
+            s => path.push(s),
+        }
+    }
+    let repo_path = path.join("/");
+    let data = repo.file(&repo_path, commit)?.ok_or_else(|| Error::Policy(format!("instructions `{reference}` names {repo_path}, which is not in the repository")))?;
+    files.insert(carried, data);
+    Ok(())
 }
 
 pub struct AddOptions {

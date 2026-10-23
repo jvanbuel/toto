@@ -7,6 +7,17 @@
 //! reads it to tell the contributor what they are approving, checks the few things it must know
 //! (which harness, so the right credential is used; whether tasks need a network; whether the
 //! nested sandbox is used), and carries the approved files into the container at task time.
+//!
+//! **Instructions** are resolved the way Omnigent resolves them (`omnigent/spec/parser.py`,
+//! `_resolve_instructions`), so the contributor sees the prompt that will actually run:
+//! `instructions` (or its legacy alias `prompt`) is read as a file when it is one line naming a
+//! file inside the agent directory, and as inline text otherwise; with neither set, the first of
+//! `AGENTS.md`, `CLAUDE.md`, `.cursorrules` in the agent directory. Omnigent never reads outside the
+//! directory, and silently runs the reference itself as the prompt instead, so toto:
+//! - refuses a reference to a file that is not there;
+//! - for a reference that leaves the agent directory (`instructions: ../../AGENTS.md`, the
+//!   repository's own AGENTS.md), ships that one file with the agent, approved and hashed with it,
+//!   under `.toto-repo/` (`outside_path`), and points the reference there at task time (`for_run`).
 
 use crate::archive::{self, Record};
 use crate::proxy::Provider;
@@ -20,6 +31,13 @@ pub const DEFAULT_AGENT_DIR: &str = ".toto/agent";
 /// Where the approved agent directory is unpacked inside the container (a writable tmpfs).
 pub const CONTAINER_AGENT_DIR: &str = "/tmp/toto-agent";
 
+/// Where a file the agent's `instructions` reference from outside the agent directory is carried
+/// inside it. Reserved: an agent directory may not contain it itself.
+pub const OUTSIDE_DIR: &str = ".toto-repo";
+
+/// Files Omnigent reads as instructions when `instructions` and `prompt` are both unset, in order.
+pub const CONTEXT_FILES: [&str; 3] = ["AGENTS.md", "CLAUDE.md", ".cursorrules"];
+
 pub const MAX_FILES: usize = 500;
 pub const MAX_BYTES: u64 = 1 << 20;
 
@@ -32,6 +50,10 @@ pub struct AgentSummary {
     pub model: Option<String>,
     /// First line of the agent's prompt, for the listing.
     pub prompt_preview: String,
+    /// Where the prompt comes from: `inline`, or the file (e.g. `AGENTS.md`, or
+    /// `../../AGENTS.md` for one shipped from outside the agent directory). `None`: no instructions.
+    #[serde(default)]
+    pub instructions_from: Option<String>,
     /// MCP servers: name and `command ...` or `url`.
     pub mcp: Vec<(String, String)>,
     pub skills: Vec<String>,
@@ -57,7 +79,7 @@ impl AgentSummary {
         let mut out = vec![
             format!("harness     {}{}", self.harness, self.model.as_deref().map_or(String::new(), |m| format!(", model {m}"))),
             format!("credential  {}", match self.provider() { Some(Provider::Anthropic) => "Anthropic (Claude subscription or API key)", Some(Provider::OpenAi) => "OpenAI API key", None => "unknown harness: no credential of yours matches" }),
-            format!("prompt      {}", self.prompt_preview),
+            format!("prompt      {}{}", self.instructions_from.as_deref().filter(|f| *f != "inline").map_or(String::new(), |f| format!("from {f}: ")), if self.prompt_preview.is_empty() { "(none)" } else { &self.prompt_preview }),
             format!("skills      {}", if self.skills.is_empty() { "none".into() } else { self.skills.join(", ") }),
         ];
         if self.mcp.is_empty() {
@@ -117,6 +139,7 @@ pub fn summarize(files: &BTreeMap<String, Vec<u8>>) -> Result<AgentSummary> {
     if let Some(p) = files.keys().find(|p| !archive::valid_path(p)) {
         return Err(bad(format!("unsafe path `{p}`")));
     }
+    let shipped: Vec<&String> = files.keys().filter(|p| p.starts_with(&format!("{OUTSIDE_DIR}/"))).collect();
     let config = files.get("config.yaml").or_else(|| files.get("config.yml")).ok_or_else(|| bad("no config.yaml".into()))?;
     let text = std::str::from_utf8(config).map_err(|_| bad("config.yaml is not UTF-8".into()))?;
     let v: serde_json::Value = serde_yaml_ng::from_str(text).map_err(|e| bad(format!("config.yaml: {e}")))?;
@@ -130,7 +153,11 @@ pub fn summarize(files: &BTreeMap<String, Vec<u8>>) -> Result<AgentSummary> {
     if model.is_none() {
         warnings.push("no executor.model: Omnigent cannot discover models through the credential proxy, so tasks may fail to start".into());
     }
-    let prompt_preview = v["prompt"].as_str().unwrap_or("").lines().next().unwrap_or("").chars().take(120).collect();
+    let (instructions_from, text) = resolve_instructions(files, &v).map_err(bad)?;
+    let prompt_preview = text.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#')).or_else(|| text.lines().map(str::trim).find(|l| !l.is_empty())).unwrap_or("").chars().take(120).collect();
+    if let Some(p) = shipped.iter().find(|p| instruction_ref(&v).and_then(|r| outside_path(&r)).as_deref() != Some(p.as_str())) {
+        return Err(bad(format!("`{p}`: `{OUTSIDE_DIR}/` is reserved for the instructions file toto carries in from outside the agent directory")));
+    }
 
     match v["os_env"]["type"].as_str() {
         None | Some("caller_process") => {}
@@ -147,7 +174,7 @@ pub fn summarize(files: &BTreeMap<String, Vec<u8>>) -> Result<AgentSummary> {
         warnings.push("egress_rules are set but allow_network is false: Omnigent will refuse all network".into());
     }
     if !egress_rules.is_empty() && sandbox_type.as_deref() != Some("linux_bwrap") {
-        warnings.push("egress_rules only apply with os_env.sandbox.type linux_bwrap".into());
+        warnings.push("egress_rules are enforced by toto's sandbox (OpenShell); on the deprecated docker sandbox only with os_env.sandbox.type linux_bwrap".into());
     }
 
     let mut mcp = vec![];
@@ -179,7 +206,76 @@ pub fn summarize(files: &BTreeMap<String, Vec<u8>>) -> Result<AgentSummary> {
     if url_servers && !allow_network {
         warnings.push("an MCP server is reached by URL: tasks need a network for it, and its host must be in the egress rules".into());
     }
-    Ok(AgentSummary { harness, model, prompt_preview, mcp, skills, sandbox_type, egress_rules, needs_network, warnings })
+    Ok(AgentSummary { harness, model, prompt_preview, instructions_from, mcp, skills, sandbox_type, egress_rules, needs_network, warnings })
+}
+
+/// The one-line `instructions` (or, without it, `prompt`) value that Omnigent would try as a file.
+pub fn instruction_ref(config: &serde_json::Value) -> Option<String> {
+    let raw = if config["instructions"].is_null() { &config["prompt"] } else { &config["instructions"] };
+    raw.as_str().filter(|s| !s.contains('\n')).map(|s| s.trim().to_string())
+}
+
+/// Where a reference that leaves the agent directory (`../../AGENTS.md`) is carried inside it:
+/// `.toto-repo/up/up/AGENTS.md`. `None` for a reference that stays inside, and for one toto does
+/// not carry (an absolute path, `..` after a name, `.` segments).
+pub fn outside_path(reference: &str) -> Option<String> {
+    let segments: Vec<&str> = reference.split('/').collect();
+    let ups = segments.iter().take_while(|s| **s == "..").count();
+    let rest = &segments[ups..];
+    (ups > 0 && !rest.is_empty() && rest.iter().all(|s| !s.is_empty() && *s != "." && *s != "..")).then(|| format!("{OUTSIDE_DIR}/{}{}", "up/".repeat(ups), rest.join("/")))
+}
+
+/// Resolves the agent's instructions as Omnigent will (see the module docs): where they come from
+/// (`inline`, or a file) and their text. Refuses a reference to a file that is not there, which
+/// Omnigent would otherwise run as the prompt text itself.
+fn resolve_instructions(files: &BTreeMap<String, Vec<u8>>, config: &serde_json::Value) -> std::result::Result<(Option<String>, String), String> {
+    let utf8 = |p: &str, b: &[u8]| String::from_utf8(b.to_vec()).map_err(|_| format!("instructions file `{p}` is not UTF-8"));
+    let raw = if config["instructions"].is_null() { &config["prompt"] } else { &config["instructions"] };
+    if raw.is_null() {
+        return Ok(match CONTEXT_FILES.iter().find_map(|f| files.get(*f).map(|b| (*f, b))) {
+            Some((f, b)) => (Some(f.to_string()), utf8(f, b)?),
+            None => (None, String::new()),
+        });
+    }
+    let text = raw.as_str().ok_or("`instructions`/`prompt` must be text")?.to_string();
+    let Some(r) = instruction_ref(config) else { return Ok((Some("inline".into()), text)) };
+    let inside = r.strip_prefix("./").unwrap_or(&r);
+    if let Some(b) = files.get(inside).filter(|_| archive::valid_path(inside)) {
+        return Ok((Some(inside.to_string()), utf8(inside, b)?));
+    }
+    if let Some(b) = outside_path(&r).and_then(|p| files.get(&p)) {
+        return Ok((Some(r.clone()), utf8(&r, b)?));
+    }
+    let looks_like_a_file = !r.contains(char::is_whitespace) && (r.contains('/') || [".md", ".txt", ".markdown", ".cursorrules"].iter().any(|e| r.to_lowercase().ends_with(e)));
+    if looks_like_a_file {
+        return Err(format!("instructions `{r}` names a file that is not in the agent directory (Omnigent would run the text `{r}` itself as the prompt)"));
+    }
+    Ok((Some("inline".into()), text))
+}
+
+/// The text of the instructions file `from` (an `instructions_from` other than `inline`).
+pub fn instructions_file<'a>(files: &'a BTreeMap<String, Vec<u8>>, from: &str) -> Option<&'a [u8]> {
+    files.get(from).or_else(|| files.get(&outside_path(from)?)).map(Vec::as_slice)
+}
+
+/// The approved agent directory as the sandbox runs it. Two adjustments, both derived from the
+/// approved files alone, and nothing else changed:
+/// - an `instructions` reference to a file outside the agent directory points at the copy
+///   carried in `.toto-repo/` (Omnigent reads only inside the directory);
+/// - with `external_egress` (OpenShell), Omnigent's own network sandbox is turned off
+///   (`with_external_egress`).
+pub fn for_run(tar: &[u8], external_egress: bool) -> Result<Vec<u8>> {
+    let tar = if external_egress { with_external_egress(tar)? } else { tar.to_vec() };
+    let mut records = archive::from_bytes(&tar, archive::Limits::new(MAX_BYTES)).map_err(Error::Policy)?;
+    let Some(archive::Record::File { data, .. }) = records.iter_mut().find(|r| matches!(r, archive::Record::File { path, .. } if path == "config.yaml" || path == "config.yml")) else {
+        return Ok(tar);
+    };
+    let mut v: serde_yaml_ng::Value = serde_yaml_ng::from_slice(data).map_err(|e| Error::Policy(format!("agent config.yaml: {e}")))?;
+    let key = if v.get("instructions").is_some_and(|i| !i.is_null()) { "instructions" } else { "prompt" };
+    let Some(target) = v.get(key).and_then(serde_yaml_ng::Value::as_str).filter(|s| !s.contains('\n')).and_then(|r| outside_path(r.trim())) else { return Ok(tar) };
+    v[key] = target.into();
+    *data = serde_yaml_ng::to_string(&v).map_err(|e| Error::Policy(e.to_string()))?.into_bytes();
+    archive::to_bytes(&records).map_err(Error::Policy)
 }
 
 /// The agent directory as a tar (what the approval stores and the container receives).

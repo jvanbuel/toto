@@ -19,5 +19,6 @@
 | 15 | [The contributor's UI is a local page served by the toto binary](0015-local-ui-in-the-binary.md) | Accepted |
 | 16 | [Task intake, refinement and tracking through Inbound and Outbound connectors](0016-task-intake-refinement-and-tracking.md) | Accepted |
 | 17 | [NVIDIA OpenShell is toto's sandbox, shipped with toto](0017-openshell-is-the-sandbox.md) | Accepted |
+| 18 | [The agent is defined in Omnigent's format, built on MCP, Agent Skills and AGENTS.md](0018-agent-definition-format.md) | Accepted |
 
 ADRs 2, 13 and 17 are load-bearing: together they guarantee credentials never leave the contributor's machine. Several ADRs list a simpler v1 option worth considering before building the full design.

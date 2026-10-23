@@ -467,7 +467,7 @@ impl Config {
                 for (id, a) in &self.environments {
                     // OpenShell enforces the approved egress rules itself; Omnigent's nested
                     // sandbox cannot start there (no user namespaces), so it is turned off.
-                    let tar = if external_egress { crate::agent::with_external_egress(&a.agent_tar_bytes()?)? } else { a.agent_tar_bytes()? };
+                    let tar = crate::agent::for_run(&a.agent_tar_bytes()?, external_egress)?;
                     h.agents.insert(id.clone(), ApprovedAgent { tar, harness: a.agent.harness.clone() });
                 }
                 Box::new(h)
